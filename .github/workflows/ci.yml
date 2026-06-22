@@ -23,7 +23,7 @@ jobs:
       - name: Run tests
         run: cd exporter/agentauditexporter && go test -race -coverprofile=../../coverage.out ./...
       - name: Report coverage
-        run: go tool cover -func=coverage.out | grep total
+        run: cd exporter/agentauditexporter && go tool cover -func=../../coverage.out | grep total
 
   lint:
     name: Lint
@@ -36,7 +36,7 @@ jobs:
           cache: false
       - uses: golangci/golangci-lint-action@v6
         with:
-          version: v1.64.5
+          version: v2.12.2
           working-directory: exporter/agentauditexporter
 
   build:
