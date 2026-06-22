@@ -1,0 +1,6 @@
+# Local working docs (not published)
+planning/
+
+# Go
+/bin/
+*.test
