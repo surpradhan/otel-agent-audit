@@ -13,7 +13,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        go: ['1.22', '1.23']
+        go: ['1.25', '1.26']
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-go@v5
@@ -21,9 +21,9 @@ jobs:
           go-version: ${{ matrix.go }}
           cache: true
       - name: Run tests
-        run: go test -race -coverprofile=coverage.out ./...
+        run: cd exporter/agentauditexporter && go test -race -coverprofile=../../coverage.out ./...
       - name: Report coverage
-        run: go tool cover -func=coverage.out | grep total
+        run: cd exporter/agentauditexporter && go tool cover -func=../../coverage.out | grep total
 
   lint:
     name: Lint
@@ -32,11 +32,12 @@ jobs:
       - uses: actions/checkout@v4
       - uses: actions/setup-go@v5
         with:
-          go-version: '1.23'
+          go-version: '1.26'
           cache: false
       - uses: golangci/golangci-lint-action@v6
         with:
-          version: v1.64.5
+          version: v2.12.2
+          working-directory: exporter/agentauditexporter
 
   build:
     name: Build
@@ -46,13 +47,12 @@ jobs:
       - uses: actions/checkout@v4
       - uses: actions/setup-go@v5
         with:
-          go-version: '1.23'
+          go-version: '1.26'
           cache: true
       - name: Install OpenTelemetry Collector Builder
-        # Pin to a specific release once go.mod is created in Phase B0.
-        run: go install go.opentelemetry.io/collector/cmd/builder@latest
+        run: go install go.opentelemetry.io/collector/cmd/builder@v0.154.0
       - name: Build demo collector distro
-        run: builder --config=ocb/builder-config.yaml
+        run: GOWORK=off builder --config=ocb/builder-config.yaml
 
   check-sync:
     name: Required checks in sync

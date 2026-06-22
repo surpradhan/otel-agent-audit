@@ -1,0 +1,13 @@
+dist:
+  name: otel-agent-audit-collector
+  description: Demo OTel Collector distro for otel-agent-audit
+  output_path: ./dist
+  otelcol_version: 0.154.0
+
+receivers:
+  - gomod: go.opentelemetry.io/collector/receiver/otlpreceiver v0.154.0
+
+exporters:
+  # path is relative to the CWD where `builder` is invoked (repo root in CI)
+  - gomod: github.com/surpradhan/otel-agent-audit/exporter/agentauditexporter v0.0.0
+    path: exporter/agentauditexporter
