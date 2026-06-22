@@ -86,6 +86,10 @@ The release workflow must:
 2. Require human approval via a GitHub deployment Environment with required
    reviewers before publishing.
 3. Never publish code that has not been reviewed and merged to `main`.
+4. Keep the publish token (e.g. `GOMODULE_TOKEN`) as an *environment* secret
+   scoped to the release environment — not a repo-level secret accessible to
+   all jobs.
+5. Publish with SLSA provenance / GitHub artifact attestation where supported.
 
 ## Branch-protection settings (apply in GitHub UI)
 

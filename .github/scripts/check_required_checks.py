@@ -8,6 +8,7 @@ Exits 0 when every list matches; exits 1 on any mismatch and prints a diff.
 
 (1) ci.yml → CONTRIBUTING.md always runs (no credentials needed; works on forks).
 (2) ci.yml → GitHub API runs only when CHECKS_SYNC_TOKEN + GITHUB_REPOSITORY are set.
+    API failure when the token is present is treated as a hard gate failure.
 
 Rule: whenever you add/rename/remove a CI job, update ci.yml, the
 CONTRIBUTING.md required-checks block, AND branch protection in the same PR.
@@ -31,11 +32,18 @@ def load_ci_contexts(path: str) -> set[str]:
     with open(path) as f:
         ci = yaml.safe_load(f)
 
+    if not isinstance(ci, dict):
+        print(f"ERROR: {path} did not parse to a YAML mapping (got {type(ci).__name__})")
+        sys.exit(1)
+
     contexts: set[str] = set()
     for job_id, job in ci.get("jobs", {}).items():
         name_template: str = job.get("name", job_id)
         matrix: dict = job.get("strategy", {}).get("matrix", {})
 
+        # NOTE: matrix 'include' overrides / extra rows are not expanded here.
+        # If you use 'include' to add new matrix combinations, also add their
+        # context strings manually to the CONTRIBUTING.md required-checks block.
         dims: list[tuple[str, list]] = [
             (k, [str(v) for v in vs])
             for k, vs in matrix.items()
@@ -53,7 +61,12 @@ def load_ci_contexts(path: str) -> set[str]:
         for combo in combos:
             name = name_template
             for key, val in combo.items():
-                name = name.replace("${{ matrix." + key + " }}", val)
+                # Handle both ${{ matrix.X }} (spaced) and ${{matrix.X}} (compact).
+                name = re.sub(
+                    r"\$\{\{\s*matrix\." + re.escape(key) + r"\s*\}\}",
+                    val,
+                    name,
+                )
             contexts.add(name)
 
     return contexts
@@ -91,7 +104,7 @@ def load_github_contexts(repo: str, branch: str, token: str) -> set[str]:
     req.add_header("Authorization", f"Bearer {token}")
     req.add_header("Accept", "application/vnd.github+json")
     req.add_header("X-GitHub-Api-Version", "2022-11-28")
-    with urllib.request.urlopen(req) as resp:
+    with urllib.request.urlopen(req, timeout=15) as resp:
         data = json.load(resp)
     return set(data.get("contexts", []))
 
@@ -130,7 +143,8 @@ def main() -> None:
             print(f"GitHub contexts ({len(gh_contexts)}): {sorted(gh_contexts)}")
             ok &= compare("ci.yml", ci_contexts, "GitHub branch protection", gh_contexts)
         except Exception as exc:
-            print(f"⚠️   Could not fetch GitHub contexts: {exc}")
+            print(f"ERROR: Could not fetch GitHub contexts: {exc}")
+            ok = False
     else:
         print("\n(Skipping GitHub API check — CHECKS_SYNC_TOKEN not set)")
 
