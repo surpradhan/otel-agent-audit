@@ -1,14 +1,14 @@
 .PHONY: build test lint clean
 
-# OCB must be installed: go install go.opentelemetry.io/collector/cmd/builder@latest
+# OCB must be installed: go install go.opentelemetry.io/collector/cmd/builder@v0.154.0
 build:
-	builder --config=ocb/builder-config.yaml
+	GOWORK=off builder --config=ocb/builder-config.yaml
 
 test:
-	go test -race ./...
+	cd exporter/agentauditexporter && go test -race ./...
 
 lint:
-	golangci-lint run
+	cd exporter/agentauditexporter && golangci-lint run
 
 clean:
 	rm -rf dist/

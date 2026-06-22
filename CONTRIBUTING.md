@@ -67,12 +67,16 @@ Never add `Co-Authored-By` lines attributing an AI tool.
 
 ```bash
 # Go 1.25 or 1.26 required (OTel Collector v1.60+ requires Go 1.25+)
+
+# Run tests and lint from the exporter sub-module
+cd exporter/agentauditexporter
 go test -race ./...
 golangci-lint run
+cd ../..
 
 # Build the demo collector distro
 go install go.opentelemetry.io/collector/cmd/builder@v0.154.0
-builder --config=ocb/builder-config.yaml
+GOWORK=off builder --config=ocb/builder-config.yaml
 ```
 
 ## Release gating
