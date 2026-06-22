@@ -24,9 +24,9 @@ func createDefaultConfig() component.Config {
 
 func createTracesExporter(
 	_ context.Context,
-	_ exporter.Settings,
+	set exporter.Settings,
 	cfg component.Config,
 ) (exporter.Traces, error) {
 	oCfg := cfg.(*Config)
-	return newAgentAuditExporter(oCfg), nil
+	return newAgentAuditExporter(oCfg, set.Logger), nil
 }

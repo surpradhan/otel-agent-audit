@@ -13,6 +13,7 @@ import (
 	"go.opentelemetry.io/collector/component"
 	"go.opentelemetry.io/collector/consumer"
 	"go.opentelemetry.io/collector/pdata/ptrace"
+	"go.uber.org/zap"
 
 	"github.com/surpradhan/otel-agent-audit/exporter/agentauditexporter/internal/canonical"
 	"github.com/surpradhan/otel-agent-audit/exporter/agentauditexporter/internal/record"
@@ -27,13 +28,17 @@ type logEntry struct {
 
 type agentAuditExporter struct {
 	cfg     *Config
+	logger  *zap.Logger
 	signer  sign.Signer
 	logFile *os.File
 	mu      sync.Mutex
 }
 
-func newAgentAuditExporter(cfg *Config) *agentAuditExporter {
-	return &agentAuditExporter{cfg: cfg}
+func newAgentAuditExporter(cfg *Config, logger *zap.Logger) *agentAuditExporter {
+	if logger == nil {
+		logger = zap.NewNop()
+	}
+	return &agentAuditExporter{cfg: cfg, logger: logger}
 }
 
 func (e *agentAuditExporter) Start(_ context.Context, _ component.Host) error {
@@ -43,7 +48,7 @@ func (e *agentAuditExporter) Start(_ context.Context, _ component.Host) error {
 	}
 	e.signer = sign.NewEd25519Signer(priv)
 
-	f, err := os.OpenFile(e.cfg.LogPath, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0644)
+	f, err := os.OpenFile(e.cfg.LogPath, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0600)
 	if err != nil {
 		return fmt.Errorf("agentaudit: opening audit log %q: %w", e.cfg.LogPath, err)
 	}
@@ -67,7 +72,7 @@ func (e *agentAuditExporter) Capabilities() consumer.Capabilities {
 // ConsumeTraces processes spans from the OTel pipeline.
 //
 // B1 limitation: only the first span of the first ScopeSpans of the first
-// ResourceSpans is processed. Multi-span batches are silently truncated.
+// ResourceSpans is processed. Multi-span batches are truncated with a warning.
 // B2 will replace this with a full per-trace buffer and deterministic ordering.
 func (e *agentAuditExporter) ConsumeTraces(_ context.Context, td ptrace.Traces) error {
 	rss := td.ResourceSpans()
@@ -83,6 +88,11 @@ func (e *agentAuditExporter) ConsumeTraces(_ context.Context, td ptrace.Traces) 
 		return nil
 	}
 
+	if total := td.SpanCount(); total > 1 {
+		e.logger.Warn("agentaudit: B1 limitation: multi-span batch truncated to first span",
+			zap.Int("total_spans", total))
+	}
+
 	span := spans.At(0)
 	rec := record.SpanToRecord(span, 0)
 
@@ -91,16 +101,20 @@ func (e *agentAuditExporter) ConsumeTraces(_ context.Context, td ptrace.Traces) 
 		return fmt.Errorf("agentaudit: canonical marshal: %w", err)
 	}
 
-	// genesisSeed = SHA256(traceIDBytes ‖ SchemaVersion)
-	// Using the constant ensures a version bump propagates to the seed.
-	traceID := span.TraceID()
+	// Use hex.DecodeString(rec.TraceID) so the bytes fed into the genesis seed
+	// are derived from the stored record field, matching any verifier that
+	// reconstructs traceIDBytes from the log entry rather than the live span.
+	traceIDBytes, err := hex.DecodeString(rec.TraceID)
+	if err != nil {
+		return fmt.Errorf("agentaudit: decoding trace ID %q: %w", rec.TraceID, err)
+	}
 	h := sha256.New()
-	h.Write(traceID[:])
+	h.Write(traceIDBytes)
 	h.Write([]byte(record.SchemaVersion))
 	genesisSeed := h.Sum(nil)
 
-	// sigPayload is what Ed25519 signs directly (the library applies SHA-512 internally).
-	sigPayload := append(canonicalBytes, genesisSeed...)
+	// Three-index slice cap prevents append from aliasing into canonicalBytes.
+	sigPayload := append(canonicalBytes[:len(canonicalBytes):len(canonicalBytes)], genesisSeed...)
 
 	entryHashArr := sha256.Sum256(sigPayload)
 	entryHash := hex.EncodeToString(entryHashArr[:])

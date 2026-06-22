@@ -54,8 +54,14 @@ func TestSpanToRecord_Deterministic(t *testing.T) {
 	a := SpanToRecord(span, 0)
 	b := SpanToRecord(span, 0)
 
-	aJSON, _ := json.Marshal(a)
-	bJSON, _ := json.Marshal(b)
+	aJSON, err := json.Marshal(a)
+	if err != nil {
+		t.Fatalf("json.Marshal(a): %v", err)
+	}
+	bJSON, err := json.Marshal(b)
+	if err != nil {
+		t.Fatalf("json.Marshal(b): %v", err)
+	}
 
 	if string(aJSON) != string(bJSON) {
 		t.Error("SpanToRecord is non-deterministic: two calls on the same span produced different output")

@@ -1,6 +1,7 @@
 package agentauditexporter
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"crypto/sha256"
@@ -8,6 +9,7 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"sync"
 	"testing"
 
 	"go.opentelemetry.io/collector/component"
@@ -97,7 +99,7 @@ func TestConfig_Validate(t *testing.T) {
 }
 
 func TestCapabilities(t *testing.T) {
-	exp := newAgentAuditExporter(&Config{})
+	exp := newAgentAuditExporter(&Config{}, nil)
 	caps := exp.Capabilities()
 	if caps.MutatesData {
 		t.Error("MutatesData should be false")
@@ -106,7 +108,7 @@ func TestCapabilities(t *testing.T) {
 
 func TestStartShutdown(t *testing.T) {
 	cfg := testConfig(t)
-	exp := newAgentAuditExporter(cfg)
+	exp := newAgentAuditExporter(cfg, nil)
 	if err := exp.Start(context.Background(), nil); err != nil {
 		t.Fatalf("Start: %v", err)
 	}
@@ -117,7 +119,7 @@ func TestStartShutdown(t *testing.T) {
 
 func TestConsumeTraces_Empty(t *testing.T) {
 	cfg := testConfig(t)
-	exp := newAgentAuditExporter(cfg)
+	exp := newAgentAuditExporter(cfg, nil)
 	if err := exp.Start(context.Background(), nil); err != nil {
 		t.Fatalf("Start: %v", err)
 	}
@@ -153,7 +155,7 @@ func TestConsumeTraces_SignsAndVerifies(t *testing.T) {
 	logPath := filepath.Join(dir, "audit.jsonl")
 
 	cfg := &Config{LogPath: logPath, KeyPath: keyPath}
-	exp := newAgentAuditExporter(cfg)
+	exp := newAgentAuditExporter(cfg, nil)
 	if err := exp.Start(context.Background(), nil); err != nil {
 		t.Fatalf("Start: %v", err)
 	}
@@ -196,6 +198,8 @@ func TestConsumeTraces_SignsAndVerifies(t *testing.T) {
 	if err != nil {
 		t.Fatalf("re-marshal record: %v", err)
 	}
+	// hex.DecodeString(entry.Record.TraceID) yields the same 16 bytes as
+	// span.TraceID()[:] because rec.TraceID = span.TraceID().String() (lowercase hex).
 	traceIDBytes, err := hex.DecodeString(entry.Record.TraceID)
 	if err != nil {
 		t.Fatalf("decode trace ID: %v", err)
@@ -205,7 +209,8 @@ func TestConsumeTraces_SignsAndVerifies(t *testing.T) {
 	seedH.Write([]byte(record.SchemaVersion))
 	genesisSeed := seedH.Sum(nil)
 
-	sigPayload := append(canonicalBytes, genesisSeed...)
+	// Three-index slice cap prevents aliasing into canonicalBytes' backing array.
+	sigPayload := append(canonicalBytes[:len(canonicalBytes):len(canonicalBytes)], genesisSeed...)
 
 	// Verify the signature.
 	if err := sign.Verify(entry.Signed, sigPayload, pub); err != nil {
@@ -222,5 +227,53 @@ func TestConsumeTraces_SignsAndVerifies(t *testing.T) {
 	// Sanity: verify the record schema version.
 	if entry.Record.SchemaVersion != record.SchemaVersion {
 		t.Errorf("schema_version: got %q, want %q", entry.Record.SchemaVersion, record.SchemaVersion)
+	}
+}
+
+// TestConsumeTraces_Concurrent verifies that concurrent calls to ConsumeTraces
+// are race-safe and each produce exactly one JSONL entry.
+func TestConsumeTraces_Concurrent(t *testing.T) {
+	const N = 50
+	cfg := testConfig(t)
+	exp := newAgentAuditExporter(cfg, nil)
+	if err := exp.Start(context.Background(), nil); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	t.Cleanup(func() {
+		if err := exp.Shutdown(context.Background()); err != nil {
+			t.Errorf("Shutdown: %v", err)
+		}
+	})
+
+	var wg sync.WaitGroup
+	wg.Add(N)
+	for i := 0; i < N; i++ {
+		go func() {
+			defer wg.Done()
+			td := ptrace.NewTraces()
+			span := td.ResourceSpans().AppendEmpty().ScopeSpans().AppendEmpty().Spans().AppendEmpty()
+			span.SetTraceID(pcommon.TraceID([16]byte{1}))
+			span.SetSpanID(pcommon.SpanID([8]byte{1}))
+			span.SetName("gen_ai.chat")
+			if err := exp.ConsumeTraces(context.Background(), td); err != nil {
+				t.Errorf("ConsumeTraces: %v", err)
+			}
+		}()
+	}
+	wg.Wait()
+
+	data, err := os.ReadFile(cfg.LogPath)
+	if err != nil {
+		t.Fatalf("reading log: %v", err)
+	}
+	scanner := bufio.NewScanner(bytes.NewReader(data))
+	count := 0
+	for scanner.Scan() {
+		if scanner.Text() != "" {
+			count++
+		}
+	}
+	if count != N {
+		t.Errorf("expected %d log entries, got %d", N, count)
 	}
 }

@@ -142,9 +142,13 @@ fields in the order defined by the `AuditRecord` struct. This is a deterministic
 function: identical `AuditRecord` values produce byte-identical output across
 all runs and language implementations.
 
-The golden fixture is:
-- Input: `internal/record/testdata/v1_span_to_record_fixture.json`
-- Canonical output: `internal/canonical/testdata/v1_canonical_fixture.json`
+The golden fixture is (paths relative to repo root):
+- Input: `exporter/agentauditexporter/internal/record/testdata/v1_span_to_record_fixture.json`
+- Canonical output: `exporter/agentauditexporter/internal/canonical/testdata/v1_canonical_fixture.json`
+
+Note: the canonical fixture file ends with a single trailing newline added by editors.
+That newline is **not** part of the canonical bytes — `canonical.Marshal` produces
+compact JSON with no trailing newline. Tests strip trailing whitespace before comparing.
 
 ---
 
