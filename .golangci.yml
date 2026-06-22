@@ -5,8 +5,7 @@ linters:
     - govet
     - errcheck
     - staticcheck
-
-issues:
-  exclude-dirs:
-    - dist
-    - .claude
+  exclusions:
+    paths:
+      - dist
+      - .claude
