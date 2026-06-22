@@ -1,0 +1,5 @@
+blank_issues_enabled: false
+contact_links:
+  - name: OTel GenAI SIG (Mondays 09:00 PT)
+    url: https://github.com/open-telemetry/community/blob/main/community-members.md
+    about: Discuss guardrail/policy-decision semantics with the OTel GenAI agent SIG.
