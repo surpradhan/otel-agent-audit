@@ -170,7 +170,16 @@ func VerifyLog(logPath, checkpointPath string, pubKey ed25519.PublicKey) (Report
 	prevHash := chain.ZeroPrevCheckpointHash
 	for _, cp := range checkpoints {
 		// Compute the signing payload hash BEFORE checking (VerifyCheckpoint checks the field).
-		payload := checkpointSignPayload(cp)
+		payload, err := checkpointSignPayload(cp)
+		if err != nil {
+			verifyErrs = append(verifyErrs, VerifyError{
+				TraceID: "",
+				Kind:    "checkpoint",
+				Detail:  fmt.Sprintf("seq %d: %v", cp.CheckpointSeq, err),
+			})
+			report.CheckpointsVerified++
+			continue
+		}
 		h := sha256.Sum256(payload)
 
 		if err := VerifyCheckpoint(cp, prevHash, pubKey); err != nil {
@@ -220,7 +229,7 @@ type checkpointSigningStruct struct {
 }
 
 // checkpointSignPayload reconstructs the signing payload for a checkpoint.
-func checkpointSignPayload(cp chain.Checkpoint) []byte {
+func checkpointSignPayload(cp chain.Checkpoint) ([]byte, error) {
 	cfs := checkpointSigningStruct{
 		SchemaVersion:      cp.SchemaVersion,
 		CheckpointSeq:      cp.CheckpointSeq,
@@ -230,8 +239,11 @@ func checkpointSignPayload(cp chain.Checkpoint) []byte {
 		KeyID:              cp.KeyID,
 		Algorithm:          cp.Algorithm,
 	}
-	b, _ := json.Marshal(cfs)
-	return b
+	b, err := json.Marshal(cfs)
+	if err != nil {
+		return nil, fmt.Errorf("checkpoint: marshal signing payload: %w", err)
+	}
+	return b, nil
 }
 
 func readLogEntries(logPath string) (map[string][]chain.LogEntry, error) {
