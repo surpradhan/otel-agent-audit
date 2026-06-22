@@ -2,6 +2,7 @@ package agentauditexporter
 
 import (
 	"context"
+	"time"
 
 	"go.opentelemetry.io/collector/component"
 	"go.opentelemetry.io/collector/exporter"
@@ -19,7 +20,10 @@ func NewFactory() exporter.Factory {
 }
 
 func createDefaultConfig() component.Config {
-	return &Config{}
+	return &Config{
+		TraceTimeout:       30 * time.Second,
+		CheckpointInterval: 100,
+	}
 }
 
 func createTracesExporter(

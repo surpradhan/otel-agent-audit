@@ -1,51 +1,96 @@
+// Package agentauditexporter implements an OpenTelemetry Collector exporter that
+// writes a tamper-evident audit log of agent spans.
+//
+// B2 design: spans are buffered per trace_id. When a root span (parent_span_id == "")
+// is detected, or when a trace has been idle for TraceTimeout, the buffer is sealed:
+// spans are sorted by (start_time_unix_nano ASC, span_id ASC), SeqInTrace is
+// assigned, and BuildChain produces a per-entry hash chain. Each entry is written
+// as a JSONL line to the audit log. A signed checkpoint is written every
+// CheckpointInterval sealed traces and on Shutdown.
+//
+// Known B2 limitations:
+//   - If child spans arrive in a later ConsumeTraces batch than the root span,
+//     those children are not included in the sealed chain. Post-seal spans for an
+//     already-sealed trace_id are dropped with a warning log. This will be
+//     addressed in B3 with the agentauditselect processor.
+//   - sealedTraces grows without bound for long-running collectors. After
+//     WAL.Compact removes sealed entries, the corresponding sealedTraces entries
+//     are only needed to guard against re-sealing within the same process lifetime.
+//     B3 will add eviction after compaction.
+//
+// WAL: in-progress trace buffers are backed by a write-ahead log so a collector
+// restart does not introduce spurious gaps. Sealed traces are excluded from
+// Replay. Compact is run on Start (after Replay) and after each seal to
+// prevent unbounded WAL growth.
 package agentauditexporter
 
 import (
 	"context"
-	"crypto/sha256"
-	"encoding/base64"
-	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"sync"
+	"time"
 
 	"go.opentelemetry.io/collector/component"
 	"go.opentelemetry.io/collector/consumer"
 	"go.opentelemetry.io/collector/pdata/ptrace"
 	"go.uber.org/zap"
 
-	"github.com/surpradhan/otel-agent-audit/exporter/agentauditexporter/internal/canonical"
+	"github.com/surpradhan/otel-agent-audit/exporter/agentauditexporter/internal/chain"
 	"github.com/surpradhan/otel-agent-audit/exporter/agentauditexporter/internal/record"
 	"github.com/surpradhan/otel-agent-audit/exporter/agentauditexporter/internal/sign"
+	"github.com/surpradhan/otel-agent-audit/exporter/agentauditexporter/internal/wal"
 )
 
-// logEntry is the JSON object written to the audit log for each processed span.
-type logEntry struct {
-	Record record.AuditRecord `json:"record"`
-	Signed sign.SignedEntry   `json:"signed"`
+// traceBuffer holds spans received for one in-progress trace.
+type traceBuffer struct {
+	records  map[string]record.AuditRecord // keyed by span_id for dedup
+	lastSeen time.Time
+	hasRoot  bool
 }
 
 type agentAuditExporter struct {
-	cfg     *Config
-	logger  *zap.Logger
-	signer  sign.Signer
-	logFile *os.File
-	mu      sync.Mutex
+	cfg          *Config
+	logger       *zap.Logger
+	signer       sign.Signer
+	logFile      *os.File
+	checkFile    *os.File
+	wal          *wal.WAL
+	accumulator  *chain.Accumulator
+	buffers      map[string]*traceBuffer  // guarded by mu
+	// sealedTraces guards against re-sealing a trace within one process lifetime.
+	// TODO(B3): after WAL.Compact, evict sealedTraces entries — they only need to
+	// persist for the duration between seal and compaction, not forever.
+	sealedTraces map[string]struct{} // guarded by mu
+	mu           sync.Mutex
+	compactWG    sync.WaitGroup // tracks background Compact goroutines
+	stopCh       chan struct{}
+	doneCh       chan struct{}
+}
+
+// effectiveCheckpointInterval returns the configured interval with a default
+// of 100 applied when unset (zero). Centralizes the three-way repeated default.
+func (e *agentAuditExporter) effectiveCheckpointInterval() int {
+	if e.cfg.CheckpointInterval > 0 {
+		return e.cfg.CheckpointInterval
+	}
+	return 100
 }
 
 func newAgentAuditExporter(cfg *Config, logger *zap.Logger) *agentAuditExporter {
 	if logger == nil {
 		logger = zap.NewNop()
 	}
-	return &agentAuditExporter{cfg: cfg, logger: logger}
+	return &agentAuditExporter{
+		cfg:    cfg,
+		logger: logger,
+	}
 }
 
-// Start loads the signing key and opens the audit log for appending.
-// The OTel Collector service guarantees Start is called at most once per
-// component instance. A second Start call would overwrite signer and logFile
-// without closing the previous handle; B2 will add a guard if the component
-// is promoted to a lifecycle that permits re-start.
+// Start loads the signing key, opens all files, replays the WAL, and starts
+// the background goroutine that seals timed-out traces.
 func (e *agentAuditExporter) Start(_ context.Context, _ component.Host) error {
 	priv, err := sign.LoadEd25519PrivateKeyPEM(e.cfg.KeyPath)
 	if err != nil {
@@ -53,23 +98,177 @@ func (e *agentAuditExporter) Start(_ context.Context, _ component.Host) error {
 	}
 	e.signer = sign.NewEd25519Signer(priv)
 
-	f, err := os.OpenFile(e.cfg.LogPath, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0600)
+	// Open audit log.
+	logF, err := os.OpenFile(e.cfg.LogPath, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0600)
 	if err != nil {
 		return fmt.Errorf("agentaudit: opening audit log %q: %w", e.cfg.LogPath, err)
 	}
-	e.logFile = f
+	e.logFile = logF
+
+	// Open checkpoint file.
+	checkF, err := os.OpenFile(e.cfg.CheckpointPath, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0600)
+	if err != nil {
+		_ = logF.Close()
+		return fmt.Errorf("agentaudit: opening checkpoint file %q: %w", e.cfg.CheckpointPath, err)
+	}
+	e.checkFile = checkF
+
+	// Open WAL.
+	w, err := wal.Open(e.cfg.WalPath)
+	if err != nil {
+		_ = logF.Close()
+		_ = checkF.Close()
+		return fmt.Errorf("agentaudit: opening WAL %q: %w", e.cfg.WalPath, err)
+	}
+	e.wal = w
+
+	// Replay WAL to rehydrate in-progress buffers.
+	replayed, err := w.Replay()
+	if err != nil {
+		_ = logF.Close()
+		_ = checkF.Close()
+		_ = w.Close()
+		return fmt.Errorf("agentaudit: WAL replay: %w", err)
+	}
+
+	now := time.Now()
+	e.buffers = make(map[string]*traceBuffer, len(replayed))
+	e.sealedTraces = make(map[string]struct{})
+	for traceID, recs := range replayed {
+		buf := &traceBuffer{
+			records:  make(map[string]record.AuditRecord, len(recs)),
+			lastSeen: now,
+		}
+		for _, rec := range recs {
+			buf.records[rec.SpanID] = rec
+			if rec.ParentSpanID == "" {
+				buf.hasRoot = true
+			}
+		}
+		e.buffers[traceID] = buf
+	}
+
+	// Compact WAL after replay to remove any sealed entries from before the crash.
+	if err := w.Compact(); err != nil {
+		e.logger.Warn("agentaudit: WAL compact after replay failed", zap.Error(err))
+	}
+
+	// Initialize accumulator at seq=0 with ZeroPrevCheckpointHash.
+	// TODO(B3): persist and reload seq+prevHash from the last checkpoint on restart.
+	e.accumulator = chain.NewAccumulator(e.signer, 0, chain.ZeroPrevCheckpointHash)
+
+	traceTimeout := e.cfg.TraceTimeout
+	if traceTimeout <= 0 {
+		traceTimeout = 30 * time.Second
+	}
+
+	e.stopCh = make(chan struct{})
+	e.doneCh = make(chan struct{})
+
+	go e.backgroundWorker(traceTimeout, e.effectiveCheckpointInterval())
+
 	return nil
 }
 
-func (e *agentAuditExporter) Shutdown(_ context.Context) error {
-	e.mu.Lock()
-	defer e.mu.Unlock()
-	if e.logFile != nil {
-		err := e.logFile.Close()
-		e.logFile = nil
-		return err
+// backgroundWorker runs until stopCh is closed. It wakes every traceTimeout/2
+// and seals traces that have been idle for at least traceTimeout.
+func (e *agentAuditExporter) backgroundWorker(traceTimeout time.Duration, checkpointInterval int) {
+	defer close(e.doneCh)
+	ticker := time.NewTicker(traceTimeout / 2)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-e.stopCh:
+			return
+		case now := <-ticker.C:
+			e.mu.Lock()
+			for traceID, buf := range e.buffers {
+				if now.Sub(buf.lastSeen) >= traceTimeout {
+					e.logger.Info("agentaudit: sealing timed-out trace",
+						zap.String("trace_id", traceID),
+						zap.Duration("idle", now.Sub(buf.lastSeen)))
+					e.sealTrace(traceID, buf, checkpointInterval)
+				}
+			}
+			e.mu.Unlock()
+		}
 	}
-	return nil
+}
+
+// Shutdown follows the explicit 8-step ordering from the B2 plan:
+//  1. close(stopCh)
+//  2. <-doneCh          — block until background goroutine exits and releases mu
+//  3. mu.Lock()
+//  4. force-seal all remaining buffers
+//  5. write final checkpoint
+//  6. mu.Unlock()
+//  7. compactWG.Wait()  — wait for background Compact goroutines
+//  8. close logFile, checkFile; WAL.Compact(); WAL.Close()
+func (e *agentAuditExporter) Shutdown(ctx context.Context) error {
+	if e.stopCh == nil {
+		// Start was never called (e.g. factory test).
+		return nil
+	}
+
+	// Step 1.
+	close(e.stopCh)
+
+	// Step 2.
+	<-e.doneCh
+
+	// Step 3.
+	e.mu.Lock()
+
+	// Step 4: force-seal all remaining buffers.
+	for traceID, buf := range e.buffers {
+		e.sealTrace(traceID, buf, e.effectiveCheckpointInterval())
+	}
+
+	// Step 5: write final checkpoint if there are pending tips.
+	if e.accumulator.PendingCount() > 0 {
+		if err := e.writeCheckpoint(); err != nil {
+			e.logger.Error("agentaudit: writing final checkpoint", zap.Error(err))
+		}
+	}
+
+	// Step 6.
+	e.mu.Unlock()
+
+	// Step 7: wait for all background Compact goroutines, honoring ctx.
+	waitDone := make(chan struct{})
+	go func() { e.compactWG.Wait(); close(waitDone) }()
+	select {
+	case <-waitDone:
+	case <-ctx.Done():
+		e.logger.Warn("agentaudit: Shutdown context expired waiting for Compact goroutines")
+	}
+
+	// Step 8: close files and compact WAL one final time.
+	var errs []error
+	if e.logFile != nil {
+		if err := e.logFile.Close(); err != nil {
+			errs = append(errs, fmt.Errorf("closing log file: %w", err))
+		}
+		e.logFile = nil
+	}
+	if e.checkFile != nil {
+		if err := e.checkFile.Close(); err != nil {
+			errs = append(errs, fmt.Errorf("closing checkpoint file: %w", err))
+		}
+		e.checkFile = nil
+	}
+	if e.wal != nil {
+		if err := e.wal.Compact(); err != nil {
+			e.logger.Warn("agentaudit: final WAL compact failed", zap.Error(err))
+		}
+		if err := e.wal.Close(); err != nil {
+			errs = append(errs, fmt.Errorf("closing WAL: %w", err))
+		}
+		e.wal = nil
+	}
+
+	return errors.Join(errs...)
 }
 
 func (e *agentAuditExporter) Capabilities() consumer.Capabilities {
@@ -77,82 +276,203 @@ func (e *agentAuditExporter) Capabilities() consumer.Capabilities {
 }
 
 // ConsumeTraces processes spans from the OTel pipeline.
-//
-// B1 limitation: only the first span of the first ScopeSpans of the first
-// ResourceSpans is processed. Multi-span batches are truncated with a warning.
-// B2 will replace this with a full per-trace buffer and deterministic ordering.
+// Each span is added to its trace's buffer. If the trace now has a root span
+// (parent_span_id == ""), the entire buffer is sealed immediately.
 func (e *agentAuditExporter) ConsumeTraces(_ context.Context, td ptrace.Traces) error {
+	now := time.Now()
+	checkpointInterval := e.effectiveCheckpointInterval()
+
 	rss := td.ResourceSpans()
-	if rss.Len() == 0 {
+	for i := 0; i < rss.Len(); i++ {
+		scopeSpans := rss.At(i).ScopeSpans()
+		for j := 0; j < scopeSpans.Len(); j++ {
+			spans := scopeSpans.At(j).Spans()
+			for k := 0; k < spans.Len(); k++ {
+				span := spans.At(k)
+				// Use seqInTrace=0 as a placeholder; real seq is assigned in sealTrace.
+				rec := record.SpanToRecord(span, 0)
+
+				e.mu.Lock()
+				err := e.bufferSpan(rec, now, checkpointInterval)
+				e.mu.Unlock()
+
+				if err != nil {
+					return err
+				}
+			}
+		}
+	}
+	return nil
+}
+
+// bufferSpan adds rec to its trace's buffer. If a root span is found, seals immediately.
+// Called under e.mu.
+func (e *agentAuditExporter) bufferSpan(rec record.AuditRecord, now time.Time, checkpointInterval int) error {
+	traceID := rec.TraceID
+	if traceID == "" {
+		e.logger.Warn("agentaudit: span with empty trace_id, dropping")
 		return nil
 	}
-	ss := rss.At(0).ScopeSpans()
-	if ss.Len() == 0 {
+
+	// Drop spans for already-sealed traces. A second root span would create a second
+	// chain for the same trace_id, making the log ambiguous for verifiers.
+	if _, sealed := e.sealedTraces[traceID]; sealed {
+		e.logger.Warn("agentaudit: span for already-sealed trace, dropping",
+			zap.String("trace_id", traceID))
 		return nil
 	}
-	spans := ss.At(0).Spans()
-	if spans.Len() == 0 {
-		return nil
+
+	buf := e.buffers[traceID]
+	if buf == nil {
+		buf = &traceBuffer{
+			records:  make(map[string]record.AuditRecord),
+			lastSeen: now,
+		}
+		e.buffers[traceID] = buf
 	}
 
-	if total := td.SpanCount(); total > 1 {
-		e.logger.Warn("agentaudit: B1 limitation: multi-span batch truncated to first span",
-			zap.Int("total_spans", total))
+	// Dedup by span_id: last write wins (idempotent for re-delivered spans).
+	buf.records[rec.SpanID] = rec
+	buf.lastSeen = now
+	if rec.ParentSpanID == "" {
+		buf.hasRoot = true
 	}
 
-	span := spans.At(0)
-	rec := record.SpanToRecord(span, 0)
+	// Write to WAL for crash recovery (before sealing).
+	if e.wal != nil {
+		if err := e.wal.AppendSpan(traceID, rec); err != nil {
+			e.logger.Warn("agentaudit: WAL append span failed",
+				zap.String("trace_id", traceID), zap.Error(err))
+		}
+	}
 
-	canonicalBytes, err := canonical.Marshal(rec)
+	// Seal immediately on root span detection.
+	if buf.hasRoot {
+		e.sealTrace(traceID, buf, checkpointInterval)
+	}
+
+	return nil
+}
+
+// sealTrace seals a trace buffer: sorts, assigns SeqInTrace, builds the chain,
+// writes JSONL entries, updates the accumulator, and marks the WAL sealed.
+// Called under e.mu. Compact is dispatched in a goroutine OUTSIDE the lock
+// (but the goroutine is started while we still hold the lock so compactWG.Add
+// happens before Shutdown's compactWG.Wait).
+func (e *agentAuditExporter) sealTrace(traceID string, buf *traceBuffer, checkpointInterval int) {
+	// Extract records as a slice.
+	recs := make([]record.AuditRecord, 0, len(buf.records))
+	for _, rec := range buf.records {
+		recs = append(recs, rec)
+	}
+
+	// Remove from buffers and mark sealed so future spans for this trace_id are dropped.
+	delete(e.buffers, traceID)
+	e.sealedTraces[traceID] = struct{}{}
+
+	if len(recs) == 0 {
+		return
+	}
+
+	// Step 1: sort in-place.
+	chain.SortRecords(recs)
+
+	// Step 2: assign SeqInTrace BEFORE BuildChain.
+	for i := range recs {
+		recs[i].SeqInTrace = i
+	}
+
+	// Step 3: build chain.
+	genesisSeed, err := chain.GenesisSeed(traceID)
 	if err != nil {
-		return fmt.Errorf("agentaudit: canonical marshal: %w", err)
+		e.logger.Error("agentaudit: genesis seed", zap.String("trace_id", traceID), zap.Error(err))
+		return
 	}
 
-	// Use hex.DecodeString(rec.TraceID) so the bytes fed into the genesis seed
-	// are derived from the stored record field, matching any verifier that
-	// reconstructs traceIDBytes from the log entry rather than the live span.
-	traceIDBytes, err := hex.DecodeString(rec.TraceID)
+	entries, err := chain.BuildChain(recs, genesisSeed, e.signer)
 	if err != nil {
-		return fmt.Errorf("agentaudit: decoding trace ID %q: %w", rec.TraceID, err)
-	}
-	h := sha256.New()
-	h.Write(traceIDBytes)
-	h.Write([]byte(record.SchemaVersion))
-	genesisSeed := h.Sum(nil)
-
-	// Three-index slice cap prevents append from aliasing into canonicalBytes.
-	sigPayload := append(canonicalBytes[:len(canonicalBytes):len(canonicalBytes)], genesisSeed...)
-
-	entryHashArr := sha256.Sum256(sigPayload)
-	entryHash := hex.EncodeToString(entryHashArr[:])
-
-	sig, err := e.signer.Sign(sigPayload)
-	if err != nil {
-		return fmt.Errorf("agentaudit: signing entry: %w", err)
+		e.logger.Error("agentaudit: build chain", zap.String("trace_id", traceID), zap.Error(err))
+		return
 	}
 
-	entry := logEntry{
-		Record: rec,
-		Signed: sign.SignedEntry{
-			KeyID:     e.signer.KeyID(),
-			Algorithm: "ed25519",
-			EntryHash: entryHash,
-			Signature: base64.StdEncoding.EncodeToString(sig),
-		},
+	// Step 4: write each entry as a JSONL line.
+	logEntries := chain.ToLogEntries(entries)
+	for _, le := range logEntries {
+		if err := e.writeLogEntry(le); err != nil {
+			e.logger.Error("agentaudit: write log entry",
+				zap.String("trace_id", traceID), zap.Error(err))
+			return
+		}
 	}
 
-	line, err := json.Marshal(entry)
-	if err != nil {
-		return fmt.Errorf("agentaudit: marshaling log entry: %w", err)
+	// Step 5: update accumulator.
+	tipHash := chain.TipHash(entries)
+	e.accumulator.AddTip(traceID, tipHash, len(entries))
+
+	// Step 6: checkpoint if interval reached.
+	if e.accumulator.PendingCount() >= checkpointInterval {
+		if err := e.writeCheckpoint(); err != nil {
+			e.logger.Error("agentaudit: write checkpoint", zap.Error(err))
+		}
 	}
 
-	e.mu.Lock()
-	defer e.mu.Unlock()
+	// Step 7: mark WAL sealed (calls Sync).
+	if e.wal != nil {
+		if err := e.wal.MarkSealed(traceID); err != nil {
+			e.logger.Error("agentaudit: WAL mark sealed",
+				zap.String("trace_id", traceID), zap.Error(err))
+		}
+	}
+
+	// Step 8: schedule compact OUTSIDE the lock (goroutine is launched while lock is held
+	// so compactWG.Add(1) is observed by Shutdown's compactWG.Wait()).
+	if e.wal != nil {
+		e.compactWG.Add(1)
+		w := e.wal
+		go func() {
+			defer e.compactWG.Done()
+			if err := w.Compact(); err != nil {
+				e.logger.Warn("agentaudit: background WAL compact failed", zap.Error(err))
+			}
+		}()
+	}
+}
+
+// writeLogEntry marshals a LogEntry and appends it as a JSONL line.
+// Called under e.mu.
+func (e *agentAuditExporter) writeLogEntry(le chain.LogEntry) error {
 	if e.logFile == nil {
-		return fmt.Errorf("agentaudit: ConsumeTraces called before Start or after Shutdown")
+		return fmt.Errorf("agentaudit: logFile is nil (Start not called?)")
+	}
+	line, err := json.Marshal(le)
+	if err != nil {
+		return fmt.Errorf("agentaudit: marshal log entry: %w", err)
 	}
 	if _, err := fmt.Fprintf(e.logFile, "%s\n", line); err != nil {
-		return fmt.Errorf("agentaudit: writing log entry: %w", err)
+		return fmt.Errorf("agentaudit: write log entry: %w", err)
+	}
+	return nil
+}
+
+// writeCheckpoint builds and writes a checkpoint to the checkpoint file.
+// Called under e.mu.
+func (e *agentAuditExporter) writeCheckpoint() error {
+	if e.checkFile == nil {
+		return fmt.Errorf("agentaudit: checkFile is nil")
+	}
+	cp, err := e.accumulator.Build(time.Now())
+	if err != nil {
+		return fmt.Errorf("agentaudit: build checkpoint: %w", err)
+	}
+	line, err := json.Marshal(cp)
+	if err != nil {
+		return fmt.Errorf("agentaudit: marshal checkpoint: %w", err)
+	}
+	if _, err := fmt.Fprintf(e.checkFile, "%s\n", line); err != nil {
+		return fmt.Errorf("agentaudit: write checkpoint: %w", err)
+	}
+	if err := e.checkFile.Sync(); err != nil {
+		return fmt.Errorf("agentaudit: sync checkpoint: %w", err)
 	}
 	return nil
 }
