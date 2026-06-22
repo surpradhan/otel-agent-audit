@@ -89,6 +89,12 @@ objects, not a map. The sort order is fixed by the `attributeAllowlist` in
 Only attributes present in the span are included; missing allowlist keys are
 omitted (no null entries). The resulting array preserves the allowlist order.
 
+**Cross-impl note:** when no allowlisted attributes are present, the Go exporter
+produces `"selected_attributes":null` (JSON null), not `"selected_attributes":[]`
+(empty array). Verifiers written in other languages MUST treat both as equivalent
+to "no attributes." Do not normalize one to the other — doing so would change
+canonical bytes for a previously stored record.
+
 ---
 
 ## 5. Entry construction protocol

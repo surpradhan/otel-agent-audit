@@ -41,6 +41,11 @@ func newAgentAuditExporter(cfg *Config, logger *zap.Logger) *agentAuditExporter 
 	return &agentAuditExporter{cfg: cfg, logger: logger}
 }
 
+// Start loads the signing key and opens the audit log for appending.
+// The OTel Collector service guarantees Start is called at most once per
+// component instance. A second Start call would overwrite signer and logFile
+// without closing the previous handle; B2 will add a guard if the component
+// is promoted to a lifecycle that permits re-start.
 func (e *agentAuditExporter) Start(_ context.Context, _ component.Host) error {
 	priv, err := sign.LoadEd25519PrivateKeyPEM(e.cfg.KeyPath)
 	if err != nil {
