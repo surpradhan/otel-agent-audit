@@ -97,30 +97,53 @@ canonical bytes for a previously stored record.
 
 ---
 
-## 5. Entry construction protocol
+## 5. Entry construction protocol (B2 — multi-entry chain)
 
 This is the exact byte-level protocol used by `exporter.go` and expected by
-any verifier.
+any verifier. B2 extends B1 with per-trace hash chaining.
+
+### SeqInTrace ordering invariant
+
+`seq_in_trace` is assigned to each `AuditRecord` **after** sorting by
+`(start_time_unix_nano ASC, span_id ASC)` and **before** canonical
+serialization. The canonical bytes for entry `i` include `"seq_in_trace":i`;
+this is load-bearing for the chain.
+
+### Per-entry chain computation
 
 ```
-1. rec           = SpanToRecord(span, seqInTrace)
-2. canonicalBytes = canonical.Marshal(rec)          // compact JSON, field order per §2
-3. traceIDBytes  = hex.DecodeString(rec.TraceID)    // 16 raw bytes
-4. genesisSeed   = SHA256(traceIDBytes ‖ []byte(SchemaVersion))
-5. sigPayload    = append(canonicalBytes, genesisSeed...)
-6. entryHash     = SHA256(sigPayload)               // hex-encoded; used for B2 chain-linking
-7. signature     = ed25519.Sign(privKey, sigPayload) // base64-encoded; NOT a pre-hash
+// For each trace with N spans:
+genesisSeed = SHA256(hex.DecodeString(trace_id) ‖ []byte("v1"))
+
+// Step 1: sort records by (start_time_unix_nano ASC, span_id ASC)
+// Step 2: assign seq_in_trace = i (before canonicalizing)
+
+for i in 0..N-1:
+    canonicalBytes[i] = canonical.Marshal(records[i])   // includes seq_in_trace = i
+    prev[i]           = genesisSeed       if i == 0
+    prev[i]           = entryHash[i-1]    if i  > 0
+    sigPayload[i]     = append(canonicalBytes[i][:len:len], prev[i]...)  // three-index cap
+    entryHash[i]      = hex(SHA256(sigPayload[i]))
+    signature[i]      = base64(ed25519.Sign(privKey, sigPayload[i]))
 ```
 
-The log entry JSON:
+**Backward compatibility:** for a single-span trace (N=1, seq=0, prev=genesisSeed),
+this is identical to B1.
+
+**Known B2 limitation:** if child spans arrive in a later batch than the root
+span (the span with `parent_span_id: ""`), those children are not included in the
+sealed chain. Post-seal spans for an already-sealed `trace_id` are dropped with
+a warning log.
+
+The log entry JSON (one JSONL line per entry):
 ```json
 {
   "record": { <AuditRecord fields per §2> },
   "signed": {
     "key_id":    "<hex(SHA256(publicKey))>",
     "algorithm": "ed25519",
-    "entry_hash": "<hex(SHA256(sigPayload))>",
-    "signature":  "<base64(ed25519.Sign(privKey, sigPayload))>"
+    "entry_hash": "<hex(SHA256(sigPayload[i]))>",
+    "signature":  "<base64(ed25519.Sign(privKey, sigPayload[i]))>"
   }
 }
 ```
@@ -128,12 +151,14 @@ The log entry JSON:
 ### Verification
 
 A verifier MUST:
-1. Reconstruct `canonicalBytes` by re-marshaling `record` from the log entry.
-2. Re-derive `traceIDBytes` from `record.trace_id` and `genesisSeed` as in step 4.
-3. Reconstruct `sigPayload = append(canonicalBytes, genesisSeed...)`.
-4. Verify the Ed25519 signature: `ed25519.Verify(pubKey, sigPayload, base64Decode(signed.signature))`.
-5. Optionally cross-check `entryHash = hex(SHA256(sigPayload))` to detect
-   inconsistency between the stored hash and the recomputed canonical bytes.
+1. Group log entries by `trace_id`; sort by `seq_in_trace`.
+2. Re-derive `genesisSeed` from `record.trace_id` as above.
+3. For each entry `i`: reconstruct `canonicalBytes[i]` by re-marshaling
+   `record` (this includes `seq_in_trace = i`).
+4. Reconstruct `prev[i]` (genesisSeed for i=0; entryHash[i-1] for i>0).
+5. Reconstruct `sigPayload[i] = append(canonicalBytes[i][:len:len], prev[i]...)`.
+6. Verify the Ed25519 signature: `ed25519.Verify(pubKey, sigPayload[i], base64Decode(signed.signature))`.
+7. Cross-check `entryHash[i] = hex(SHA256(sigPayload[i]))` against `signed.entry_hash`.
 
 The verifier MUST NOT derive `sigPayload` from the stored `entry_hash` — only
 from a fresh re-serialization of `record`. This ensures a tampered record
@@ -148,11 +173,12 @@ fields in the order defined by the `AuditRecord` struct. This is a deterministic
 function: identical `AuditRecord` values produce byte-identical output across
 all runs and language implementations.
 
-The golden fixture is (paths relative to repo root):
+The golden fixtures (paths relative to repo root):
 - Input: `exporter/agentauditexporter/internal/record/testdata/v1_span_to_record_fixture.json`
-- Canonical output: `exporter/agentauditexporter/internal/canonical/testdata/v1_canonical_fixture.json`
+- Canonical output (seq_in_trace=0): `exporter/agentauditexporter/internal/canonical/testdata/v1_canonical_fixture.json`
+- Canonical output (seq_in_trace=1): `exporter/agentauditexporter/internal/canonical/testdata/v1_canonical_seq1_fixture.json`
 
-Note: the canonical fixture file ends with a single trailing newline added by editors.
+Note: the canonical fixture files end with a single trailing newline added by editors.
 That newline is **not** part of the canonical bytes — `canonical.Marshal` produces
 compact JSON with no trailing newline. Tests strip trailing whitespace before comparing.
 
@@ -167,3 +193,76 @@ key epoch; all entries signed after rotation carry the new `key_id`. Entries
 from before rotation remain verifiable against the old epoch's public key.
 Key distribution is out of scope for v1 and will be specified in
 `docs/verification.md` (B4).
+
+---
+
+## 8. Checkpoint format (B2)
+
+A **checkpoint** is a signed commitment to all sealed trace chain tips since
+the previous checkpoint. Checkpoints are written every `checkpoint_interval`
+sealed traces (default 100) and on `Shutdown`.
+
+### JSON format (one JSONL line per checkpoint)
+
+```json
+{
+  "schema_version": "v1",
+  "checkpoint_seq": 1,
+  "timestamp": "2026-06-22T14:30:00Z",
+  "prev_checkpoint_hash": "0000000000000000000000000000000000000000000000000000000000000000",
+  "trace_tips": [
+    {"trace_id": "…", "tip_hash": "…", "entry_count": 3}
+  ],
+  "key_id": "…",
+  "algorithm": "ed25519",
+  "signature": "…"
+}
+```
+
+### Fields
+
+| JSON key | Type | Description |
+|---|---|---|
+| `schema_version` | `string` | Always `"v1"` |
+| `checkpoint_seq` | `uint64` | Starts at 1, increments by 1 per checkpoint. A gap indicates a missing checkpoint |
+| `timestamp` | `string` | RFC3339 UTC timestamp when the checkpoint was built |
+| `prev_checkpoint_hash` | `string` | `hex(SHA256(prev checkpointForSigning bytes))`; `"000…0"` (64 zeros) for the first checkpoint |
+| `trace_tips` | `array` | Sorted by `trace_id`. Each element: `{trace_id, tip_hash, entry_count}` |
+| `key_id` | `string` | Same key identity as audit log entries |
+| `algorithm` | `string` | Always `"ed25519"` |
+| `signature` | `string` | `base64(ed25519.Sign(privKey, checkpointForSigning))` |
+
+### First-checkpoint sentinel
+
+`prev_checkpoint_hash` for the very first checkpoint is the constant
+`chain.ZeroPrevCheckpointHash = "0000000000000000000000000000000000000000000000000000000000000000"`
+(64 ASCII '0' characters = hex encoding of 32 zero bytes).
+
+### Signing protocol
+
+The signing payload (`checkpointForSigning`) is the compact JSON of all fields
+except `signature`, in the same field order. `trace_tips` is sorted by `trace_id`
+before marshaling to ensure deterministic bytes across implementations.
+
+`prev_checkpoint_hash` = `hex(SHA256(prev checkpointForSigning bytes))`.
+The first checkpoint uses the zero sentinel.
+
+### Checkpoint verification
+
+A verifier MUST:
+1. Parse checkpoints in order (by `checkpoint_seq`).
+2. Re-derive `checkpointForSigning` bytes (all fields except `signature`, sorted `trace_tips`).
+3. Verify `prev_checkpoint_hash` equals `hex(SHA256(prev checkpointForSigning bytes))`.
+4. Verify `ed25519.Verify(pubKey, checkpointForSigning, base64Decode(signature))`.
+5. For each `trace_tip`, cross-check `entry_count` against the number of log
+   entries for that `trace_id` to detect post-seal deletions.
+
+**Policy for traces not covered by any checkpoint:** counted in
+`Report.TracesVerified` but not reported as errors (they are
+"unchecked-by-checkpoint"). Rationale: the last batch before a crash may have
+been written to the log before the final Shutdown checkpoint was persisted;
+treating this as an error would produce false positives on clean restarts.
+
+### Cross-impl fixture
+
+- `exporter/agentauditexporter/internal/chain/testdata/v1_checkpoint_fixture.json`

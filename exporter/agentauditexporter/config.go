@@ -1,6 +1,9 @@
 package agentauditexporter
 
-import "errors"
+import (
+	"errors"
+	"time"
+)
 
 // Config holds configuration for the agentaudit exporter.
 type Config struct {
@@ -12,6 +15,22 @@ type Config struct {
 	// format (block type "PRIVATE KEY").
 	// Required.
 	KeyPath string `mapstructure:"key_path"`
+
+	// WalPath is the path to the write-ahead log for in-progress trace buffers.
+	// Required. Must be distinct from LogPath and CheckpointPath.
+	WalPath string `mapstructure:"wal_path"`
+
+	// CheckpointPath is the path to the JSONL checkpoint file.
+	// Required. Must be distinct from LogPath and WalPath.
+	CheckpointPath string `mapstructure:"checkpoint_path"`
+
+	// TraceTimeout is the maximum time a trace buffer is held open waiting
+	// for more spans before being force-sealed. Default: 30s.
+	TraceTimeout time.Duration `mapstructure:"trace_timeout"`
+
+	// CheckpointInterval is the number of sealed traces that trigger an
+	// automatic checkpoint write. Default: 100.
+	CheckpointInterval int `mapstructure:"checkpoint_interval"`
 }
 
 // Validate checks that the configuration is valid.
@@ -24,6 +43,16 @@ func (c *Config) Validate() error {
 	}
 	if c.KeyPath == "" {
 		return errors.New("key_path is required")
+	}
+	if c.WalPath == "" {
+		return errors.New("wal_path is required")
+	}
+	if c.CheckpointPath == "" {
+		return errors.New("checkpoint_path is required")
+	}
+	// Prevent operator misconfiguration from corrupting multiple log files.
+	if c.LogPath == c.WalPath || c.LogPath == c.CheckpointPath || c.WalPath == c.CheckpointPath {
+		return errors.New("log_path, wal_path, and checkpoint_path must all be distinct")
 	}
 	return nil
 }
