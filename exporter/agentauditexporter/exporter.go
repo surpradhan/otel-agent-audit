@@ -22,6 +22,7 @@ package agentauditexporter
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"sync"
@@ -46,18 +47,28 @@ type traceBuffer struct {
 }
 
 type agentAuditExporter struct {
-	cfg         *Config
-	logger      *zap.Logger
-	signer      sign.Signer
-	logFile     *os.File
-	checkFile   *os.File
-	wal         *wal.WAL
-	accumulator *chain.Accumulator
-	buffers     map[string]*traceBuffer // guarded by mu
-	mu          sync.Mutex
-	compactWG   sync.WaitGroup // tracks background Compact goroutines
-	stopCh      chan struct{}
-	doneCh      chan struct{}
+	cfg          *Config
+	logger       *zap.Logger
+	signer       sign.Signer
+	logFile      *os.File
+	checkFile    *os.File
+	wal          *wal.WAL
+	accumulator  *chain.Accumulator
+	buffers      map[string]*traceBuffer  // guarded by mu
+	sealedTraces map[string]struct{}      // guarded by mu; prevents re-sealing a trace
+	mu           sync.Mutex
+	compactWG    sync.WaitGroup // tracks background Compact goroutines
+	stopCh       chan struct{}
+	doneCh       chan struct{}
+}
+
+// effectiveCheckpointInterval returns the configured interval with a default
+// of 100 applied when unset (zero). Centralizes the three-way repeated default.
+func (e *agentAuditExporter) effectiveCheckpointInterval() int {
+	if e.cfg.CheckpointInterval > 0 {
+		return e.cfg.CheckpointInterval
+	}
+	return 100
 }
 
 func newAgentAuditExporter(cfg *Config, logger *zap.Logger) *agentAuditExporter {
@@ -114,6 +125,7 @@ func (e *agentAuditExporter) Start(_ context.Context, _ component.Host) error {
 
 	now := time.Now()
 	e.buffers = make(map[string]*traceBuffer, len(replayed))
+	e.sealedTraces = make(map[string]struct{})
 	for traceID, recs := range replayed {
 		buf := &traceBuffer{
 			records:  make(map[string]record.AuditRecord, len(recs)),
@@ -137,20 +149,15 @@ func (e *agentAuditExporter) Start(_ context.Context, _ component.Host) error {
 	// TODO(B3): persist and reload seq+prevHash from the last checkpoint on restart.
 	e.accumulator = chain.NewAccumulator(e.signer, 0, chain.ZeroPrevCheckpointHash)
 
-	// Effective defaults.
 	traceTimeout := e.cfg.TraceTimeout
 	if traceTimeout <= 0 {
 		traceTimeout = 30 * time.Second
-	}
-	checkpointInterval := e.cfg.CheckpointInterval
-	if checkpointInterval <= 0 {
-		checkpointInterval = 100
 	}
 
 	e.stopCh = make(chan struct{})
 	e.doneCh = make(chan struct{})
 
-	go e.backgroundWorker(traceTimeout, checkpointInterval)
+	go e.backgroundWorker(traceTimeout, e.effectiveCheckpointInterval())
 
 	return nil
 }
@@ -190,7 +197,7 @@ func (e *agentAuditExporter) backgroundWorker(traceTimeout time.Duration, checkp
 //  6. mu.Unlock()
 //  7. compactWG.Wait()  — wait for background Compact goroutines
 //  8. close logFile, checkFile; WAL.Compact(); WAL.Close()
-func (e *agentAuditExporter) Shutdown(_ context.Context) error {
+func (e *agentAuditExporter) Shutdown(ctx context.Context) error {
 	if e.stopCh == nil {
 		// Start was never called (e.g. factory test).
 		return nil
@@ -202,17 +209,12 @@ func (e *agentAuditExporter) Shutdown(_ context.Context) error {
 	// Step 2.
 	<-e.doneCh
 
-	checkpointInterval := e.cfg.CheckpointInterval
-	if checkpointInterval <= 0 {
-		checkpointInterval = 100
-	}
-
 	// Step 3.
 	e.mu.Lock()
 
 	// Step 4: force-seal all remaining buffers.
 	for traceID, buf := range e.buffers {
-		e.sealTrace(traceID, buf, checkpointInterval)
+		e.sealTrace(traceID, buf, e.effectiveCheckpointInterval())
 	}
 
 	// Step 5: write final checkpoint if there are pending tips.
@@ -225,8 +227,14 @@ func (e *agentAuditExporter) Shutdown(_ context.Context) error {
 	// Step 6.
 	e.mu.Unlock()
 
-	// Step 7: wait for all background Compact goroutines.
-	e.compactWG.Wait()
+	// Step 7: wait for all background Compact goroutines, honoring ctx.
+	waitDone := make(chan struct{})
+	go func() { e.compactWG.Wait(); close(waitDone) }()
+	select {
+	case <-waitDone:
+	case <-ctx.Done():
+		e.logger.Warn("agentaudit: Shutdown context expired waiting for Compact goroutines")
+	}
 
 	// Step 8: close files and compact WAL one final time.
 	var errs []error
@@ -252,10 +260,7 @@ func (e *agentAuditExporter) Shutdown(_ context.Context) error {
 		e.wal = nil
 	}
 
-	if len(errs) > 0 {
-		return errs[0]
-	}
-	return nil
+	return errors.Join(errs...)
 }
 
 func (e *agentAuditExporter) Capabilities() consumer.Capabilities {
@@ -267,11 +272,7 @@ func (e *agentAuditExporter) Capabilities() consumer.Capabilities {
 // (parent_span_id == ""), the entire buffer is sealed immediately.
 func (e *agentAuditExporter) ConsumeTraces(_ context.Context, td ptrace.Traces) error {
 	now := time.Now()
-
-	checkpointInterval := e.cfg.CheckpointInterval
-	if checkpointInterval <= 0 {
-		checkpointInterval = 100
-	}
+	checkpointInterval := e.effectiveCheckpointInterval()
 
 	rss := td.ResourceSpans()
 	for i := 0; i < rss.Len(); i++ {
@@ -302,6 +303,14 @@ func (e *agentAuditExporter) bufferSpan(rec record.AuditRecord, now time.Time, c
 	traceID := rec.TraceID
 	if traceID == "" {
 		e.logger.Warn("agentaudit: span with empty trace_id, dropping")
+		return nil
+	}
+
+	// Drop spans for already-sealed traces. A second root span would create a second
+	// chain for the same trace_id, making the log ambiguous for verifiers.
+	if _, sealed := e.sealedTraces[traceID]; sealed {
+		e.logger.Warn("agentaudit: span for already-sealed trace, dropping",
+			zap.String("trace_id", traceID))
 		return nil
 	}
 
@@ -349,8 +358,9 @@ func (e *agentAuditExporter) sealTrace(traceID string, buf *traceBuffer, checkpo
 		recs = append(recs, rec)
 	}
 
-	// Remove from buffers immediately so concurrent calls won't double-seal.
+	// Remove from buffers and mark sealed so future spans for this trace_id are dropped.
 	delete(e.buffers, traceID)
+	e.sealedTraces[traceID] = struct{}{}
 
 	if len(recs) == 0 {
 		return

@@ -5,8 +5,12 @@
 // This provides crash-recovery for in-progress traces but not power-loss durability.
 //
 // Thread-safety: WAL has an internal RWMutex.
-//   - AppendSpan and MarkSealed acquire a read lock (multiple writers serialized
-//     by OS write-atomicity for small appends; lock protects the fd from Compact).
+//   - AppendSpan and MarkSealed acquire a read lock. The lock protects the fd
+//     from being invalidated by Compact. Multiple concurrent AppendSpan callers
+//     may write concurrently; the OS serializes small appends on Linux (ext4/xfs)
+//     but this is NOT guaranteed by POSIX and is not reliable on macOS (APFS/HFS+).
+//     Production deployments on non-Linux platforms should switch AppendSpan to
+//     a full write lock.
 //   - Compact acquires the write lock, atomically renames a temp file over the WAL,
 //     then re-opens the fd before releasing. No concurrent AppendSpan can write to
 //     the unlinked inode after Compact completes.

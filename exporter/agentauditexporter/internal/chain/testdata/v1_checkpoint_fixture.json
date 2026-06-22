@@ -1,0 +1,1 @@
+{"schema_version":"v1","checkpoint_seq":1,"timestamp":"2026-06-22T00:00:00Z","prev_checkpoint_hash":"0000000000000000000000000000000000000000000000000000000000000000","trace_tips":[{"trace_id":"01010101010101010101010101010101","tip_hash":"a0415a08bbac8ad89462cae146a727dbcfb3022b3f1e5870886fb2deb1538f9c","entry_count":2}],"key_id":"PLACEHOLDER","algorithm":"ed25519"}

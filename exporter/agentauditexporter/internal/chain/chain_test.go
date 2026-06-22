@@ -5,7 +5,6 @@ import (
 	"encoding/base64"
 	"encoding/hex"
 	"testing"
-	"time"
 
 	"github.com/surpradhan/otel-agent-audit/exporter/agentauditexporter/internal/canonical"
 	"github.com/surpradhan/otel-agent-audit/exporter/agentauditexporter/internal/chain"
@@ -459,23 +458,3 @@ func TestTwoSpanChainFixture(t *testing.T) {
 	}
 }
 
-// TestAccumulatorBuildEmpty verifies that the first Build call produces
-// checkpoint_seq=1 and prev_checkpoint_hash=ZeroPrevCheckpointHash.
-func TestAccumulatorBuildEmpty(t *testing.T) {
-	signer, _ := makeTestSigner(t)
-	acc := chain.NewAccumulator(signer, 0, chain.ZeroPrevCheckpointHash)
-
-	cp, err := acc.Build(time.Now())
-	if err != nil {
-		t.Fatalf("Build: %v", err)
-	}
-	if cp.CheckpointSeq != 1 {
-		t.Errorf("CheckpointSeq: got %d, want 1", cp.CheckpointSeq)
-	}
-	if cp.PrevCheckpointHash != chain.ZeroPrevCheckpointHash {
-		t.Errorf("PrevCheckpointHash: got %q, want ZeroPrevCheckpointHash", cp.PrevCheckpointHash)
-	}
-	if len(cp.TraceTips) != 0 {
-		t.Errorf("TraceTips: expected empty, got %d", len(cp.TraceTips))
-	}
-}

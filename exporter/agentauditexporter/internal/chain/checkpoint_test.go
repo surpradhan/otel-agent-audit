@@ -6,6 +6,8 @@ import (
 	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
+	"os"
+	"strings"
 	"testing"
 	"time"
 
@@ -208,5 +210,43 @@ func TestAccumulator_PendingCount(t *testing.T) {
 	_, _ = acc.Build(time.Now())
 	if got := acc.PendingCount(); got != 0 {
 		t.Errorf("PendingCount after Build: got %d, want 0", got)
+	}
+}
+
+// TestCheckpointSigningPayloadFixture is the cross-impl lock test for the
+// checkpoint signing payload. It verifies that the compact JSON of
+// checkpointForSigning for known inputs matches the golden fixture byte-for-byte.
+// Any encoding change here is a breaking chain-format change and requires a
+// schema_version bump per CLAUDE.md.
+func TestCheckpointSigningPayloadFixture(t *testing.T) {
+	cfs := checkpointForSigning{
+		SchemaVersion:      "v1",
+		CheckpointSeq:      1,
+		Timestamp:          "2026-06-22T00:00:00Z",
+		PrevCheckpointHash: chain.ZeroPrevCheckpointHash,
+		TraceTips: []chain.TraceTip{{
+			TraceID:    "01010101010101010101010101010101",
+			TipHash:    "a0415a08bbac8ad89462cae146a727dbcfb3022b3f1e5870886fb2deb1538f9c",
+			EntryCount: 2,
+		}},
+		KeyID:     "PLACEHOLDER",
+		Algorithm: "ed25519",
+	}
+
+	got, err := json.Marshal(cfs)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+
+	const fixturePath = "testdata/v1_checkpoint_fixture.json"
+	want, err := os.ReadFile(fixturePath)
+	if err != nil {
+		t.Fatalf("reading fixture %s: %v", fixturePath, err)
+	}
+
+	gotStr := strings.TrimRight(string(got), "\n\r ")
+	wantStr := strings.TrimRight(string(want), "\n\r ")
+	if gotStr != wantStr {
+		t.Errorf("checkpoint signing payload diverges from golden fixture.\ngot:  %s\nwant: %s", got, want)
 	}
 }

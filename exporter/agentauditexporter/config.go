@@ -54,5 +54,11 @@ func (c *Config) Validate() error {
 	if c.LogPath == c.WalPath || c.LogPath == c.CheckpointPath || c.WalPath == c.CheckpointPath {
 		return errors.New("log_path, wal_path, and checkpoint_path must all be distinct")
 	}
+	if c.TraceTimeout < 0 {
+		return errors.New("trace_timeout must not be negative")
+	}
+	if c.CheckpointInterval < 0 {
+		return errors.New("checkpoint_interval must not be negative")
+	}
 	return nil
 }

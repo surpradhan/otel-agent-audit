@@ -10,6 +10,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/surpradhan/otel-agent-audit/exporter/agentauditexporter/internal/record"
 	"github.com/surpradhan/otel-agent-audit/exporter/agentauditexporter/internal/sign"
 )
 
@@ -108,7 +109,7 @@ func (a *Accumulator) Build(ts time.Time) (Checkpoint, error) {
 	})
 
 	cfs := checkpointForSigning{
-		SchemaVersion:      "v1",
+		SchemaVersion:      record.SchemaVersion,
 		CheckpointSeq:      a.seq,
 		Timestamp:          ts.UTC().Format(time.RFC3339),
 		PrevCheckpointHash: a.prevHash,

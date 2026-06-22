@@ -553,9 +553,11 @@ func TestVerify_DeletionDetected_Middle(t *testing.T) {
 	}
 }
 
-// TestVerify_ReorderDetected verifies that physically swapping two complete JSONL
-// lines causes a chain break error.
-func TestVerify_ReorderDetected(t *testing.T) {
+// TestVerify_ReorderNotError verifies that physically swapping JSONL lines does
+// NOT cause a chain error. The verifier sorts entries by seq_in_trace before
+// verifying, so file-order swaps are harmless; only seq_in_trace value swaps
+// (covered by TestVerify_SeqTamperDetected) are an integrity violation.
+func TestVerify_ReorderNotError(t *testing.T) {
 	dir := t.TempDir()
 
 	priv, pub, err := sign.GenerateEd25519Key()
@@ -598,7 +600,7 @@ func TestVerify_ReorderDetected(t *testing.T) {
 		t.Skipf("need at least 2 entries, got %d", len(lines))
 	}
 
-	// Swap first two lines.
+	// Swap first two lines to simulate out-of-order log writes.
 	lines[0], lines[1] = lines[1], lines[0]
 
 	var buf bytes.Buffer
@@ -608,12 +610,13 @@ func TestVerify_ReorderDetected(t *testing.T) {
 	}
 	_ = os.WriteFile(cfg.LogPath, buf.Bytes(), 0600)
 
+	// The verifier sorts by seq_in_trace, so the swap is transparent.
 	report, err := verify.VerifyLog(cfg.LogPath, cfg.CheckpointPath, pub)
 	if err != nil {
 		t.Fatalf("VerifyLog: %v", err)
 	}
-	if len(report.Errors) == 0 {
-		t.Error("expected VerifyLog to detect reorder, got no errors")
+	if len(report.Errors) != 0 {
+		t.Errorf("expected no errors for physical line swap (verifier re-sorts), got: %v", report.Errors)
 	}
 }
 
@@ -914,16 +917,11 @@ func TestRestart_Rehydration(t *testing.T) {
 }
 
 // TestConsumeTraces_Concurrent verifies that 50 DISTINCT trace IDs are handled
-// race-safely and each produces at least one log entry.
+// race-safely and each produces exactly one log entry after Shutdown.
 func TestConsumeTraces_Concurrent(t *testing.T) {
 	const N = 50
 	env := newTestEnv(t)
 	exp := startExporter(t, env.cfg)
-	t.Cleanup(func() {
-		if err := exp.Shutdown(context.Background()); err != nil {
-			t.Errorf("Shutdown: %v", err)
-		}
-	})
 
 	var wg sync.WaitGroup
 	wg.Add(N)
@@ -946,10 +944,26 @@ func TestConsumeTraces_Concurrent(t *testing.T) {
 	}
 	wg.Wait()
 
-	// Wait for Shutdown (via t.Cleanup) to seal all remaining buffers.
-	// The Cleanup above runs after the test returns.
-	// For now, count entries written during the concurrent phase.
-	// (Some may still be buffered; Shutdown seals them all.)
+	// Shutdown seals any buffered traces and flushes all entries to disk.
+	if err := exp.Shutdown(context.Background()); err != nil {
+		t.Fatalf("Shutdown: %v", err)
+	}
+
+	// Each trace has exactly one root span, so the log must have exactly N entries.
+	data, err := os.ReadFile(env.cfg.LogPath)
+	if err != nil {
+		t.Fatalf("reading log: %v", err)
+	}
+	var count int
+	scanner := bufio.NewScanner(bytes.NewReader(data))
+	for scanner.Scan() {
+		if l := scanner.Text(); l != "" {
+			count++
+		}
+	}
+	if count != N {
+		t.Errorf("log entry count: got %d, want %d", count, N)
+	}
 }
 
 // TestVerify_SeqTamperDetected verifies that swapping seq_in_trace values on

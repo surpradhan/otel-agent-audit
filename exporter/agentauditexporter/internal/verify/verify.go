@@ -41,39 +41,48 @@ type Report struct {
 // All entries must belong to the same trace, already in chain order (seq 0, 1, …).
 // An empty entries slice returns nil.
 func VerifyChain(entries []chain.LogEntry, pubKey ed25519.PublicKey) error {
+	_, err := verifyChainReturnTip(entries, pubKey)
+	return err
+}
+
+// verifyChainReturnTip verifies the chain and returns the hex-encoded SHA256 of
+// the final sigPayload (the recomputed tip hash). Returns "" on an empty slice.
+func verifyChainReturnTip(entries []chain.LogEntry, pubKey ed25519.PublicKey) (string, error) {
 	if len(entries) == 0 {
-		return nil
+		return "", nil
 	}
 
 	genesisSeed, err := chain.GenesisSeed(entries[0].Record.TraceID)
 	if err != nil {
-		return err
+		return "", err
 	}
 
 	prev := genesisSeed
+	var lastHash [32]byte
 	for i, e := range entries {
 		canonicalBytes, err := canonical.Marshal(e.Record)
 		if err != nil {
-			return fmt.Errorf("seq %d: canonical marshal: %w", i, err)
+			return "", fmt.Errorf("seq %d: canonical marshal: %w", i, err)
 		}
 		// Three-index slice prevents aliasing.
 		sigPayload := append(canonicalBytes[:len(canonicalBytes):len(canonicalBytes)], prev...)
 
 		// Verify signature.
 		if err := sign.Verify(e.Signed, sigPayload, pubKey); err != nil {
-			return fmt.Errorf("seq %d: %w", i, err)
+			return "", fmt.Errorf("seq %d: %w", i, err)
 		}
 
 		// Verify stored entryHash.
 		expectedHash := sha256.Sum256(sigPayload)
 		if e.Signed.EntryHash != hex.EncodeToString(expectedHash[:]) {
-			return fmt.Errorf("seq %d: entry_hash mismatch: stored %s, recomputed %s",
+			return "", fmt.Errorf("seq %d: entry_hash mismatch: stored %s, recomputed %s",
 				i, e.Signed.EntryHash, hex.EncodeToString(expectedHash[:]))
 		}
 
 		prev = expectedHash[:]
+		lastHash = expectedHash
 	}
-	return nil
+	return hex.EncodeToString(lastHash[:]), nil
 }
 
 // VerifyCheckpoint verifies a checkpoint's signature and prev_checkpoint_hash field.
@@ -133,15 +142,21 @@ func VerifyLog(logPath, checkpointPath string, pubKey ed25519.PublicKey) (Report
 	}
 	sort.Strings(traceIDs)
 
+	// verifiedTips maps trace_id → the actual recomputed tip hash (hex of SHA256
+	// of last sigPayload). Used to cross-check checkpoint tip_hash fields.
+	verifiedTips := make(map[string]string, len(traceIDs))
 	var verifyErrs []VerifyError
 	for _, traceID := range traceIDs {
 		entries := traceEntries[traceID]
-		if err := VerifyChain(entries, pubKey); err != nil {
+		tipHash, err := verifyChainReturnTip(entries, pubKey)
+		if err != nil {
 			verifyErrs = append(verifyErrs, VerifyError{
 				TraceID: traceID,
 				Kind:    "chain",
 				Detail:  err.Error(),
 			})
+		} else {
+			verifiedTips[traceID] = tipHash
 		}
 		report.TracesVerified++
 	}
@@ -168,7 +183,7 @@ func VerifyLog(logPath, checkpointPath string, pubKey ed25519.PublicKey) (Report
 		prevHash = hex.EncodeToString(h[:])
 		report.CheckpointsVerified++
 
-		// Check that each trace_tip's entry_count matches the actual log.
+		// Cross-check each trace_tip's entry_count and tip_hash against the log.
 		for _, tip := range cp.TraceTips {
 			entries := traceEntries[tip.TraceID]
 			if len(entries) != tip.EntryCount {
@@ -176,6 +191,13 @@ func VerifyLog(logPath, checkpointPath string, pubKey ed25519.PublicKey) (Report
 					TraceID: tip.TraceID,
 					Kind:    "entry_count_mismatch",
 					Detail:  fmt.Sprintf("checkpoint says %d, log has %d", tip.EntryCount, len(entries)),
+				})
+			}
+			if actual, ok := verifiedTips[tip.TraceID]; ok && actual != tip.TipHash {
+				verifyErrs = append(verifyErrs, VerifyError{
+					TraceID: tip.TraceID,
+					Kind:    "tip_hash_mismatch",
+					Detail:  fmt.Sprintf("checkpoint tip_hash %s, recomputed %s", tip.TipHash, actual),
 				})
 			}
 		}
@@ -235,7 +257,20 @@ func readLogEntries(logPath string) (map[string][]chain.LogEntry, error) {
 		}
 		result[e.Record.TraceID] = append(result[e.Record.TraceID], e)
 	}
-	return result, scanner.Err()
+	if err := scanner.Err(); err != nil {
+		return nil, err
+	}
+
+	// Sort each trace's entries by seq_in_trace so VerifyChain sees them in
+	// chain order regardless of log write order.
+	for id := range result {
+		entries := result[id]
+		sort.Slice(entries, func(i, j int) bool {
+			return entries[i].Record.SeqInTrace < entries[j].Record.SeqInTrace
+		})
+		result[id] = entries
+	}
+	return result, nil
 }
 
 func readCheckpoints(checkPath string) ([]chain.Checkpoint, error) {
