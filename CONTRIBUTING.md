@@ -20,8 +20,8 @@ Before merge, **all** of the following must hold:
 ## Required status checks
 
 <!-- required-checks:start -->
-- `Test (Go 1.22)`
-- `Test (Go 1.23)`
+- `Test (Go 1.25)`
+- `Test (Go 1.26)`
 - `Lint`
 - `Build`
 - `Required checks in sync`
@@ -35,13 +35,13 @@ Before merge, **all** of the following must hold:
 
 | Job | What it does |
 |-----|-------------|
-| `Test (Go 1.22)` / `Test (Go 1.23)` | `go test -race ./...` with coverage report |
+| `Test (Go 1.25)` / `Test (Go 1.26)` | `go test -race ./...` with coverage report |
 | `Lint` | `golangci-lint run` |
 | `Build` | Installs OCB; builds the demo collector distro from `ocb/builder-config.yaml` |
 | `Required checks in sync` | Runs the drift-guard script; verifies ci.yml ↔ this block ↔ (optionally) branch protection |
 
-> **Phase B0 note:** `Test` and `Build` require `go.mod` and
-> `ocb/builder-config.yaml` to exist. Both are created in Phase B0.
+> **Phase B0:** `go.mod`, `ocb/builder-config.yaml`, and the no-op `agentauditexporter` are
+> in place. OTel Collector v1.60.0 requires Go 1.25+, so the CI matrix was updated accordingly.
 
 ## Commit format
 
@@ -66,12 +66,12 @@ Never add `Co-Authored-By` lines attributing an AI tool.
 ## Development setup
 
 ```bash
-# Go 1.22 or 1.23 required
+# Go 1.25 or 1.26 required (OTel Collector v1.60+ requires Go 1.25+)
 go test -race ./...
 golangci-lint run
 
-# Build the demo collector distro (requires ocb/builder-config.yaml)
-go install go.opentelemetry.io/collector/cmd/builder@latest
+# Build the demo collector distro
+go install go.opentelemetry.io/collector/cmd/builder@v0.154.0
 builder --config=ocb/builder-config.yaml
 ```
 

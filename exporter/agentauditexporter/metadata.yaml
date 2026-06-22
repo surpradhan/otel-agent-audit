@@ -1,0 +1,8 @@
+type: agentaudit
+status:
+  class: exporter
+  stability:
+    development: [traces]
+  distributions: []
+  codeowners:
+    active: [surpradhan]

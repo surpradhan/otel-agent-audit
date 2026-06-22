@@ -2,8 +2,8 @@
 
 ## Project context
 
-- **Language / runtime:** Go 1.22+
-- **Build:** OpenTelemetry Collector Builder (OCB); `go install go.opentelemetry.io/collector/cmd/builder@latest`
+- **Language / runtime:** Go 1.25+ (OTel Collector v1.60+ requires Go 1.25)
+- **Build:** OpenTelemetry Collector Builder (OCB); `go install go.opentelemetry.io/collector/cmd/builder@v0.154.0`
 - **Module path:** `github.com/surpradhan/otel-agent-audit`
 - **Test command:** `go test -race ./...`
 - **Lint command:** `golangci-lint run`
