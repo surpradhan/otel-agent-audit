@@ -60,7 +60,9 @@ func (e *agentAuditExporter) Shutdown(_ context.Context) error {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	if e.logFile != nil {
-		return e.logFile.Close()
+		err := e.logFile.Close()
+		e.logFile = nil
+		return err
 	}
 	return nil
 }
@@ -141,6 +143,9 @@ func (e *agentAuditExporter) ConsumeTraces(_ context.Context, td ptrace.Traces) 
 
 	e.mu.Lock()
 	defer e.mu.Unlock()
+	if e.logFile == nil {
+		return fmt.Errorf("agentaudit: ConsumeTraces called before Start or after Shutdown")
+	}
 	if _, err := fmt.Fprintf(e.logFile, "%s\n", line); err != nil {
 		return fmt.Errorf("agentaudit: writing log entry: %w", err)
 	}

@@ -269,9 +269,15 @@ func TestConsumeTraces_Concurrent(t *testing.T) {
 	scanner := bufio.NewScanner(bytes.NewReader(data))
 	count := 0
 	for scanner.Scan() {
-		if scanner.Text() != "" {
-			count++
+		line := scanner.Text()
+		if line == "" {
+			continue
 		}
+		var entry logEntry
+		if err := json.Unmarshal([]byte(line), &entry); err != nil {
+			t.Errorf("line %d is not valid JSON: %v\n%s", count+1, err, line)
+		}
+		count++
 	}
 	if count != N {
 		t.Errorf("expected %d log entries, got %d", N, count)
