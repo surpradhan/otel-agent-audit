@@ -30,6 +30,10 @@ const (
 	entryTypeSealed entryType = "sealed"
 )
 
+// maxScanTokenSize caps the bufio.Scanner token size for WAL lines.
+// The 64 KB default is too small for traces with many spans; 4 MB provides headroom.
+const maxScanTokenSize = 4 * 1024 * 1024
+
 type walEntry struct {
 	Type    entryType           `json:"type"`
 	TraceID string              `json:"trace_id"`
@@ -103,7 +107,7 @@ func (w *WAL) Replay() (map[string][]record.AuditRecord, error) {
 	buffers := map[string][]record.AuditRecord{}
 
 	scanner := bufio.NewScanner(rf)
-	scanner.Buffer(make([]byte, 64*1024), 4*1024*1024)
+	scanner.Buffer(make([]byte, 64*1024), maxScanTokenSize)
 	for scanner.Scan() {
 		line := scanner.Bytes()
 		if len(line) == 0 {
@@ -154,7 +158,7 @@ func (w *WAL) Compact() error {
 	var spans []spanEntry
 
 	scanner := bufio.NewScanner(rf)
-	scanner.Buffer(make([]byte, 64*1024), 4*1024*1024)
+	scanner.Buffer(make([]byte, 64*1024), maxScanTokenSize)
 	for scanner.Scan() {
 		line := scanner.Bytes()
 		if len(line) == 0 {

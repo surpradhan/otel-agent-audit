@@ -43,6 +43,10 @@ import (
 	"github.com/surpradhan/otel-agent-audit/exporter/agentauditexporter/internal/wal"
 )
 
+// maxScanTokenSize caps the bufio.Scanner token size for checkpoint JSONL lines.
+// The 64 KB default is too small when CheckpointInterval is large; 4 MB provides headroom.
+const maxScanTokenSize = 4 * 1024 * 1024
+
 // traceBuffer holds spans received for one in-progress trace.
 type traceBuffer struct {
 	records  map[string]record.AuditRecord // keyed by span_id for dedup
@@ -503,7 +507,7 @@ func readLastCheckpoint(path string) (chain.Checkpoint, bool, error) {
 	var last chain.Checkpoint
 	found := false
 	scanner := bufio.NewScanner(f)
-	scanner.Buffer(make([]byte, 64*1024), 4*1024*1024) // up to 4 MB per line (default 64 KB is too small for large checkpoint intervals)
+	scanner.Buffer(make([]byte, 64*1024), maxScanTokenSize)
 	for scanner.Scan() {
 		line := scanner.Bytes()
 		if len(line) == 0 {

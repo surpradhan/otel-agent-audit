@@ -1337,7 +1337,10 @@ func TestRestart_CheckpointContinuity_PartialLine(t *testing.T) {
 	if err := json.Unmarshal([]byte(lines[0]), &cp1); err != nil {
 		t.Fatalf("unmarshal cp1: %v", err)
 	}
-	payload1, _ := chain.CheckpointSigningPayload(cp1)
+	payload1, err := chain.CheckpointSigningPayload(cp1)
+	if err != nil {
+		t.Fatalf("CheckpointSigningPayload: %v", err)
+	}
 	h := sha256.Sum256(payload1)
 	expectedPrevHash := hex.EncodeToString(h[:])
 
