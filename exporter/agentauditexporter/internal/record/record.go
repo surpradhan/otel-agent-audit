@@ -1,12 +1,10 @@
 // Package record defines the AuditRecord schema and its deterministic mapping
 // from OTel spans.
 //
-// NOTE(B4-refactor): These packages currently live inside the exporter module.
-// When cmd/otel-agent-audit-verify is added in B4, they will be moved to the
-// root module (github.com/surpradhan/otel-agent-audit/internal/...) so the CLI
-// can import them without violating Go's internal-package visibility rule.
-// Import paths will change at that point; all callers will be updated in the
-// same PR.
+// NOTE: These packages live inside the exporter module. The CLI at
+// cmd/otel-agent-audit-verify imports them via same-module internal visibility
+// (Go's internal rule permits this). A root-module restructuring was considered
+// for B4 but deferred; the within-module approach is simpler and sufficient.
 package record
 
 import (

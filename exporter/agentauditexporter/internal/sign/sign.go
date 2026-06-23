@@ -9,9 +9,6 @@
 // Verification reconstructs sigPayload from canonical bytes (never trusts the
 // stored entryHash) and calls ed25519.Verify. This ensures a tampered record
 // cannot produce a valid signature even if its stored hash is also replaced.
-//
-// NOTE(B4-refactor): see internal/record/record.go for the planned B4 module
-// restructuring.
 package sign
 
 import (
@@ -118,11 +115,50 @@ func LoadEd25519PrivateKeyPEM(path string) (ed25519.PrivateKey, error) {
 	if block == nil {
 		return nil, errors.New("no PEM block found in key file")
 	}
+	if block.Type != "PRIVATE KEY" {
+		return nil, fmt.Errorf("expected PEM block type %q, got %q", "PRIVATE KEY", block.Type)
+	}
 	key, err := x509.ParsePKCS8PrivateKey(block.Bytes)
 	if err != nil {
 		return nil, fmt.Errorf("parsing PKCS#8 key: %w", err)
 	}
 	ed25519Key, ok := key.(ed25519.PrivateKey)
+	if !ok {
+		return nil, fmt.Errorf("key is not Ed25519 (got %T)", key)
+	}
+	return ed25519Key, nil
+}
+
+// MarshalEd25519PublicKeyPEM serialises pub to a PEM-encoded PKIX block.
+// The PEM block type is "PUBLIC KEY" (standard for PKIX/SubjectPublicKeyInfo).
+func MarshalEd25519PublicKeyPEM(pub ed25519.PublicKey) ([]byte, error) {
+	der, err := x509.MarshalPKIXPublicKey(pub)
+	if err != nil {
+		return nil, fmt.Errorf("PKIX marshal: %w", err)
+	}
+	return pem.EncodeToMemory(&pem.Block{Type: "PUBLIC KEY", Bytes: der}), nil
+}
+
+// LoadEd25519PublicKeyPEM reads and parses an Ed25519 public key from a
+// PEM file containing a PKIX-encoded "PUBLIC KEY" block (e.g. produced by
+// "openssl pkey -pubout").
+func LoadEd25519PublicKeyPEM(path string) (ed25519.PublicKey, error) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return nil, fmt.Errorf("reading public key file %q: %w", path, err)
+	}
+	block, _ := pem.Decode(data)
+	if block == nil {
+		return nil, errors.New("no PEM block found in public key file")
+	}
+	if block.Type != "PUBLIC KEY" {
+		return nil, fmt.Errorf("expected PEM block type %q, got %q", "PUBLIC KEY", block.Type)
+	}
+	key, err := x509.ParsePKIXPublicKey(block.Bytes)
+	if err != nil {
+		return nil, fmt.Errorf("parsing PKIX public key: %w", err)
+	}
+	ed25519Key, ok := key.(ed25519.PublicKey)
 	if !ok {
 		return nil, fmt.Errorf("key is not Ed25519 (got %T)", key)
 	}

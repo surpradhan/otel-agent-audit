@@ -5,6 +5,7 @@ import (
 	"crypto/sha256"
 	"encoding/base64"
 	"encoding/hex"
+	"encoding/pem"
 	"os"
 	"path/filepath"
 	"testing"
@@ -146,5 +147,102 @@ func TestLoadEd25519PrivateKeyPEM_MissingFile(t *testing.T) {
 	_, err := LoadEd25519PrivateKeyPEM("/nonexistent/key.pem")
 	if err == nil {
 		t.Error("expected error for missing file")
+	}
+}
+
+func TestPublicKeyPEM_RoundTrip(t *testing.T) {
+	_, pub, err := GenerateEd25519Key()
+	if err != nil {
+		t.Fatalf("GenerateEd25519Key: %v", err)
+	}
+	pemBytes, err := MarshalEd25519PublicKeyPEM(pub)
+	if err != nil {
+		t.Fatalf("MarshalEd25519PublicKeyPEM: %v", err)
+	}
+	dir := t.TempDir()
+	keyFile := filepath.Join(dir, "pub.pem")
+	if err := os.WriteFile(keyFile, pemBytes, 0600); err != nil {
+		t.Fatalf("write pub key file: %v", err)
+	}
+	loaded, err := LoadEd25519PublicKeyPEM(keyFile)
+	if err != nil {
+		t.Fatalf("LoadEd25519PublicKeyPEM: %v", err)
+	}
+	if string(pub) != string(loaded) {
+		t.Error("loaded public key does not match original")
+	}
+}
+
+func TestLoadEd25519PublicKeyPEM_MissingFile(t *testing.T) {
+	_, err := LoadEd25519PublicKeyPEM("/nonexistent/pub.pem")
+	if err == nil {
+		t.Error("expected error for missing file")
+	}
+}
+
+func TestLoadEd25519PrivateKeyPEM_WrongType(t *testing.T) {
+	priv, _, err := GenerateEd25519Key()
+	if err != nil {
+		t.Fatalf("GenerateEd25519Key: %v", err)
+	}
+	pubPEM, err := MarshalEd25519PublicKeyPEM(priv.Public().(ed25519.PublicKey))
+	if err != nil {
+		t.Fatalf("MarshalEd25519PublicKeyPEM: %v", err)
+	}
+	dir := t.TempDir()
+	f := filepath.Join(dir, "wrong.pem")
+	if err := os.WriteFile(f, pubPEM, 0600); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+	_, err = LoadEd25519PrivateKeyPEM(f)
+	if err == nil {
+		t.Error("expected error when loading PUBLIC KEY block as private key")
+	}
+}
+
+func TestLoadEd25519PublicKeyPEM_WrongType(t *testing.T) {
+	priv, _, err := GenerateEd25519Key()
+	if err != nil {
+		t.Fatalf("GenerateEd25519Key: %v", err)
+	}
+	privPEM, err := MarshalEd25519PrivateKeyPEM(priv)
+	if err != nil {
+		t.Fatalf("MarshalEd25519PrivateKeyPEM: %v", err)
+	}
+	dir := t.TempDir()
+	f := filepath.Join(dir, "wrong.pem")
+	if err := os.WriteFile(f, privPEM, 0600); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+	_, err = LoadEd25519PublicKeyPEM(f)
+	if err == nil {
+		t.Error("expected error when loading PRIVATE KEY block as public key")
+	}
+}
+
+func TestLoadEd25519PrivateKeyPEM_NoPEMBlock(t *testing.T) {
+	dir := t.TempDir()
+	f := filepath.Join(dir, "garbage.pem")
+	if err := os.WriteFile(f, []byte("not a pem block"), 0600); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+	_, err := LoadEd25519PrivateKeyPEM(f)
+	if err == nil {
+		t.Error("expected error for file with no PEM block")
+	}
+}
+
+func TestLoadEd25519PublicKeyPEM_NonEd25519(t *testing.T) {
+	// Write a PEM block with PUBLIC KEY type but garbage DER bytes to trigger
+	// the non-Ed25519 key type check.
+	block := &pem.Block{Type: "PUBLIC KEY", Bytes: []byte("not valid der")}
+	dir := t.TempDir()
+	f := filepath.Join(dir, "bad.pem")
+	if err := os.WriteFile(f, pem.EncodeToMemory(block), 0600); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+	_, err := LoadEd25519PublicKeyPEM(f)
+	if err == nil {
+		t.Error("expected error for malformed DER bytes")
 	}
 }
