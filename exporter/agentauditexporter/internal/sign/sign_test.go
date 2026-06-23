@@ -240,7 +240,7 @@ func TestLoadEd25519PublicKeyPEM_NoPEMBlock(t *testing.T) {
 	}
 	_, err := LoadEd25519PublicKeyPEM(f)
 	if err == nil {
-		t.Error("expected error for file with no PEM block")
+		t.Error("LoadEd25519PublicKeyPEM: expected error for file with no PEM block")
 	}
 }
 
