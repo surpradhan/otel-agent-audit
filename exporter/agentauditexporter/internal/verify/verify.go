@@ -19,6 +19,10 @@ import (
 	"github.com/surpradhan/otel-agent-audit/exporter/agentauditexporter/internal/sign"
 )
 
+// maxScanTokenSize caps the bufio.Scanner token size for JSONL files.
+// The 64 KB default is too small when CheckpointInterval is large; 4 MB provides headroom.
+const maxScanTokenSize = 4 * 1024 * 1024
+
 // VerifyError describes one verification failure.
 type VerifyError struct {
 	TraceID string
@@ -258,6 +262,7 @@ func readLogEntries(logPath string) (map[string][]chain.LogEntry, error) {
 
 	result := map[string][]chain.LogEntry{}
 	scanner := bufio.NewScanner(f)
+	scanner.Buffer(make([]byte, 64*1024), maxScanTokenSize)
 	for scanner.Scan() {
 		line := bytes.TrimSpace(scanner.Bytes())
 		if len(line) == 0 {
@@ -297,6 +302,7 @@ func readCheckpoints(checkPath string) ([]chain.Checkpoint, error) {
 
 	var cps []chain.Checkpoint
 	scanner := bufio.NewScanner(f)
+	scanner.Buffer(make([]byte, 64*1024), maxScanTokenSize)
 	for scanner.Scan() {
 		line := bytes.TrimSpace(scanner.Bytes())
 		if len(line) == 0 {

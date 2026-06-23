@@ -4,17 +4,12 @@
 // MarkSealed and Compact call Sync() before returning.
 // This provides crash-recovery for in-progress traces but not power-loss durability.
 //
-// Thread-safety: WAL has an internal RWMutex.
-//   - AppendSpan and MarkSealed acquire a read lock. The lock protects the fd
-//     from being invalidated by Compact. Multiple concurrent AppendSpan callers
-//     may write concurrently; the OS serializes small appends on Linux (ext4/xfs)
-//     but this is NOT guaranteed by POSIX and is not reliable on macOS (APFS/HFS+).
-//     Production deployments on non-Linux platforms should switch AppendSpan to
-//     a full write lock.
-//   - Compact acquires the write lock, atomically renames a temp file over the WAL,
-//     then re-opens the fd before releasing. No concurrent AppendSpan can write to
-//     the unlinked inode after Compact completes.
-//   - Close acquires the write lock; call only after compactWG.Wait() in Shutdown.
+// Thread-safety: WAL has an internal mutex.
+//   - All writes (AppendSpan, MarkSealed) are serialized by the WAL's internal mutex.
+//   - Compact acquires the same mutex, atomically renames a temp file over the WAL,
+//     then re-opens the fd before releasing. No concurrent write can touch the
+//     unlinked inode after Compact completes.
+//   - Close acquires the mutex; call only after compactWG.Wait() in Shutdown.
 //   - Replay is called only from Start, before any concurrent writes begin.
 package wal
 
@@ -35,6 +30,10 @@ const (
 	entryTypeSealed entryType = "sealed"
 )
 
+// maxScanTokenSize caps the bufio.Scanner token size for WAL lines.
+// The 64 KB default is too small for traces with many spans; 4 MB provides headroom.
+const maxScanTokenSize = 4 * 1024 * 1024
+
 type walEntry struct {
 	Type    entryType           `json:"type"`
 	TraceID string              `json:"trace_id"`
@@ -43,7 +42,7 @@ type walEntry struct {
 
 // WAL is a JSONL write-ahead log for buffered trace spans.
 type WAL struct {
-	mu   sync.RWMutex
+	mu   sync.Mutex
 	path string
 	f    *os.File
 }
@@ -59,16 +58,16 @@ func Open(path string) (*WAL, error) {
 
 // AppendSpan writes a span entry to the WAL. Does not call Sync.
 func (w *WAL) AppendSpan(traceID string, rec record.AuditRecord) error {
-	w.mu.RLock()
-	defer w.mu.RUnlock()
+	w.mu.Lock()
+	defer w.mu.Unlock()
 	entry := walEntry{Type: entryTypeSpan, TraceID: traceID, Record: &rec}
 	return w.appendEntry(entry)
 }
 
 // MarkSealed writes a sealed marker and calls Sync.
 func (w *WAL) MarkSealed(traceID string) error {
-	w.mu.RLock()
-	defer w.mu.RUnlock()
+	w.mu.Lock()
+	defer w.mu.Unlock()
 	entry := walEntry{Type: entryTypeSealed, TraceID: traceID}
 	if err := w.appendEntry(entry); err != nil {
 		return err
@@ -76,7 +75,7 @@ func (w *WAL) MarkSealed(traceID string) error {
 	return w.f.Sync()
 }
 
-// appendEntry serializes entry as a JSONL line. Caller holds at least RLock.
+// appendEntry serializes entry as a JSONL line. Caller holds mu.
 func (w *WAL) appendEntry(entry walEntry) error {
 	line, err := json.Marshal(entry)
 	if err != nil {
@@ -108,6 +107,7 @@ func (w *WAL) Replay() (map[string][]record.AuditRecord, error) {
 	buffers := map[string][]record.AuditRecord{}
 
 	scanner := bufio.NewScanner(rf)
+	scanner.Buffer(make([]byte, 64*1024), maxScanTokenSize)
 	for scanner.Scan() {
 		line := scanner.Bytes()
 		if len(line) == 0 {
@@ -158,6 +158,7 @@ func (w *WAL) Compact() error {
 	var spans []spanEntry
 
 	scanner := bufio.NewScanner(rf)
+	scanner.Buffer(make([]byte, 64*1024), maxScanTokenSize)
 	for scanner.Scan() {
 		line := scanner.Bytes()
 		if len(line) == 0 {

@@ -4,6 +4,8 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"os"
@@ -1176,6 +1178,211 @@ func TestWALAppendSpanWritesToWAL(t *testing.T) {
 
 	if err := exp.Shutdown(context.Background()); err != nil {
 		t.Fatalf("Shutdown: %v", err)
+	}
+}
+
+// TestRestart_CheckpointContinuity verifies that checkpoint_seq and prev_checkpoint_hash
+// continue correctly across a clean Shutdown + restart.
+//
+// Sequence:
+//  1. Run exporter A: seal trace-1 (1 span) → Shutdown → checkpoint seq=1 written.
+//  2. Run exporter B on same files: seal trace-2 (1 span) → Shutdown → checkpoint seq=2 written.
+//  3. Assert: second checkpoint has checkpoint_seq=2 and prev_checkpoint_hash == SHA256(first signing payload).
+func TestRestart_CheckpointContinuity(t *testing.T) {
+	env := newTestEnv(t)
+	env.cfg.CheckpointInterval = 1 // checkpoint after every trace
+
+	traceID1 := [16]byte{0xE1}
+	traceID2 := [16]byte{0xE2}
+	rootID1 := [8]byte{0x01}
+	rootID2 := [8]byte{0x02}
+
+	// Phase 1: seal one trace, shut down (writes checkpoint seq=1).
+	exp1 := startExporter(t, env.cfg)
+	_ = exp1.ConsumeTraces(context.Background(), makeSpan(traceID1, rootID1, zeroParentID, "t1", 1000, 2000))
+	if err := exp1.Shutdown(context.Background()); err != nil {
+		t.Fatalf("Shutdown phase 1: %v", err)
+	}
+
+	// Read the first checkpoint to compute the expected prevHash.
+	data, err := os.ReadFile(env.cfg.CheckpointPath)
+	if err != nil {
+		t.Fatalf("reading checkpoint after phase 1: %v", err)
+	}
+	var lines []string
+	sc := bufio.NewScanner(bytes.NewReader(data))
+	for sc.Scan() {
+		if l := sc.Text(); l != "" {
+			lines = append(lines, l)
+		}
+	}
+	if len(lines) == 0 {
+		t.Fatal("expected at least one checkpoint after phase 1")
+	}
+	var cp1 chain.Checkpoint
+	if err := json.Unmarshal([]byte(lines[0]), &cp1); err != nil {
+		t.Fatalf("unmarshal first checkpoint: %v", err)
+	}
+	if cp1.CheckpointSeq != 1 {
+		t.Fatalf("first checkpoint seq: got %d, want 1", cp1.CheckpointSeq)
+	}
+	payload1, err := chain.CheckpointSigningPayload(cp1)
+	if err != nil {
+		t.Fatalf("CheckpointSigningPayload: %v", err)
+	}
+	h := sha256.Sum256(payload1)
+	expectedPrevHash := hex.EncodeToString(h[:])
+
+	// Phase 2: restart on same files, seal a second trace.
+	exp2 := startExporter(t, env.cfg)
+	_ = exp2.ConsumeTraces(context.Background(), makeSpan(traceID2, rootID2, zeroParentID, "t2", 3000, 4000))
+	if err := exp2.Shutdown(context.Background()); err != nil {
+		t.Fatalf("Shutdown phase 2: %v", err)
+	}
+
+	// Read the second checkpoint (last line of the file).
+	data2, err := os.ReadFile(env.cfg.CheckpointPath)
+	if err != nil {
+		t.Fatalf("reading checkpoint after phase 2: %v", err)
+	}
+	var lines2 []string
+	sc2 := bufio.NewScanner(bytes.NewReader(data2))
+	for sc2.Scan() {
+		if l := sc2.Text(); l != "" {
+			lines2 = append(lines2, l)
+		}
+	}
+	if len(lines2) < 2 {
+		t.Fatalf("expected at least 2 checkpoints, got %d", len(lines2))
+	}
+	var cp2 chain.Checkpoint
+	if err := json.Unmarshal([]byte(lines2[len(lines2)-1]), &cp2); err != nil {
+		t.Fatalf("unmarshal second checkpoint: %v", err)
+	}
+
+	if cp2.CheckpointSeq != 2 {
+		t.Errorf("second checkpoint seq: got %d, want 2", cp2.CheckpointSeq)
+	}
+	if cp2.PrevCheckpointHash != expectedPrevHash {
+		t.Errorf("second checkpoint prev_checkpoint_hash:\n  got  %s\n  want %s",
+			cp2.PrevCheckpointHash, expectedPrevHash)
+	}
+}
+
+// TestSealedTraces_EvictedAfterCompact verifies that sealedTraces is cleared
+// after a successful WAL.Compact so it does not grow without bound.
+func TestSealedTraces_EvictedAfterCompact(t *testing.T) {
+	env := newTestEnv(t)
+	exp := startExporter(t, env.cfg)
+	defer func() { _ = exp.Shutdown(context.Background()) }()
+
+	traceID := [16]byte{0xF1}
+	rootID := [8]byte{0x01}
+
+	// Seal one trace (root span triggers immediate seal).
+	_ = exp.ConsumeTraces(context.Background(), makeSpan(traceID, rootID, zeroParentID, "root", 1000, 2000))
+
+	// Verify the trace is now in sealedTraces.
+	exp.mu.Lock()
+	_, inSealed := exp.sealedTraces[pcommon.TraceID(traceID).String()]
+	exp.mu.Unlock()
+	if !inSealed {
+		t.Fatal("expected trace to be in sealedTraces after seal")
+	}
+
+	// Wait for the background Compact goroutine to finish and clear sealedTraces.
+	exp.compactWG.Wait()
+
+	exp.mu.Lock()
+	remaining := len(exp.sealedTraces)
+	exp.mu.Unlock()
+	if remaining != 0 {
+		t.Errorf("sealedTraces should be empty after Compact, got %d entries", remaining)
+	}
+}
+
+// TestRestart_CheckpointContinuity_PartialLine verifies that a corrupt/partial
+// last line in the checkpoint file (e.g. from a crash mid-write) does not cause
+// Start to lose the previous valid checkpoint: the restart should use seq=2 based
+// on the last intact line, not fall back to seq=0.
+func TestRestart_CheckpointContinuity_PartialLine(t *testing.T) {
+	env := newTestEnv(t)
+	env.cfg.CheckpointInterval = 1
+
+	traceID1 := [16]byte{0xE3}
+	traceID2 := [16]byte{0xE4}
+	rootID1 := [8]byte{0x01}
+	rootID2 := [8]byte{0x02}
+
+	// Phase 1: write checkpoint seq=1.
+	exp1 := startExporter(t, env.cfg)
+	_ = exp1.ConsumeTraces(context.Background(), makeSpan(traceID1, rootID1, zeroParentID, "t1", 1000, 2000))
+	if err := exp1.Shutdown(context.Background()); err != nil {
+		t.Fatalf("Shutdown phase 1: %v", err)
+	}
+
+	// Read checkpoint seq=1 so we can compute the expected prevHash for seq=2.
+	data, _ := os.ReadFile(env.cfg.CheckpointPath)
+	sc := bufio.NewScanner(bytes.NewReader(data))
+	var lines []string
+	for sc.Scan() {
+		if l := sc.Text(); l != "" {
+			lines = append(lines, l)
+		}
+	}
+	if len(lines) == 0 {
+		t.Fatal("expected checkpoint after phase 1")
+	}
+	var cp1 chain.Checkpoint
+	if err := json.Unmarshal([]byte(lines[0]), &cp1); err != nil {
+		t.Fatalf("unmarshal cp1: %v", err)
+	}
+	payload1, err := chain.CheckpointSigningPayload(cp1)
+	if err != nil {
+		t.Fatalf("CheckpointSigningPayload: %v", err)
+	}
+	h := sha256.Sum256(payload1)
+	expectedPrevHash := hex.EncodeToString(h[:])
+
+	// Simulate a crash mid-write: append a truncated JSON line that ends with '\n'
+	// so the following writeCheckpoint appends on its own line (not concatenated).
+	f, err := os.OpenFile(env.cfg.CheckpointPath, os.O_APPEND|os.O_WRONLY, 0600)
+	if err != nil {
+		t.Fatalf("open checkpoint for truncated append: %v", err)
+	}
+	_, _ = f.Write([]byte("{\"schema_version\":\"v1\",\"checkpoint_seq\":2,\"timestamp\":\"\n")) // truncated + newline
+	_ = f.Close()
+
+	// Phase 2: restart on files with the corrupt last line.
+	exp2 := startExporter(t, env.cfg)
+	_ = exp2.ConsumeTraces(context.Background(), makeSpan(traceID2, rootID2, zeroParentID, "t2", 3000, 4000))
+	if err := exp2.Shutdown(context.Background()); err != nil {
+		t.Fatalf("Shutdown phase 2: %v", err)
+	}
+
+	// The new checkpoint appended by phase 2 should be seq=2 with the correct prevHash.
+	data2, _ := os.ReadFile(env.cfg.CheckpointPath)
+	sc2 := bufio.NewScanner(bytes.NewReader(data2))
+	var lines2 []string
+	for sc2.Scan() {
+		if l := sc2.Text(); l != "" {
+			lines2 = append(lines2, l)
+		}
+	}
+	// lines2 includes: seq=1, corrupt partial, seq=2 — but corrupt line fails Unmarshal so
+	// readLastCheckpoint skips it; seq=2 is written by phase 2.
+	var cp2 chain.Checkpoint
+	for i := len(lines2) - 1; i >= 0; i-- {
+		if err := json.Unmarshal([]byte(lines2[i]), &cp2); err == nil {
+			break
+		}
+	}
+	if cp2.CheckpointSeq != 2 {
+		t.Errorf("second checkpoint seq: got %d, want 2", cp2.CheckpointSeq)
+	}
+	if cp2.PrevCheckpointHash != expectedPrevHash {
+		t.Errorf("second checkpoint prev_checkpoint_hash:\n  got  %s\n  want %s",
+			cp2.PrevCheckpointHash, expectedPrevHash)
 	}
 }
 
