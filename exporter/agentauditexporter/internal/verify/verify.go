@@ -144,7 +144,7 @@ func VerifyLog(logPath, checkpointPath string, pubKey ed25519.PublicKey) (Report
 	// cross-check loop can emit tip_hash_unverifiable instead of silently
 	// skipping the comparison.
 	verifiedTips := make(map[string]string, len(traceIDs))
-	chainFailed := make(map[string]bool)
+	chainFailed := make(map[string]struct{}) // set of trace IDs whose chain verification failed
 	var verifyErrs []VerifyError
 	for _, traceID := range traceIDs {
 		entries := traceEntries[traceID]
@@ -155,7 +155,7 @@ func VerifyLog(logPath, checkpointPath string, pubKey ed25519.PublicKey) (Report
 				Kind:    "chain",
 				Detail:  err.Error(),
 			})
-			chainFailed[traceID] = true
+			chainFailed[traceID] = struct{}{}
 		} else {
 			verifiedTips[traceID] = tipHash
 		}
@@ -200,6 +200,9 @@ func VerifyLog(logPath, checkpointPath string, pubKey ed25519.PublicKey) (Report
 		report.CheckpointsProcessed++
 
 		// Cross-check each trace_tip's entry_count and tip_hash against the log.
+		// Errors are emitted once per (checkpoint, trace) pair — a trace covered
+		// by N checkpoints produces N errors. This is intentional: each
+		// checkpoint occurrence is an independent audit point.
 		for _, tip := range cp.TraceTips {
 			entries := traceEntries[tip.TraceID]
 			if len(entries) != tip.EntryCount {
@@ -209,7 +212,7 @@ func VerifyLog(logPath, checkpointPath string, pubKey ed25519.PublicKey) (Report
 					Detail:  fmt.Sprintf("checkpoint says %d, log has %d", tip.EntryCount, len(entries)),
 				})
 			}
-			if chainFailed[tip.TraceID] {
+			if _, ok := chainFailed[tip.TraceID]; ok {
 				// Chain verification failed, so we cannot confirm the tip
 				// hash. Report it explicitly instead of silently skipping.
 				verifyErrs = append(verifyErrs, VerifyError{
