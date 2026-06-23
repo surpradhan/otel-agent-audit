@@ -8,11 +8,9 @@
 // as a JSONL line to the audit log. A signed checkpoint is written every
 // CheckpointInterval sealed traces and on Shutdown.
 //
-// Known B2 limitations:
-//   - If child spans arrive in a later ConsumeTraces batch than the root span,
-//     those children are not included in the sealed chain. Post-seal spans for an
-//     already-sealed trace_id are dropped with a warning log. This will be
-//     addressed in B3 with the agentauditselect processor.
+// Post-seal behaviour: a span arriving for an already-sealed trace_id is dropped
+// with a warning log. Place the agentauditselect processor upstream to ensure
+// the exporter only receives complete traces.
 //
 // WAL: in-progress trace buffers are backed by a write-ahead log so a collector
 // restart does not introduce spurious gaps. Sealed traces are excluded from
