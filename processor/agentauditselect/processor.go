@@ -26,6 +26,8 @@ package agentauditselect
 
 import (
 	"context"
+	"errors"
+	"fmt"
 	"sort"
 	"strings"
 	"sync"
@@ -37,6 +39,11 @@ import (
 	"go.opentelemetry.io/collector/pdata/ptrace"
 	"go.uber.org/zap"
 )
+
+// minTraceTimeout is the smallest value Validate() accepts for TraceTimeout
+// when explicitly set. Values smaller than this are impractical for a tracing
+// buffer and would produce a sub-nanosecond ticker interval on division by 2.
+const minTraceTimeout = time.Millisecond
 
 // capturedSpan is a deep copy of a span together with its resource and scope
 // metadata, safe to hold across ConsumeTraces calls.
@@ -57,13 +64,16 @@ type traceBuffer struct {
 }
 
 // scopeKey identifies a unique instrumentation scope within a ResourceSpans.
-type scopeKey struct{ schemaURL, name, version string }
+// It includes scope attributes so that scopes sharing the same name, version,
+// and schema URL but carrying different attributes are not merged.
+type scopeKey struct{ schemaURL, name, version, attrsKey string }
 
 type agentAuditSelectProcessor struct {
-	cfg    *Config
-	logger *zap.Logger
-	next   consumer.Traces
-	mu     sync.Mutex
+	cfg          *Config
+	logger       *zap.Logger
+	next         consumer.Traces
+	mu           sync.Mutex
+	shutdownOnce sync.Once
 	// buffers holds in-progress traces not yet forwarded. Guarded by mu.
 	buffers map[string]*traceBuffer
 	// emitted records trace IDs already forwarded, keyed to the time of
@@ -98,8 +108,12 @@ func (p *agentAuditSelectProcessor) Start(_ context.Context, _ component.Host) e
 // trace buffers. Traces that received spans but no root span before shutdown
 // are forwarded as partial so the downstream exporter can seal whatever was
 // received. No WAL-backed recovery is performed (that is out of scope for B3b).
+//
+// Shutdown is idempotent: a second call is a no-op (the stopCh is guarded by
+// sync.Once). Flush errors from individual traces are collected and returned
+// as a combined error.
 func (p *agentAuditSelectProcessor) Shutdown(ctx context.Context) error {
-	close(p.stopCh)
+	p.shutdownOnce.Do(func() { close(p.stopCh) })
 	select {
 	case <-p.doneCh:
 	case <-ctx.Done():
@@ -119,15 +133,17 @@ func (p *agentAuditSelectProcessor) Shutdown(ctx context.Context) error {
 	}
 	p.mu.Unlock()
 
+	var errs []error
 	for _, f := range toFlush {
 		p.logger.Warn("agentauditselect: flushing in-progress trace at shutdown",
 			zap.String("trace_id", f.traceID))
 		if err := p.next.ConsumeTraces(ctx, f.traces); err != nil {
 			p.logger.Error("agentauditselect: flush at shutdown failed",
 				zap.String("trace_id", f.traceID), zap.Error(err))
+			errs = append(errs, err)
 		}
 	}
-	return nil
+	return errors.Join(errs...)
 }
 
 func (p *agentAuditSelectProcessor) Capabilities() consumer.Capabilities {
@@ -289,30 +305,38 @@ func (p *agentAuditSelectProcessor) sweepTimedOut(ctx context.Context, now time.
 	}
 }
 
+// traceTimeout returns the configured timeout, falling back to 30s for zero
+// or any value below minTraceTimeout (belt-and-suspenders; Validate rejects
+// values in the [1ns, minTraceTimeout) range at config-load time).
 func (p *agentAuditSelectProcessor) traceTimeout() time.Duration {
-	if p.cfg.TraceTimeout > 0 {
+	if p.cfg.TraceTimeout >= minTraceTimeout {
 		return p.cfg.TraceTimeout
 	}
 	return 30 * time.Second
 }
 
-// resourceAttrsKey returns a stable string key derived from the sorted resource
-// attribute pairs and schema URL, suitable for use as a map key.
-func resourceAttrsKey(attrs pcommon.Map, schemaURL string) string {
+// attrsMapKey returns a stable, collision-resistant string key for an attribute
+// map. Keys and values are Go-quoted so embedded delimiters cannot produce
+// false matches between distinct attribute sets.
+func attrsMapKey(attrs pcommon.Map) string {
 	pairs := make([]string, 0, attrs.Len())
 	attrs.Range(func(k string, v pcommon.Value) bool {
-		pairs = append(pairs, k+"="+v.AsString())
+		pairs = append(pairs, fmt.Sprintf("%q=%q", k, v.AsString()))
 		return true
 	})
 	sort.Strings(pairs)
-	return schemaURL + "\x00" + strings.Join(pairs, "\x01")
+	return strings.Join(pairs, "\x01")
+}
+
+// resourceAttrsKey returns a stable key for a (resource attrs, schema URL) pair.
+func resourceAttrsKey(attrs pcommon.Map, schemaURL string) string {
+	return schemaURL + "\x00" + attrsMapKey(attrs)
 }
 
 // buildTraces assembles a ptrace.Traces from a buffer. Each distinct
 // (resource attrs, resource schema URL) combination produces its own
-// ResourceSpans; each distinct (scope schema URL, scope name, scope version)
-// produces its own ScopeSpans within that ResourceSpans. This preserves the
-// original resource and scope structure, including schema URLs and scope attrs.
+// ResourceSpans; each distinct (scope schema URL, scope name, scope version,
+// scope attrs) produces its own ScopeSpans within that ResourceSpans.
 func buildTraces(buf *traceBuffer) ptrace.Traces {
 	td := ptrace.NewTraces()
 	if len(buf.spans) == 0 {
@@ -336,7 +360,7 @@ func buildTraces(buf *traceBuffer) ptrace.Traces {
 			rsMap[rk] = rse
 		}
 
-		sk := scopeKey{cs.scopeSchemaURL, cs.scopeName, cs.scopeVersion}
+		sk := scopeKey{cs.scopeSchemaURL, cs.scopeName, cs.scopeVersion, attrsMapKey(cs.scopeAttrs)}
 		ss, ok := rse.ssMap[sk]
 		if !ok {
 			ss = rse.rs.ScopeSpans().AppendEmpty()
