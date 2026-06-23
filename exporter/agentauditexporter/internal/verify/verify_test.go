@@ -129,6 +129,42 @@ func TestVerifyLog_MissingFiles(t *testing.T) {
 	}
 }
 
+// TestVerifyLog_TamperedChainEmitsBothErrors asserts that when a chain fails
+// verification, the cross-check loop still emits tip_hash_unverifiable for the
+// trace rather than silently skipping it (regression for the ok-guard bug).
+func TestVerifyLog_TamperedChainEmitsBothErrors(t *testing.T) {
+	logPath, checkpointPath, pub := makeVerifyFixture(t)
+	data, err := os.ReadFile(logPath)
+	if err != nil {
+		t.Fatalf("read log: %v", err)
+	}
+	tampered := strings.ReplaceAll(string(data), `"root"`, `"tampered"`)
+	if err := os.WriteFile(logPath, []byte(tampered), 0600); err != nil {
+		t.Fatalf("write tampered log: %v", err)
+	}
+
+	report, err := verify.VerifyLog(logPath, checkpointPath, pub)
+	if err != nil {
+		t.Fatalf("VerifyLog: %v", err)
+	}
+
+	var hasChain, hasTipUnverifiable bool
+	for _, e := range report.Errors {
+		if e.Kind == "chain" {
+			hasChain = true
+		}
+		if e.Kind == "tip_hash_unverifiable" {
+			hasTipUnverifiable = true
+		}
+	}
+	if !hasChain {
+		t.Error("expected a 'chain' error; got none")
+	}
+	if !hasTipUnverifiable {
+		t.Errorf("expected a 'tip_hash_unverifiable' error; got errors: %v", report.Errors)
+	}
+}
+
 func TestVerifyChain_Empty(t *testing.T) {
 	_, pub, err := sign.GenerateEd25519Key()
 	if err != nil {
