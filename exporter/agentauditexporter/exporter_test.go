@@ -311,8 +311,8 @@ func TestMultiSpanTrace_SignsAndVerifies(t *testing.T) {
 			t.Errorf("VerifyLog error: %v", e)
 		}
 	}
-	if report.TracesVerified != 1 {
-		t.Errorf("TracesVerified: got %d, want 1", report.TracesVerified)
+	if report.TracesProcessed != 1 {
+		t.Errorf("TracesVerified: got %d, want 1", report.TracesProcessed)
 	}
 }
 
@@ -664,8 +664,8 @@ func TestCheckpoint_SignsAndVerifies(t *testing.T) {
 			t.Errorf("VerifyLog error: %v", e)
 		}
 	}
-	if report.CheckpointsVerified < 1 {
-		t.Errorf("CheckpointsVerified: got %d, want >= 1", report.CheckpointsVerified)
+	if report.CheckpointsProcessed < 1 {
+		t.Errorf("CheckpointsVerified: got %d, want >= 1", report.CheckpointsProcessed)
 	}
 }
 
@@ -762,8 +762,8 @@ func TestVerifyLog_UncoveredTrace(t *testing.T) {
 		t.Fatalf("VerifyLog: %v", err)
 	}
 	// The uncovered trace must be counted but not flagged as error.
-	if report.TracesVerified < 1 {
-		t.Errorf("TracesVerified: got %d, want >= 1", report.TracesVerified)
+	if report.TracesProcessed < 1 {
+		t.Errorf("TracesVerified: got %d, want >= 1", report.TracesProcessed)
 	}
 	// Chain errors are still an error; only "not in any checkpoint" is not an error.
 	chainErrors := 0
@@ -828,8 +828,8 @@ func TestConsumeTraces_SignsAndVerifies(t *testing.T) {
 			t.Errorf("VerifyLog chain error: %v", e)
 		}
 	}
-	if report.TracesVerified != 1 {
-		t.Errorf("TracesVerified: got %d, want 1", report.TracesVerified)
+	if report.TracesProcessed != 1 {
+		t.Errorf("TracesVerified: got %d, want 1", report.TracesProcessed)
 	}
 }
 

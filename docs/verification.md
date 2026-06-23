@@ -25,7 +25,7 @@ otel-agent-audit-verify [-key <hex>] [-key-file <pem>] [-json] <log-file> <check
 |---|---|
 | `-key <hex>` | Hex-encoded Ed25519 public key (64 hex chars = 32 bytes) |
 | `-key-file <pem>` | Path to PEM file with `PUBLIC KEY` block (PKIX/SubjectPublicKeyInfo) |
-| `-json` | Emit results as JSON (`{"TracesVerified":…,"CheckpointsVerified":…,"Errors":[…]}`) |
+| `-json` | Emit results as JSON (`{"TracesProcessed":…,"CheckpointsProcessed":…,"Errors":[…]}`) |
 
 Exactly one of `-key` or `-key-file` is required; using both is an error.
 
@@ -40,11 +40,13 @@ openssl pkey -in /path/to/private.pem -pubout -out /path/to/public.pem
 
 Then pass `-key-file /path/to/public.pem` to the verifier.
 
-To get the raw hex bytes for use with `-key`:
+To get the raw hex bytes for use with `-key` (Ed25519 only — do not use for other key types):
 
 ```bash
 openssl pkey -in /path/to/private.pem -pubout -outform DER | tail -c 32 | xxd -p -c 32
 ```
+
+> **Warning:** `tail -c 32` works only for Ed25519, which has a fixed 32-byte public key at the end of its PKIX DER encoding. Using this command with a non-Ed25519 key produces incorrect bytes without any error. Prefer `-key-file` with the PEM file in all cases.
 
 ## Exit codes
 
@@ -57,16 +59,16 @@ openssl pkey -in /path/to/private.pem -pubout -outform DER | tail -c 32 | xxd -p
 ## Example output (human-readable)
 
 ```
-Traces verified:      42
-Checkpoints verified: 1
+Traces processed:      42
+Checkpoints processed: 1
 Status: OK
 ```
 
 Failure example:
 
 ```
-Traces verified:      42
-Checkpoints verified: 1
+Traces processed:      42
+Checkpoints processed: 1
 Status: FAILED (1 error(s))
   [0123456789abcdef0123456789abcdef] chain: seq 2: signature verification failed
 ```
@@ -75,8 +77,8 @@ Status: FAILED (1 error(s))
 
 ```json
 {
-  "TracesVerified": 42,
-  "CheckpointsVerified": 1,
+  "TracesProcessed": 42,
+  "CheckpointsProcessed": 1,
   "Errors": []
 }
 ```
@@ -89,7 +91,7 @@ Status: FAILED (1 error(s))
 - Traces not covered by any checkpoint are counted but not flagged as errors
   (the last batch before a crash may have been written before the final checkpoint).
 - A missing log or checkpoint file is treated as empty — no error is returned.
-- Partial or corrupt final lines left by a crash are silently skipped.
+- An unparseable line in the log or checkpoint file (e.g. a truncated line from a crash) causes the verifier to return an I/O error (exit 2). The WAL, not the audit log, absorbs crash-partial writes; the audit log only receives complete JSONL entries.
 
 ## Key distribution (v1 scope)
 

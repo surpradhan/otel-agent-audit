@@ -115,6 +115,9 @@ func LoadEd25519PrivateKeyPEM(path string) (ed25519.PrivateKey, error) {
 	if block == nil {
 		return nil, errors.New("no PEM block found in key file")
 	}
+	if block.Type != "PRIVATE KEY" {
+		return nil, fmt.Errorf("expected PEM block type %q, got %q", "PRIVATE KEY", block.Type)
+	}
 	key, err := x509.ParsePKCS8PrivateKey(block.Bytes)
 	if err != nil {
 		return nil, fmt.Errorf("parsing PKCS#8 key: %w", err)
@@ -147,6 +150,9 @@ func LoadEd25519PublicKeyPEM(path string) (ed25519.PublicKey, error) {
 	block, _ := pem.Decode(data)
 	if block == nil {
 		return nil, errors.New("no PEM block found in public key file")
+	}
+	if block.Type != "PUBLIC KEY" {
+		return nil, fmt.Errorf("expected PEM block type %q, got %q", "PUBLIC KEY", block.Type)
 	}
 	key, err := x509.ParsePKIXPublicKey(block.Bytes)
 	if err != nil {

@@ -83,8 +83,8 @@ func run() int {
 		enc.SetIndent("", "  ")
 		_ = enc.Encode(report)
 	} else {
-		fmt.Printf("Traces verified:      %d\n", report.TracesVerified)
-		fmt.Printf("Checkpoints verified: %d\n", report.CheckpointsVerified)
+		fmt.Printf("Traces processed:      %d\n", report.TracesProcessed)
+		fmt.Printf("Checkpoints processed: %d\n", report.CheckpointsProcessed)
 		if len(report.Errors) == 0 {
 			fmt.Println("Status: OK")
 		} else {

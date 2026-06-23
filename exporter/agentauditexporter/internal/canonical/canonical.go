@@ -5,8 +5,6 @@
 // field order follows the AuditRecord struct declaration — that order is
 // load-bearing and is locked by the golden fixture in testdata/.
 //
-// NOTE(B4-refactor): see internal/record/record.go for the planned B4 module
-// restructuring.
 package canonical
 
 import (

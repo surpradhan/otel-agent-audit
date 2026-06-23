@@ -87,11 +87,11 @@ func TestVerifyLog_HappyPath(t *testing.T) {
 	if len(report.Errors) != 0 {
 		t.Errorf("expected no errors; got %v", report.Errors)
 	}
-	if report.TracesVerified != 1 {
-		t.Errorf("want 1 trace verified; got %d", report.TracesVerified)
+	if report.TracesProcessed != 1 {
+		t.Errorf("want 1 trace verified; got %d", report.TracesProcessed)
 	}
-	if report.CheckpointsVerified != 1 {
-		t.Errorf("want 1 checkpoint verified; got %d", report.CheckpointsVerified)
+	if report.CheckpointsProcessed != 1 {
+		t.Errorf("want 1 checkpoint verified; got %d", report.CheckpointsProcessed)
 	}
 }
 
@@ -121,8 +121,8 @@ func TestVerifyLog_MissingFiles(t *testing.T) {
 	if err != nil {
 		t.Fatalf("VerifyLog with missing files: %v", err)
 	}
-	if report.TracesVerified != 0 {
-		t.Errorf("want 0 traces; got %d", report.TracesVerified)
+	if report.TracesProcessed != 0 {
+		t.Errorf("want 0 traces; got %d", report.TracesProcessed)
 	}
 	if len(report.Errors) != 0 {
 		t.Errorf("expected no errors for empty log; got %v", report.Errors)
@@ -136,5 +136,20 @@ func TestVerifyChain_Empty(t *testing.T) {
 	}
 	if err := verify.VerifyChain(nil, pub); err != nil {
 		t.Errorf("VerifyChain(nil): %v", err)
+	}
+}
+
+func TestVerifyLog_WrongKey(t *testing.T) {
+	logPath, checkpointPath, _ := makeVerifyFixture(t)
+	_, wrongPub, err := sign.GenerateEd25519Key()
+	if err != nil {
+		t.Fatalf("GenerateEd25519Key: %v", err)
+	}
+	report, err := verify.VerifyLog(logPath, checkpointPath, wrongPub)
+	if err != nil {
+		t.Fatalf("VerifyLog: %v", err)
+	}
+	if len(report.Errors) == 0 {
+		t.Error("expected errors when verifying with wrong key; got none")
 	}
 }

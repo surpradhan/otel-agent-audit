@@ -1,5 +1,5 @@
 // Package verify provides chain and checkpoint verification.
-// Used by tests and the exporter's self-check path; standalone CLI is deferred to B4.
+// Used by tests, the exporter's self-check path, and the otel-agent-audit-verify CLI.
 package verify
 
 import (
@@ -35,10 +35,12 @@ func (e VerifyError) Error() string {
 }
 
 // Report summarizes a VerifyLog run.
+// TracesProcessed and CheckpointsProcessed count all entries seen (including
+// those that failed verification); check Errors for per-entry failure details.
 type Report struct {
-	TracesVerified      int
-	CheckpointsVerified int
-	Errors              []VerifyError
+	TracesProcessed      int
+	CheckpointsProcessed int
+	Errors               []VerifyError
 }
 
 // VerifyChain verifies the hash chain of a set of log entries for a single trace.
@@ -126,7 +128,7 @@ func VerifyCheckpoint(cp chain.Checkpoint, prevSignPayloadHash string, pubKey ed
 // VerifyLog reads a JSONL log file and checkpoint file, verifies all chains and
 // checkpoints, and returns a Report.
 //
-// Policy for traces not covered by any checkpoint: counted in TracesVerified
+// Policy for traces not covered by any checkpoint: counted in TracesProcessed
 // but not reported as errors (they are "unchecked-by-checkpoint"). Rationale:
 // the final batch before a crash may be in the log before the checkpoint was
 // persisted; treating this as an error would produce false positives on restarts.
@@ -162,7 +164,7 @@ func VerifyLog(logPath, checkpointPath string, pubKey ed25519.PublicKey) (Report
 		} else {
 			verifiedTips[traceID] = tipHash
 		}
-		report.TracesVerified++
+		report.TracesProcessed++
 	}
 
 	// Parse and verify checkpoints.
@@ -181,7 +183,7 @@ func VerifyLog(logPath, checkpointPath string, pubKey ed25519.PublicKey) (Report
 				Kind:    "checkpoint",
 				Detail:  fmt.Sprintf("seq %d: %v", cp.CheckpointSeq, err),
 			})
-			report.CheckpointsVerified++
+			report.CheckpointsProcessed++
 			continue
 		}
 		h := sha256.Sum256(payload)
@@ -194,7 +196,7 @@ func VerifyLog(logPath, checkpointPath string, pubKey ed25519.PublicKey) (Report
 			})
 		}
 		prevHash = hex.EncodeToString(h[:])
-		report.CheckpointsVerified++
+		report.CheckpointsProcessed++
 
 		// Cross-check each trace_tip's entry_count and tip_hash against the log.
 		for _, tip := range cp.TraceTips {
