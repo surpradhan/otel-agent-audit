@@ -1301,5 +1301,87 @@ func TestSealedTraces_EvictedAfterCompact(t *testing.T) {
 	}
 }
 
+// TestRestart_CheckpointContinuity_PartialLine verifies that a corrupt/partial
+// last line in the checkpoint file (e.g. from a crash mid-write) does not cause
+// Start to lose the previous valid checkpoint: the restart should use seq=2 based
+// on the last intact line, not fall back to seq=0.
+func TestRestart_CheckpointContinuity_PartialLine(t *testing.T) {
+	env := newTestEnv(t)
+	env.cfg.CheckpointInterval = 1
+
+	traceID1 := [16]byte{0xE3}
+	traceID2 := [16]byte{0xE4}
+	rootID1 := [8]byte{0x01}
+	rootID2 := [8]byte{0x02}
+
+	// Phase 1: write checkpoint seq=1.
+	exp1 := startExporter(t, env.cfg)
+	_ = exp1.ConsumeTraces(context.Background(), makeSpan(traceID1, rootID1, zeroParentID, "t1", 1000, 2000))
+	if err := exp1.Shutdown(context.Background()); err != nil {
+		t.Fatalf("Shutdown phase 1: %v", err)
+	}
+
+	// Read checkpoint seq=1 so we can compute the expected prevHash for seq=2.
+	data, _ := os.ReadFile(env.cfg.CheckpointPath)
+	sc := bufio.NewScanner(bytes.NewReader(data))
+	var lines []string
+	for sc.Scan() {
+		if l := sc.Text(); l != "" {
+			lines = append(lines, l)
+		}
+	}
+	if len(lines) == 0 {
+		t.Fatal("expected checkpoint after phase 1")
+	}
+	var cp1 chain.Checkpoint
+	if err := json.Unmarshal([]byte(lines[0]), &cp1); err != nil {
+		t.Fatalf("unmarshal cp1: %v", err)
+	}
+	payload1, _ := chain.CheckpointSigningPayload(cp1)
+	h := sha256.Sum256(payload1)
+	expectedPrevHash := hex.EncodeToString(h[:])
+
+	// Simulate a crash mid-write: append a truncated JSON line that ends with '\n'
+	// so the following writeCheckpoint appends on its own line (not concatenated).
+	f, err := os.OpenFile(env.cfg.CheckpointPath, os.O_APPEND|os.O_WRONLY, 0600)
+	if err != nil {
+		t.Fatalf("open checkpoint for truncated append: %v", err)
+	}
+	_, _ = f.Write([]byte("{\"schema_version\":\"v1\",\"checkpoint_seq\":2,\"timestamp\":\"\n")) // truncated + newline
+	_ = f.Close()
+
+	// Phase 2: restart on files with the corrupt last line.
+	exp2 := startExporter(t, env.cfg)
+	_ = exp2.ConsumeTraces(context.Background(), makeSpan(traceID2, rootID2, zeroParentID, "t2", 3000, 4000))
+	if err := exp2.Shutdown(context.Background()); err != nil {
+		t.Fatalf("Shutdown phase 2: %v", err)
+	}
+
+	// The new checkpoint appended by phase 2 should be seq=2 with the correct prevHash.
+	data2, _ := os.ReadFile(env.cfg.CheckpointPath)
+	sc2 := bufio.NewScanner(bytes.NewReader(data2))
+	var lines2 []string
+	for sc2.Scan() {
+		if l := sc2.Text(); l != "" {
+			lines2 = append(lines2, l)
+		}
+	}
+	// lines2 includes: seq=1, corrupt partial, seq=2 — but corrupt line fails Unmarshal so
+	// readLastCheckpoint skips it; seq=2 is written by phase 2.
+	var cp2 chain.Checkpoint
+	for i := len(lines2) - 1; i >= 0; i-- {
+		if err := json.Unmarshal([]byte(lines2[i]), &cp2); err == nil {
+			break
+		}
+	}
+	if cp2.CheckpointSeq != 2 {
+		t.Errorf("second checkpoint seq: got %d, want 2", cp2.CheckpointSeq)
+	}
+	if cp2.PrevCheckpointHash != expectedPrevHash {
+		t.Errorf("second checkpoint prev_checkpoint_hash:\n  got  %s\n  want %s",
+			cp2.PrevCheckpointHash, expectedPrevHash)
+	}
+}
+
 // Ensure record import doesn't cause "imported and not used" when tests don't directly use it.
 var _ = record.SchemaVersion

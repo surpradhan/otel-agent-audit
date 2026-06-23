@@ -244,9 +244,12 @@ process lifetimes) is the constant
 On `Start`, the exporter reads the last line of the checkpoint file and restores
 `checkpoint_seq` and `prev_checkpoint_hash` from it before writing any new
 checkpoints. This ensures `checkpoint_seq` is monotonically increasing across
-clean shutdowns and that the `prev_checkpoint_hash` chain has no gaps, allowing
-verifiers to treat the entire checkpoint file as one unbroken sequence regardless
-of how many times the collector has been restarted.
+process restarts (whether clean shutdowns or crash-recovery) and that the
+`prev_checkpoint_hash` chain has no gaps, allowing verifiers to treat the entire
+checkpoint file as one unbroken sequence regardless of how many times the
+collector has been restarted. Partial or corrupt final lines left by a
+crash-in-write are silently skipped; the previous complete checkpoint is used
+as the restart base.
 
 ### Signing protocol
 

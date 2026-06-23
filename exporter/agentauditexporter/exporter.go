@@ -59,8 +59,11 @@ type agentAuditExporter struct {
 	wal          *wal.WAL
 	accumulator  *chain.Accumulator
 	buffers      map[string]*traceBuffer // guarded by mu
-	// sealedTraces prevents re-sealing a trace between seal and the next Compact.
-	// Cleared after each successful WAL.Compact so it does not grow without bound.
+	// sealedTraces prevents re-sealing a trace in the window between seal and the
+	// next WAL.Compact. Cleared after each successful Compact so it does not grow
+	// without bound. After eviction, a re-delivered root span for a compacted
+	// traceID will be buffered and sealed again as a new chain — this is an accepted
+	// at-least-once pipeline trade-off, addressed in B3 by the agentauditselect processor.
 	sealedTraces map[string]struct{} // guarded by mu
 	mu           sync.Mutex
 	compactWG    sync.WaitGroup // tracks background Compact goroutines
@@ -158,13 +161,17 @@ func (e *agentAuditExporter) Start(_ context.Context, _ component.Host) error {
 	if lastCP, ok, cpErr := readLastCheckpoint(e.cfg.CheckpointPath); ok {
 		payload, payloadErr := chain.CheckpointSigningPayload(lastCP)
 		if payloadErr != nil {
-			e.logger.Warn("agentaudit: could not reconstruct checkpoint signing payload on restart",
-				zap.Error(payloadErr))
-		} else {
-			h := sha256.Sum256(payload)
-			prevHash = hex.EncodeToString(h[:])
-			initialSeq = lastCP.CheckpointSeq
+			// CheckpointSigningPayload marshals a struct of basic types; this
+			// path is unreachable in practice. Treat it as fatal: a silent
+			// fallback to seq=0 would break the checkpoint chain invisibly.
+			_ = logF.Close()
+			_ = checkF.Close()
+			_ = w.Close()
+			return fmt.Errorf("agentaudit: cannot reconstruct checkpoint signing payload on restart: %w", payloadErr)
 		}
+		h := sha256.Sum256(payload)
+		prevHash = hex.EncodeToString(h[:])
+		initialSeq = lastCP.CheckpointSeq
 	} else if cpErr != nil {
 		e.logger.Warn("agentaudit: could not read last checkpoint on restart", zap.Error(cpErr))
 	}
@@ -275,6 +282,9 @@ func (e *agentAuditExporter) Shutdown(ctx context.Context) error {
 		if err := e.wal.Compact(); err != nil {
 			e.logger.Warn("agentaudit: final WAL compact failed", zap.Error(err))
 		} else {
+			// No concurrent goroutines remain at this point (compactWG drained,
+			// background worker stopped), but we take mu for consistency with the
+			// background-goroutine path that also clears sealedTraces under mu.
 			e.mu.Lock()
 			e.sealedTraces = make(map[string]struct{})
 			e.mu.Unlock()
@@ -493,6 +503,7 @@ func readLastCheckpoint(path string) (chain.Checkpoint, bool, error) {
 	var last chain.Checkpoint
 	found := false
 	scanner := bufio.NewScanner(f)
+	scanner.Buffer(make([]byte, 64*1024), 4*1024*1024) // up to 4 MB per line (default 64 KB is too small for large checkpoint intervals)
 	for scanner.Scan() {
 		line := scanner.Bytes()
 		if len(line) == 0 {

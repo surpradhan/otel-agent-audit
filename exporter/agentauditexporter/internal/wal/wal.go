@@ -38,7 +38,7 @@ type walEntry struct {
 
 // WAL is a JSONL write-ahead log for buffered trace spans.
 type WAL struct {
-	mu   sync.RWMutex
+	mu   sync.Mutex
 	path string
 	f    *os.File
 }
@@ -103,6 +103,7 @@ func (w *WAL) Replay() (map[string][]record.AuditRecord, error) {
 	buffers := map[string][]record.AuditRecord{}
 
 	scanner := bufio.NewScanner(rf)
+	scanner.Buffer(make([]byte, 64*1024), 4*1024*1024)
 	for scanner.Scan() {
 		line := scanner.Bytes()
 		if len(line) == 0 {
@@ -153,6 +154,7 @@ func (w *WAL) Compact() error {
 	var spans []spanEntry
 
 	scanner := bufio.NewScanner(rf)
+	scanner.Buffer(make([]byte, 64*1024), 4*1024*1024)
 	for scanner.Scan() {
 		line := scanner.Bytes()
 		if len(line) == 0 {
