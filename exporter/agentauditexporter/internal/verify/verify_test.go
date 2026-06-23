@@ -129,6 +129,101 @@ func TestVerifyLog_MissingFiles(t *testing.T) {
 	}
 }
 
+// TestVerifyLog_TamperedChainEmitsBothErrors asserts that when a chain fails
+// verification, the cross-check loop still emits tip_hash_unverifiable for the
+// trace rather than silently skipping it (regression for the ok-guard bug).
+func TestVerifyLog_TamperedChainEmitsBothErrors(t *testing.T) {
+	logPath, checkpointPath, pub := makeVerifyFixture(t)
+	data, err := os.ReadFile(logPath)
+	if err != nil {
+		t.Fatalf("read log: %v", err)
+	}
+	tampered := strings.ReplaceAll(string(data), `"root"`, `"tampered"`)
+	if err := os.WriteFile(logPath, []byte(tampered), 0600); err != nil {
+		t.Fatalf("write tampered log: %v", err)
+	}
+
+	report, err := verify.VerifyLog(logPath, checkpointPath, pub)
+	if err != nil {
+		t.Fatalf("VerifyLog: %v", err)
+	}
+
+	var hasChain, hasTipUnverifiable bool
+	for _, e := range report.Errors {
+		if e.Kind == "chain" {
+			hasChain = true
+		}
+		if e.Kind == "tip_hash_unverifiable" {
+			hasTipUnverifiable = true
+		}
+	}
+	if !hasChain {
+		t.Error("expected a 'chain' error; got none")
+	}
+	if !hasTipUnverifiable {
+		t.Errorf("expected a 'tip_hash_unverifiable' error; got errors: %v", report.Errors)
+	}
+}
+
+// TestVerifyLog_BothSidesTamperedEmitsUnverifiable covers the full attack
+// scenario: the log entries AND the checkpoint tip_hash are both replaced.
+// The verifier must emit tip_hash_unverifiable (chain failure takes priority)
+// and must NOT emit tip_hash_mismatch (the comparison is never reached).
+func TestVerifyLog_BothSidesTamperedEmitsUnverifiable(t *testing.T) {
+	logPath, checkpointPath, pub := makeVerifyFixture(t)
+
+	// Tamper the log — break the chain signature.
+	data, err := os.ReadFile(logPath)
+	if err != nil {
+		t.Fatalf("read log: %v", err)
+	}
+	if err := os.WriteFile(logPath, []byte(strings.ReplaceAll(string(data), `"root"`, `"tampered"`)), 0600); err != nil {
+		t.Fatalf("write tampered log: %v", err)
+	}
+
+	// Also tamper the checkpoint tip_hash to a fabricated value.
+	cpData, err := os.ReadFile(checkpointPath)
+	if err != nil {
+		t.Fatalf("read checkpoint: %v", err)
+	}
+	var cp chain.Checkpoint
+	if err := json.Unmarshal([]byte(strings.TrimSpace(string(cpData))), &cp); err != nil {
+		t.Fatalf("unmarshal checkpoint: %v", err)
+	}
+	cp.TraceTips[0].TipHash = strings.Repeat("ff", 32)
+	cpLine, err := json.Marshal(cp)
+	if err != nil {
+		t.Fatalf("marshal checkpoint: %v", err)
+	}
+	if err := os.WriteFile(checkpointPath, append(cpLine, '\n'), 0600); err != nil {
+		t.Fatalf("write tampered checkpoint: %v", err)
+	}
+
+	report, err := verify.VerifyLog(logPath, checkpointPath, pub)
+	if err != nil {
+		t.Fatalf("VerifyLog: %v", err)
+	}
+
+	var hasChain, hasTipUnverifiable bool
+	for _, e := range report.Errors {
+		if e.Kind == "chain" {
+			hasChain = true
+		}
+		if e.Kind == "tip_hash_unverifiable" {
+			hasTipUnverifiable = true
+		}
+		if e.Kind == "tip_hash_mismatch" {
+			t.Errorf("unexpected tip_hash_mismatch when chain failed: %v", e)
+		}
+	}
+	if !hasChain {
+		t.Error("expected a 'chain' error; got none")
+	}
+	if !hasTipUnverifiable {
+		t.Errorf("expected 'tip_hash_unverifiable'; got errors: %v", report.Errors)
+	}
+}
+
 func TestVerifyChain_Empty(t *testing.T) {
 	_, pub, err := sign.GenerateEd25519Key()
 	if err != nil {
