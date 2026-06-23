@@ -148,3 +148,33 @@ func TestLoadEd25519PrivateKeyPEM_MissingFile(t *testing.T) {
 		t.Error("expected error for missing file")
 	}
 }
+
+func TestPublicKeyPEM_RoundTrip(t *testing.T) {
+	_, pub, err := GenerateEd25519Key()
+	if err != nil {
+		t.Fatalf("GenerateEd25519Key: %v", err)
+	}
+	pemBytes, err := MarshalEd25519PublicKeyPEM(pub)
+	if err != nil {
+		t.Fatalf("MarshalEd25519PublicKeyPEM: %v", err)
+	}
+	dir := t.TempDir()
+	keyFile := filepath.Join(dir, "pub.pem")
+	if err := os.WriteFile(keyFile, pemBytes, 0600); err != nil {
+		t.Fatalf("write pub key file: %v", err)
+	}
+	loaded, err := LoadEd25519PublicKeyPEM(keyFile)
+	if err != nil {
+		t.Fatalf("LoadEd25519PublicKeyPEM: %v", err)
+	}
+	if string(pub) != string(loaded) {
+		t.Error("loaded public key does not match original")
+	}
+}
+
+func TestLoadEd25519PublicKeyPEM_MissingFile(t *testing.T) {
+	_, err := LoadEd25519PublicKeyPEM("/nonexistent/pub.pem")
+	if err == nil {
+		t.Error("expected error for missing file")
+	}
+}

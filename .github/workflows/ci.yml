@@ -26,6 +26,8 @@ jobs:
         run: cd exporter/agentauditexporter && go tool cover -func=../../coverage.out | grep total
       - name: Run processor tests
         run: cd processor/agentauditselect && go test -race ./...
+      - name: Build verifier CLI
+        run: cd exporter/agentauditexporter && go build -o /dev/null ./cmd/otel-agent-audit-verify
 
   lint:
     name: Lint

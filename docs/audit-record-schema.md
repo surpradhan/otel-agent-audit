@@ -315,3 +315,24 @@ processors:
 **Ordering constraint:** `agentauditselect` must appear in the pipeline
 immediately before `agentauditexporter`. Do not place the `batch` processor
 between them (it regroups spans and defeats deterministic ordering).
+
+---
+
+## 10. Verifier CLI (B4)
+
+`otel-agent-audit-verify` is the reference implementation for audit log
+verification. It is built from
+`exporter/agentauditexporter/cmd/otel-agent-audit-verify/` and wraps
+`internal/verify.VerifyLog`.
+
+See [`docs/verification.md`](verification.md) for build instructions, flags,
+and example output.
+
+**Schema impact:** none — the verifier is a read-only consumer of the existing
+log format. No `schema_version` bump is required.
+
+**Key distribution (v1 scope):** the operator is responsible for distributing
+the Ed25519 public key out-of-band (e.g. storing it alongside the log, or in a
+key management system). Key rotation is not defined for v1; rotated keys produce
+new `key_id` values in the log, requiring the verifier to be run with the
+appropriate key for each epoch.
