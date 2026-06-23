@@ -35,8 +35,8 @@ Before merge, **all** of the following must hold:
 
 | Job | What it does |
 |-----|-------------|
-| `Test (Go 1.25)` / `Test (Go 1.26)` | `go test -race ./...` with coverage report |
-| `Lint` | `golangci-lint run` |
+| `Test (Go 1.25)` / `Test (Go 1.26)` | `go test -race ./...` on exporter and processor; coverage report for exporter |
+| `Lint` | `golangci-lint run` on exporter and processor |
 | `Build` | Installs OCB; builds the demo collector distro from `ocb/builder-config.yaml` |
 | `Required checks in sync` | Runs the drift-guard script; verifies ci.yml ↔ this block ↔ (optionally) branch protection |
 

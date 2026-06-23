@@ -1,0 +1,8 @@
+type: agentauditselect
+status:
+  class: processor
+  stability:
+    development: [traces]
+  distributions: []
+  codeowners:
+    active: [surpradhan]

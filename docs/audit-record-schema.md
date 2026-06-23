@@ -279,3 +279,39 @@ treating this as an error would produce false positives on clean restarts.
 ### Cross-impl fixture
 
 - `exporter/agentauditexporter/internal/chain/testdata/v1_checkpoint_fixture.json`
+
+---
+
+## 9. agentauditselect processor (B3b)
+
+The `agentauditselect` processor sits immediately upstream of `agentauditexporter`
+in the collector pipeline. It buffers spans in memory, keyed by `trace_id`, and
+forwards each trace as a single `ptrace.Traces` call only when one of two
+conditions is met:
+
+1. **Root detected:** a span with `parent_span_id == ""` arrives. All buffered
+   spans for that trace are forwarded immediately in one call.
+2. **Timeout:** no new span for a trace has arrived for `trace_timeout` (default
+   30 s). The partial buffer is forwarded as-is so the exporter can seal whatever
+   was received.
+
+**What this fixes:** prior to B3b, if child spans arrived in a later
+`ConsumeTraces` batch than the root span, the exporter would seal on the root
+and then drop the late children with a warning. The processor ensures the
+exporter only ever sees complete (or timed-out-partial) traces.
+
+**Schema impact:** none — no chain-format or schema_version changes. The
+processor is transparent to the audit-record schema; it only controls the
+delivery batching.
+
+**Configuration:**
+
+```yaml
+processors:
+  agentauditselect:
+    trace_timeout: 30s   # optional; default 30s
+```
+
+**Ordering constraint:** `agentauditselect` must appear in the pipeline
+immediately before `agentauditexporter`. Do not place the `batch` processor
+between them (it regroups spans and defeats deterministic ordering).
