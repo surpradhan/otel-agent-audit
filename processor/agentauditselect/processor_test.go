@@ -290,6 +290,44 @@ func TestProcessor_PostForwardSpanPassthrough(t *testing.T) {
 	}
 }
 
+// TestConfig_Validate exercises all three validation branches.
+func TestConfig_Validate(t *testing.T) {
+	cases := []struct {
+		d       time.Duration
+		wantErr bool
+	}{
+		{-time.Second, true},
+		{500 * time.Microsecond, true},
+		{minTraceTimeout - 1, true},
+		{0, false},
+		{minTraceTimeout, false},
+		{30 * time.Second, false},
+	}
+	for _, tc := range cases {
+		err := (&Config{TraceTimeout: tc.d}).Validate()
+		if (err != nil) != tc.wantErr {
+			t.Errorf("TraceTimeout=%v: wantErr=%v, got err=%v", tc.d, tc.wantErr, err)
+		}
+	}
+}
+
+// TestProcessor_ShutdownIdempotent verifies that calling Shutdown twice does
+// not panic.
+func TestProcessor_ShutdownIdempotent(t *testing.T) {
+	cc := &capturingConsumer{}
+	cfg := &Config{TraceTimeout: 30 * time.Second}
+	p := newProcessor(cfg, nil, cc)
+	if err := p.Start(context.Background(), nil); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	if err := p.Shutdown(context.Background()); err != nil {
+		t.Fatalf("first Shutdown: %v", err)
+	}
+	if err := p.Shutdown(context.Background()); err != nil {
+		t.Fatalf("second Shutdown: %v", err)
+	}
+}
+
 // TestProcessor_ShutdownFlushesBuffers verifies that in-progress trace buffers
 // (no root received) are forwarded when the processor shuts down.
 func TestProcessor_ShutdownFlushesBuffers(t *testing.T) {

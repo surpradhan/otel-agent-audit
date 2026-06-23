@@ -2,6 +2,7 @@ package agentauditselect
 
 import (
 	"errors"
+	"fmt"
 	"time"
 )
 
@@ -10,7 +11,7 @@ type Config struct {
 	// TraceTimeout is the maximum time a trace buffer is held open waiting for
 	// a root span before being forwarded as-is. Default: 30s.
 	// A value of 0 uses the 30s default; negative values are rejected.
-	// The minimum accepted non-zero value is 1ms.
+	// The minimum accepted non-zero value is minTraceTimeout (see processor.go).
 	TraceTimeout time.Duration `mapstructure:"trace_timeout"`
 }
 
@@ -20,7 +21,7 @@ func (c *Config) Validate() error {
 		return errors.New("trace_timeout must not be negative; omit or set to 0 to use the 30s default")
 	}
 	if c.TraceTimeout > 0 && c.TraceTimeout < minTraceTimeout {
-		return errors.New("trace_timeout must be at least 1ms when set; omit or set to 0 to use the 30s default")
+		return fmt.Errorf("trace_timeout must be at least %v when set; omit or set to 0 to use the 30s default", minTraceTimeout)
 	}
 	return nil
 }
