@@ -232,6 +232,18 @@ func TestLoadEd25519PrivateKeyPEM_NoPEMBlock(t *testing.T) {
 	}
 }
 
+func TestLoadEd25519PublicKeyPEM_NoPEMBlock(t *testing.T) {
+	dir := t.TempDir()
+	f := filepath.Join(dir, "garbage.pem")
+	if err := os.WriteFile(f, []byte("not a pem block"), 0600); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+	_, err := LoadEd25519PublicKeyPEM(f)
+	if err == nil {
+		t.Error("LoadEd25519PublicKeyPEM: expected error for file with no PEM block")
+	}
+}
+
 func TestLoadEd25519PublicKeyPEM_NonEd25519(t *testing.T) {
 	// Write a PEM block with PUBLIC KEY type but garbage DER bytes to trigger
 	// the non-Ed25519 key type check.
