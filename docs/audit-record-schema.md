@@ -234,9 +234,19 @@ sealed traces (default 100) and on `Shutdown`.
 
 ### First-checkpoint sentinel
 
-`prev_checkpoint_hash` for the very first checkpoint is the constant
+`prev_checkpoint_hash` for the very first checkpoint ever written (across all
+process lifetimes) is the constant
 `chain.ZeroPrevCheckpointHash = "0000000000000000000000000000000000000000000000000000000000000000"`
 (64 ASCII '0' characters = hex encoding of 32 zero bytes).
+
+### Checkpoint continuity across restarts
+
+On `Start`, the exporter reads the last line of the checkpoint file and restores
+`checkpoint_seq` and `prev_checkpoint_hash` from it before writing any new
+checkpoints. This ensures `checkpoint_seq` is monotonically increasing across
+clean shutdowns and that the `prev_checkpoint_hash` chain has no gaps, allowing
+verifiers to treat the entire checkpoint file as one unbroken sequence regardless
+of how many times the collector has been restarted.
 
 ### Signing protocol
 

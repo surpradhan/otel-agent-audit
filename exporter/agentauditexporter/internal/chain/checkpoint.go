@@ -91,6 +91,27 @@ func (a *Accumulator) PendingCount() int {
 	return len(a.pending)
 }
 
+// CheckpointSigningPayload returns the compact JSON bytes that were signed to
+// produce cp. It reconstructs the checkpointForSigning struct used by Build,
+// allowing callers to re-derive SHA256(payload) for chaining prevHash across
+// restarts without duplicating the internal struct.
+func CheckpointSigningPayload(cp Checkpoint) ([]byte, error) {
+	cfs := checkpointForSigning{
+		SchemaVersion:      cp.SchemaVersion,
+		CheckpointSeq:      cp.CheckpointSeq,
+		Timestamp:          cp.Timestamp,
+		PrevCheckpointHash: cp.PrevCheckpointHash,
+		TraceTips:          cp.TraceTips,
+		KeyID:              cp.KeyID,
+		Algorithm:          cp.Algorithm,
+	}
+	b, err := json.Marshal(cfs)
+	if err != nil {
+		return nil, fmt.Errorf("checkpoint: marshal signing payload: %w", err)
+	}
+	return b, nil
+}
+
 // Build creates and signs a checkpoint from all pending tips.
 // trace_tips are sorted by trace_id before signing to ensure deterministic
 // checkpointForSigning bytes across implementations.
