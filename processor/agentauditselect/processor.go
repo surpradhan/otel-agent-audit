@@ -18,10 +18,16 @@
 //
 // Each trace is emitted as its own ptrace.Traces call — spans from different
 // traces are never grouped into one call.
+//
+// The emitted map (which tracks forwarded trace IDs to enable pass-through of
+// late-arriving spans) is TTL-evicted on each background sweep at 2*trace_timeout,
+// bounding its size to roughly 2*trace_timeout worth of completed trace IDs.
 package agentauditselect
 
 import (
 	"context"
+	"sort"
+	"strings"
 	"sync"
 	"time"
 
@@ -35,10 +41,13 @@ import (
 // capturedSpan is a deep copy of a span together with its resource and scope
 // metadata, safe to hold across ConsumeTraces calls.
 type capturedSpan struct {
-	resourceAttrs pcommon.Map
-	scopeName     string
-	scopeVersion  string
-	span          ptrace.Span
+	resourceAttrs     pcommon.Map
+	resourceSchemaURL string
+	scopeName         string
+	scopeVersion      string
+	scopeSchemaURL    string
+	scopeAttrs        pcommon.Map
+	span              ptrace.Span
 }
 
 // traceBuffer holds copied spans for one in-progress trace.
@@ -47,6 +56,9 @@ type traceBuffer struct {
 	lastSeen time.Time
 }
 
+// scopeKey identifies a unique instrumentation scope within a ResourceSpans.
+type scopeKey struct{ schemaURL, name, version string }
+
 type agentAuditSelectProcessor struct {
 	cfg    *Config
 	logger *zap.Logger
@@ -54,9 +66,10 @@ type agentAuditSelectProcessor struct {
 	mu     sync.Mutex
 	// buffers holds in-progress traces not yet forwarded. Guarded by mu.
 	buffers map[string]*traceBuffer
-	// emitted records trace IDs already forwarded, so post-forward spans can be
-	// passed through without re-buffering. Guarded by mu.
-	emitted map[string]struct{}
+	// emitted records trace IDs already forwarded, keyed to the time of
+	// forwarding. Entries are evicted after 2*traceTimeout on each background
+	// sweep. Guarded by mu.
+	emitted map[string]time.Time
 	stopCh  chan struct{}
 	doneCh  chan struct{}
 }
@@ -70,7 +83,7 @@ func newProcessor(cfg *Config, logger *zap.Logger, next consumer.Traces) *agentA
 		logger:  logger,
 		next:    next,
 		buffers: make(map[string]*traceBuffer),
-		emitted: make(map[string]struct{}),
+		emitted: make(map[string]time.Time),
 		stopCh:  make(chan struct{}),
 		doneCh:  make(chan struct{}),
 	}
@@ -81,9 +94,39 @@ func (p *agentAuditSelectProcessor) Start(_ context.Context, _ component.Host) e
 	return nil
 }
 
-func (p *agentAuditSelectProcessor) Shutdown(_ context.Context) error {
+// Shutdown stops the background sweep goroutine and flushes any in-progress
+// trace buffers. Traces that received spans but no root span before shutdown
+// are forwarded as partial so the downstream exporter can seal whatever was
+// received. No WAL-backed recovery is performed (that is out of scope for B3b).
+func (p *agentAuditSelectProcessor) Shutdown(ctx context.Context) error {
 	close(p.stopCh)
-	<-p.doneCh
+	select {
+	case <-p.doneCh:
+	case <-ctx.Done():
+		p.logger.Warn("agentauditselect: Shutdown context expired waiting for background worker")
+	}
+
+	// Flush all in-progress buffers.
+	p.mu.Lock()
+	type pending struct {
+		traceID string
+		traces  ptrace.Traces
+	}
+	toFlush := make([]pending, 0, len(p.buffers))
+	for traceID, buf := range p.buffers {
+		toFlush = append(toFlush, pending{traceID, buildTraces(buf)})
+		delete(p.buffers, traceID)
+	}
+	p.mu.Unlock()
+
+	for _, f := range toFlush {
+		p.logger.Warn("agentauditselect: flushing in-progress trace at shutdown",
+			zap.String("trace_id", f.traceID))
+		if err := p.next.ConsumeTraces(ctx, f.traces); err != nil {
+			p.logger.Error("agentauditselect: flush at shutdown failed",
+				zap.String("trace_id", f.traceID), zap.Error(err))
+		}
+	}
 	return nil
 }
 
@@ -105,7 +148,7 @@ func (p *agentAuditSelectProcessor) ConsumeTraces(ctx context.Context, td ptrace
 	var toForward []pendingForward
 
 	p.mu.Lock()
-	// Track which trace IDs have had a root span detected in this batch to
+	// rootSeen tracks trace IDs that received a root span in this batch to
 	// avoid forwarding the same trace twice if two root spans arrive together.
 	rootSeen := make(map[string]struct{})
 
@@ -126,14 +169,19 @@ func (p *agentAuditSelectProcessor) ConsumeTraces(ctx context.Context, td ptrace
 					continue
 				}
 
-				// Deep-copy the span so we can hold it past this ConsumeTraces call.
+				// Deep-copy the span and all metadata so we can hold them past
+				// this ConsumeTraces call.
 				cs := capturedSpan{
-					scopeName:    ss.Scope().Name(),
-					scopeVersion: ss.Scope().Version(),
-					span:         ptrace.NewSpan(),
+					resourceSchemaURL: rs.SchemaUrl(),
+					scopeName:         ss.Scope().Name(),
+					scopeVersion:      ss.Scope().Version(),
+					scopeSchemaURL:    ss.SchemaUrl(),
+					span:              ptrace.NewSpan(),
 				}
 				cs.resourceAttrs = pcommon.NewMap()
 				rs.Resource().Attributes().CopyTo(cs.resourceAttrs)
+				cs.scopeAttrs = pcommon.NewMap()
+				ss.Scope().Attributes().CopyTo(cs.scopeAttrs)
 				span.CopyTo(cs.span)
 
 				buf := p.buffers[traceID]
@@ -151,7 +199,7 @@ func (p *agentAuditSelectProcessor) ConsumeTraces(ctx context.Context, td ptrace
 		}
 	}
 
-	// Build forwarding list for all traces that received a root this batch.
+	// Build the forwarding list for all traces that received a root this batch.
 	for traceID := range rootSeen {
 		buf := p.buffers[traceID]
 		if buf == nil {
@@ -162,11 +210,11 @@ func (p *agentAuditSelectProcessor) ConsumeTraces(ctx context.Context, td ptrace
 			traces:  buildTraces(buf),
 		})
 		delete(p.buffers, traceID)
-		p.emitted[traceID] = struct{}{}
+		p.emitted[traceID] = now
 	}
 	p.mu.Unlock()
 
-	// Forward pass-through spans (no lock needed — these are independent copies).
+	// Forward pass-through spans (independent copies — no lock needed).
 	for _, pt := range passThrough {
 		if err := p.next.ConsumeTraces(ctx, pt); err != nil {
 			return err
@@ -199,31 +247,41 @@ func (p *agentAuditSelectProcessor) backgroundWorker(timeout time.Duration) {
 	}
 }
 
-// sweepTimedOut collects and forwards all traces idle for at least timeout.
+// sweepTimedOut collects and forwards all traces idle for at least timeout,
+// then evicts stale entries from the emitted map (older than 2*timeout).
 func (p *agentAuditSelectProcessor) sweepTimedOut(ctx context.Context, now time.Time, timeout time.Duration) {
 	type pendingForward struct {
 		traceID string
 		traces  ptrace.Traces
+		idle    time.Duration
 	}
 
 	p.mu.Lock()
 	var pending []pendingForward
 	for traceID, buf := range p.buffers {
 		if now.Sub(buf.lastSeen) >= timeout {
-			p.logger.Info("agentauditselect: forwarding timed-out trace",
-				zap.String("trace_id", traceID),
-				zap.Duration("idle", now.Sub(buf.lastSeen)))
 			pending = append(pending, pendingForward{
 				traceID: traceID,
 				traces:  buildTraces(buf),
+				idle:    now.Sub(buf.lastSeen),
 			})
 			delete(p.buffers, traceID)
-			p.emitted[traceID] = struct{}{}
+			p.emitted[traceID] = now
+		}
+	}
+	// Evict emitted entries older than 2*timeout. Any legitimate late-arriving
+	// span for a forwarded trace arrives well within this window.
+	for traceID, emitTime := range p.emitted {
+		if now.Sub(emitTime) >= 2*timeout {
+			delete(p.emitted, traceID)
 		}
 	}
 	p.mu.Unlock()
 
 	for _, f := range pending {
+		p.logger.Info("agentauditselect: forwarding timed-out trace",
+			zap.String("trace_id", f.traceID),
+			zap.Duration("idle", f.idle))
 		if err := p.next.ConsumeTraces(ctx, f.traces); err != nil {
 			p.logger.Error("agentauditselect: forwarding timed-out trace failed",
 				zap.String("trace_id", f.traceID), zap.Error(err))
@@ -238,44 +296,73 @@ func (p *agentAuditSelectProcessor) traceTimeout() time.Duration {
 	return 30 * time.Second
 }
 
-// buildTraces assembles a ptrace.Traces from a buffer. All spans share one
-// ResourceSpans; scopes are grouped by (name, version).
+// resourceAttrsKey returns a stable string key derived from the sorted resource
+// attribute pairs and schema URL, suitable for use as a map key.
+func resourceAttrsKey(attrs pcommon.Map, schemaURL string) string {
+	pairs := make([]string, 0, attrs.Len())
+	attrs.Range(func(k string, v pcommon.Value) bool {
+		pairs = append(pairs, k+"="+v.AsString())
+		return true
+	})
+	sort.Strings(pairs)
+	return schemaURL + "\x00" + strings.Join(pairs, "\x01")
+}
+
+// buildTraces assembles a ptrace.Traces from a buffer. Each distinct
+// (resource attrs, resource schema URL) combination produces its own
+// ResourceSpans; each distinct (scope schema URL, scope name, scope version)
+// produces its own ScopeSpans within that ResourceSpans. This preserves the
+// original resource and scope structure, including schema URLs and scope attrs.
 func buildTraces(buf *traceBuffer) ptrace.Traces {
 	td := ptrace.NewTraces()
 	if len(buf.spans) == 0 {
 		return td
 	}
 
-	rs := td.ResourceSpans().AppendEmpty()
-	buf.spans[0].resourceAttrs.CopyTo(rs.Resource().Attributes())
-
-	type scopeKey struct{ name, version string }
-	ssMap := make(map[scopeKey]ptrace.ScopeSpans)
+	type rsEntry struct {
+		rs    ptrace.ResourceSpans
+		ssMap map[scopeKey]ptrace.ScopeSpans
+	}
+	rsMap := make(map[string]*rsEntry)
 
 	for _, cs := range buf.spans {
-		key := scopeKey{cs.scopeName, cs.scopeVersion}
-		ss, ok := ssMap[key]
+		rk := resourceAttrsKey(cs.resourceAttrs, cs.resourceSchemaURL)
+		rse, ok := rsMap[rk]
 		if !ok {
-			ss = rs.ScopeSpans().AppendEmpty()
+			rs := td.ResourceSpans().AppendEmpty()
+			cs.resourceAttrs.CopyTo(rs.Resource().Attributes())
+			rs.SetSchemaUrl(cs.resourceSchemaURL)
+			rse = &rsEntry{rs: rs, ssMap: make(map[scopeKey]ptrace.ScopeSpans)}
+			rsMap[rk] = rse
+		}
+
+		sk := scopeKey{cs.scopeSchemaURL, cs.scopeName, cs.scopeVersion}
+		ss, ok := rse.ssMap[sk]
+		if !ok {
+			ss = rse.rs.ScopeSpans().AppendEmpty()
 			ss.Scope().SetName(cs.scopeName)
 			ss.Scope().SetVersion(cs.scopeVersion)
-			ssMap[key] = ss
+			cs.scopeAttrs.CopyTo(ss.Scope().Attributes())
+			ss.SetSchemaUrl(cs.scopeSchemaURL)
+			rse.ssMap[sk] = ss
 		}
-		dst := ss.Spans().AppendEmpty()
-		cs.span.CopyTo(dst)
+		cs.span.CopyTo(ss.Spans().AppendEmpty())
 	}
 	return td
 }
 
-// buildSingleSpanTraces wraps one span in its own ptrace.Traces with resource
-// and scope metadata preserved.
+// buildSingleSpanTraces wraps one span in its own ptrace.Traces, preserving
+// resource attributes, schema URLs, and scope attributes.
 func buildSingleSpanTraces(rs ptrace.ResourceSpans, ss ptrace.ScopeSpans, span ptrace.Span) ptrace.Traces {
 	td := ptrace.NewTraces()
 	newRS := td.ResourceSpans().AppendEmpty()
 	rs.Resource().Attributes().CopyTo(newRS.Resource().Attributes())
+	newRS.SetSchemaUrl(rs.SchemaUrl())
 	newSS := newRS.ScopeSpans().AppendEmpty()
 	newSS.Scope().SetName(ss.Scope().Name())
 	newSS.Scope().SetVersion(ss.Scope().Version())
+	ss.Scope().Attributes().CopyTo(newSS.Scope().Attributes())
+	newSS.SetSchemaUrl(ss.SchemaUrl())
 	span.CopyTo(newSS.Spans().AppendEmpty())
 	return td
 }

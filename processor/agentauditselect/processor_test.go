@@ -83,7 +83,7 @@ func newSingleSpanTraces(traceID pcommon.TraceID, spanID pcommon.SpanID, parentS
 	return td
 }
 
-// startProcessor creates and starts a processor with the given consumer.
+// startProcessor creates and starts a processor, registering Shutdown via t.Cleanup.
 func startProcessor(t *testing.T, timeout time.Duration, next consumer.Traces) *agentAuditSelectProcessor {
 	t.Helper()
 	cfg := &Config{TraceTimeout: timeout}
@@ -99,6 +99,25 @@ func startProcessor(t *testing.T, timeout time.Duration, next consumer.Traces) *
 	return p
 }
 
+// waitForBatch polls cc until batchCount reaches want or deadline elapses.
+func waitForBatch(t *testing.T, cc *capturingConsumer, want int, deadline time.Duration) {
+	t.Helper()
+	timer := time.NewTimer(deadline)
+	defer timer.Stop()
+	tick := time.NewTicker(5 * time.Millisecond)
+	defer tick.Stop()
+	for {
+		select {
+		case <-tick.C:
+			if cc.batchCount() >= want {
+				return
+			}
+		case <-timer.C:
+			t.Fatalf("timed out after %v waiting for %d batch(es); got %d", deadline, want, cc.batchCount())
+		}
+	}
+}
+
 // TestProcessor_CompletesTraceOnRoot sends child1, child2, then root and
 // verifies all three are forwarded in a single batch.
 func TestProcessor_CompletesTraceOnRoot(t *testing.T) {
@@ -111,35 +130,27 @@ func TestProcessor_CompletesTraceOnRoot(t *testing.T) {
 	rootID := makeSpanID(3)
 	parentID := makeSpanID(9) // non-zero → child span
 
-	// Send child1.
 	if err := p.ConsumeTraces(context.Background(), newSingleSpanTraces(traceID, child1ID, parentID, "child1")); err != nil {
 		t.Fatalf("ConsumeTraces child1: %v", err)
 	}
-	// Send child2.
 	if err := p.ConsumeTraces(context.Background(), newSingleSpanTraces(traceID, child2ID, parentID, "child2")); err != nil {
 		t.Fatalf("ConsumeTraces child2: %v", err)
 	}
-	// Nothing forwarded yet.
 	if got := cc.batchCount(); got != 0 {
 		t.Fatalf("want 0 batches before root; got %d", got)
 	}
 
-	// Send root — triggers immediate forward.
 	if err := p.ConsumeTraces(context.Background(), newSingleSpanTraces(traceID, rootID, zeroSpanID, "root")); err != nil {
 		t.Fatalf("ConsumeTraces root: %v", err)
 	}
 
-	// Exactly one batch forwarded.
 	if got := cc.batchCount(); got != 1 {
 		t.Fatalf("want 1 batch after root; got %d", got)
 	}
-	// All 3 spans present in that batch.
 	spans := cc.allSpans()
 	if len(spans) != 3 {
 		t.Fatalf("want 3 spans; got %d", len(spans))
 	}
-
-	// Verify names (order within the batch matches arrival order).
 	names := make(map[string]bool)
 	for _, s := range spans {
 		names[s.Name()] = true
@@ -166,19 +177,8 @@ func TestProcessor_TimeoutForwardsPartial(t *testing.T) {
 		t.Fatalf("ConsumeTraces: %v", err)
 	}
 
-	// Wait for the background sweep (fires at timeout/2 = 30ms, but we wait
-	// for a full timeout window to ensure the idle check triggers).
-	deadline := time.Now().Add(5 * timeout)
-	for time.Now().Before(deadline) {
-		if cc.batchCount() >= 1 {
-			break
-		}
-		time.Sleep(10 * time.Millisecond)
-	}
+	waitForBatch(t, cc, 1, 5*timeout)
 
-	if got := cc.batchCount(); got != 1 {
-		t.Fatalf("want 1 batch after timeout; got %d", got)
-	}
 	spans := cc.allSpans()
 	if len(spans) != 1 {
 		t.Fatalf("want 1 span; got %d", len(spans))
@@ -196,14 +196,12 @@ func TestProcessor_ConcurrentTraces(t *testing.T) {
 	var forwarded atomic.Int64
 	var wg sync.WaitGroup
 
-	// Use an atomic counter consumer for concurrency safety.
 	next := &countingConsumer{count: &forwarded}
 	p := startProcessor(t, 30*time.Second, next)
 
 	wg.Add(n)
 	for i := 0; i < n; i++ {
-		i := i
-		go func() {
+		go func(i int) {
 			defer wg.Done()
 			traceID := makeTraceID(100 + i)
 			childID := makeSpanID(i*2 + 1)
@@ -219,7 +217,7 @@ func TestProcessor_ConcurrentTraces(t *testing.T) {
 				newSingleSpanTraces(traceID, rootID, zeroSpanID, "root")); err != nil {
 				t.Errorf("goroutine %d ConsumeTraces root: %v", i, err)
 			}
-		}()
+		}(i)
 	}
 	wg.Wait()
 
@@ -266,12 +264,10 @@ func TestProcessor_PostForwardSpanPassthrough(t *testing.T) {
 		t.Fatalf("ConsumeTraces late: %v", err)
 	}
 
-	// Two batches total: one for the root trace, one pass-through.
 	if got := cc.batchCount(); got != 2 {
 		t.Fatalf("want 2 batches after late span; got %d", got)
 	}
 
-	// Verify the processor buffer is empty — the late span was not buffered.
 	p.mu.Lock()
 	bufLen := len(p.buffers)
 	p.mu.Unlock()
@@ -279,7 +275,6 @@ func TestProcessor_PostForwardSpanPassthrough(t *testing.T) {
 		t.Errorf("want empty buffer after passthrough; got %d entry(ies)", bufLen)
 	}
 
-	// Confirm the late span name appears in the second batch.
 	allSpans := cc.allSpans()
 	if len(allSpans) != 2 {
 		t.Fatalf("want 2 total spans; got %d", len(allSpans))
@@ -292,5 +287,42 @@ func TestProcessor_PostForwardSpanPassthrough(t *testing.T) {
 	}
 	if !lateFound {
 		t.Error("late span not found in forwarded output")
+	}
+}
+
+// TestProcessor_ShutdownFlushesBuffers verifies that in-progress trace buffers
+// (no root received) are forwarded when the processor shuts down.
+func TestProcessor_ShutdownFlushesBuffers(t *testing.T) {
+	cc := &capturingConsumer{}
+	cfg := &Config{TraceTimeout: 30 * time.Second}
+	p := newProcessor(cfg, nil, cc)
+	if err := p.Start(context.Background(), nil); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+
+	traceID := makeTraceID(4)
+	childID := makeSpanID(1)
+	parentID := makeSpanID(9)
+
+	if err := p.ConsumeTraces(context.Background(), newSingleSpanTraces(traceID, childID, parentID, "orphan")); err != nil {
+		t.Fatalf("ConsumeTraces: %v", err)
+	}
+	if cc.batchCount() != 0 {
+		t.Fatalf("want 0 batches before shutdown; got %d", cc.batchCount())
+	}
+
+	if err := p.Shutdown(context.Background()); err != nil {
+		t.Fatalf("Shutdown: %v", err)
+	}
+
+	if cc.batchCount() != 1 {
+		t.Fatalf("want 1 batch after shutdown flush; got %d", cc.batchCount())
+	}
+	spans := cc.allSpans()
+	if len(spans) != 1 {
+		t.Fatalf("want 1 span; got %d", len(spans))
+	}
+	if spans[0].Name() != "orphan" {
+		t.Errorf("want span name 'orphan'; got %q", spans[0].Name())
 	}
 }
