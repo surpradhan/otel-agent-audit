@@ -271,7 +271,7 @@ A verifier MUST:
    entries for that `trace_id` to detect post-seal deletions.
 
 **Policy for traces not covered by any checkpoint:** counted in
-`Report.TracesVerified` but not reported as errors (they are
+`Report.TracesProcessed` but not reported as errors (they are
 "unchecked-by-checkpoint"). Rationale: the last batch before a crash may have
 been written to the log before the final Shutdown checkpoint was persisted;
 treating this as an error would produce false positives on clean restarts.

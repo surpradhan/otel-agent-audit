@@ -81,7 +81,10 @@ func run() int {
 	if *jsonOut {
 		enc := json.NewEncoder(os.Stdout)
 		enc.SetIndent("", "  ")
-		_ = enc.Encode(report)
+		if err := enc.Encode(report); err != nil {
+			fmt.Fprintf(os.Stderr, "error: writing JSON output: %v\n", err)
+			return 2
+		}
 	} else {
 		fmt.Printf("Traces processed:      %d\n", report.TracesProcessed)
 		fmt.Printf("Checkpoints processed: %d\n", report.CheckpointsProcessed)

@@ -95,17 +95,7 @@ func verifyChainReturnTip(entries []chain.LogEntry, pubKey ed25519.PublicKey) (s
 // prevSignPayloadHash is the hex-encoded SHA256 of the previous checkpoint's
 // signing payload (or chain.ZeroPrevCheckpointHash for the first checkpoint).
 func VerifyCheckpoint(cp chain.Checkpoint, prevSignPayloadHash string, pubKey ed25519.PublicKey) error {
-	// Reconstruct the signing payload (all fields except Signature, same JSON struct).
-	cfs := checkpointSigningStruct{
-		SchemaVersion:      cp.SchemaVersion,
-		CheckpointSeq:      cp.CheckpointSeq,
-		Timestamp:          cp.Timestamp,
-		PrevCheckpointHash: cp.PrevCheckpointHash,
-		TraceTips:          cp.TraceTips,
-		KeyID:              cp.KeyID,
-		Algorithm:          cp.Algorithm,
-	}
-	payload, err := json.Marshal(cfs)
+	payload, err := chain.CheckpointSigningPayload(cp)
 	if err != nil {
 		return fmt.Errorf("checkpoint marshal: %w", err)
 	}
@@ -176,7 +166,7 @@ func VerifyLog(logPath, checkpointPath string, pubKey ed25519.PublicKey) (Report
 	prevHash := chain.ZeroPrevCheckpointHash
 	for _, cp := range checkpoints {
 		// Compute the signing payload hash BEFORE checking (VerifyCheckpoint checks the field).
-		payload, err := checkpointSignPayload(cp)
+		payload, err := chain.CheckpointSigningPayload(cp)
 		if err != nil {
 			verifyErrs = append(verifyErrs, VerifyError{
 				TraceID: "",
@@ -195,6 +185,12 @@ func VerifyLog(logPath, checkpointPath string, pubKey ed25519.PublicKey) (Report
 				Detail:  fmt.Sprintf("seq %d: %v", cp.CheckpointSeq, err),
 			})
 		}
+		// prevHash advances even when VerifyCheckpoint fails so that the next
+		// checkpoint's prev_checkpoint_hash field is evaluated against the hash
+		// of the corrupt/tampered entry's payload rather than the last good one.
+		// This means a cascade of "prev_checkpoint_hash mismatch" errors from
+		// subsequent checkpoints is suppressed, but each checkpoint's Ed25519
+		// signature is still independently verified regardless.
 		prevHash = hex.EncodeToString(h[:])
 		report.CheckpointsProcessed++
 
@@ -220,36 +216,6 @@ func VerifyLog(logPath, checkpointPath string, pubKey ed25519.PublicKey) (Report
 
 	report.Errors = verifyErrs
 	return report, nil
-}
-
-// checkpointSigningStruct mirrors checkpointForSigning in checkpoint.go for verification.
-// Must be kept in sync with Accumulator.Build's signing struct.
-type checkpointSigningStruct struct {
-	SchemaVersion      string           `json:"schema_version"`
-	CheckpointSeq      uint64           `json:"checkpoint_seq"`
-	Timestamp          string           `json:"timestamp"`
-	PrevCheckpointHash string           `json:"prev_checkpoint_hash"`
-	TraceTips          []chain.TraceTip `json:"trace_tips"`
-	KeyID              string           `json:"key_id"`
-	Algorithm          string           `json:"algorithm"`
-}
-
-// checkpointSignPayload reconstructs the signing payload for a checkpoint.
-func checkpointSignPayload(cp chain.Checkpoint) ([]byte, error) {
-	cfs := checkpointSigningStruct{
-		SchemaVersion:      cp.SchemaVersion,
-		CheckpointSeq:      cp.CheckpointSeq,
-		Timestamp:          cp.Timestamp,
-		PrevCheckpointHash: cp.PrevCheckpointHash,
-		TraceTips:          cp.TraceTips,
-		KeyID:              cp.KeyID,
-		Algorithm:          cp.Algorithm,
-	}
-	b, err := json.Marshal(cfs)
-	if err != nil {
-		return nil, fmt.Errorf("checkpoint: marshal signing payload: %w", err)
-	}
-	return b, nil
 }
 
 func readLogEntries(logPath string) (map[string][]chain.LogEntry, error) {

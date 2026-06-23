@@ -312,7 +312,7 @@ func TestMultiSpanTrace_SignsAndVerifies(t *testing.T) {
 		}
 	}
 	if report.TracesProcessed != 1 {
-		t.Errorf("TracesVerified: got %d, want 1", report.TracesProcessed)
+		t.Errorf("TracesProcessed: got %d, want 1", report.TracesProcessed)
 	}
 }
 
@@ -665,7 +665,7 @@ func TestCheckpoint_SignsAndVerifies(t *testing.T) {
 		}
 	}
 	if report.CheckpointsProcessed < 1 {
-		t.Errorf("CheckpointsVerified: got %d, want >= 1", report.CheckpointsProcessed)
+		t.Errorf("CheckpointsProcessed: got %d, want >= 1", report.CheckpointsProcessed)
 	}
 }
 
@@ -728,7 +728,7 @@ func TestCheckpoint_TamperDetected(t *testing.T) {
 }
 
 // TestVerifyLog_UncoveredTrace verifies that a trace not covered by any checkpoint
-// is counted in TracesVerified but not reported as an error.
+// is counted in TracesProcessed but not reported as an error.
 func TestVerifyLog_UncoveredTrace(t *testing.T) {
 	dir := t.TempDir()
 
@@ -763,7 +763,7 @@ func TestVerifyLog_UncoveredTrace(t *testing.T) {
 	}
 	// The uncovered trace must be counted but not flagged as error.
 	if report.TracesProcessed < 1 {
-		t.Errorf("TracesVerified: got %d, want >= 1", report.TracesProcessed)
+		t.Errorf("TracesProcessed: got %d, want >= 1", report.TracesProcessed)
 	}
 	// Chain errors are still an error; only "not in any checkpoint" is not an error.
 	chainErrors := 0
@@ -829,7 +829,7 @@ func TestConsumeTraces_SignsAndVerifies(t *testing.T) {
 		}
 	}
 	if report.TracesProcessed != 1 {
-		t.Errorf("TracesVerified: got %d, want 1", report.TracesProcessed)
+		t.Errorf("TracesProcessed: got %d, want 1", report.TracesProcessed)
 	}
 }
 
