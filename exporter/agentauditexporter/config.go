@@ -40,7 +40,7 @@ type Config struct {
 	// is not required. Disabling fsync means a power-loss between log write and
 	// checkpoint commit can produce spurious entry_count_mismatch errors on the
 	// next restart (the checkpoint references entries that were buffered but not
-	// flushed to disk). See docs/threat-model.md §1 for the operational implications.
+	// flushed to disk). See docs/threat-model.md §3a for the operational implications.
 	FsyncLog *bool `mapstructure:"fsync_log"`
 }
 

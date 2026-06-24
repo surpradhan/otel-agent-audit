@@ -23,6 +23,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"path/filepath"
 	"time"
 
 	"github.com/surpradhan/otel-agent-audit/exporter/agentauditexporter/internal/chain"
@@ -44,8 +45,6 @@ func run() error {
 		return fmt.Errorf("creating temp dir: %w", err)
 	}
 	defer func() { _ = os.RemoveAll(dir) }()
-
-	fmt.Printf("Demo working directory: %s\n\n", dir)
 
 	// Step 1: generate an Ed25519 key pair.
 	privKey, pubKey, err := sign.GenerateEd25519Key()
@@ -136,7 +135,7 @@ func run() error {
 	fmt.Printf("Tip hash:    %s\n\n", chain.TipHash(entries))
 
 	// Step 3: write audit.jsonl.
-	logPath := dir + "/audit.jsonl"
+	logPath := filepath.Join(dir, "audit.jsonl")
 	lf, err := os.Create(logPath)
 	if err != nil {
 		return fmt.Errorf("create log: %w", err)
@@ -149,7 +148,7 @@ func run() error {
 	fmt.Printf("Wrote %s\n", logPath)
 
 	// Write checkpoint.jsonl.
-	checkpointPath := dir + "/checkpoint.jsonl"
+	checkpointPath := filepath.Join(dir, "checkpoint.jsonl")
 	acc := chain.NewAccumulator(signer, 0, chain.ZeroPrevCheckpointHash)
 	acc.AddTip(traceID, chain.TipHash(entries), len(entries))
 	cp, err := acc.Build(time.Now())

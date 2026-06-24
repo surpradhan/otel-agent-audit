@@ -1534,16 +1534,25 @@ func TestBackgroundWorker_TimeoutSeal(t *testing.T) {
 		t.Fatalf("ConsumeTraces: %v", err)
 	}
 
-	// Wait for the background ticker (fires every traceTimeout/2 = 25 ms) to sweep
-	// and seal the now-idle trace.
-	time.Sleep(200 * time.Millisecond)
-
+	// Poll until the background ticker sweeps the idle trace (or 3 s deadline).
+	// Shutdown force-seals anything remaining, so we assert after Shutdown.
+	traceIDStr := pcommon.TraceID(traceID).String()
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		entries := readLogEntries(t, env.cfg.LogPath)
+		for _, e := range entries {
+			if e.Record.TraceID == traceIDStr {
+				goto sealed
+			}
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+sealed:
 	if err := exp.Shutdown(context.Background()); err != nil {
 		t.Fatalf("Shutdown: %v", err)
 	}
 
 	entries := readLogEntries(t, env.cfg.LogPath)
-	traceIDStr := pcommon.TraceID(traceID).String()
 	var count int
 	for _, e := range entries {
 		if e.Record.TraceID == traceIDStr {

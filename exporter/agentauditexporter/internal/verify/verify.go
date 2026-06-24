@@ -131,7 +131,7 @@ func VerifyCheckpoint(cp chain.Checkpoint, prevSignPayloadHash string, pubKey ed
 //   - The verifier computes the fingerprint of the supplied public key as
 //     hex(SHA256(pubKey)) and pre-scans all entries and checkpoints.
 //   - If the log contains more than one distinct key_id (a multi-epoch log),
-//     VerifyLog returns a "multi_epoch_log" VerifyError and stops. Re-run once
+//     VerifyLog returns a Go error (not a Report) and stops. Re-run once
 //     per epoch with the key that matches that epoch's key_id.
 //   - If the single key_id in the log does not match the supplied public key,
 //     VerifyLog emits "key_id_mismatch" errors for every trace and checkpoint
@@ -160,6 +160,9 @@ func VerifyLog(logPath, checkpointPath string, pubKey ed25519.PublicKey) (Report
 	// Pre-scan: collect all distinct key_ids across log entries and checkpoints.
 	// This allows us to distinguish "wrong key supplied" (key_id_mismatch) from
 	// "bad signature" (chain error) and to detect multi-epoch logs early.
+	// Entries with an empty key_id (pre-key_id-field logs) are excluded from
+	// this scan; for those logs the verifier falls back to direct signature
+	// verification rather than a more precise key_id_mismatch diagnostic.
 	suppliedKeyID := pubKeyID(pubKey)
 	seenKeyIDs := make(map[string]struct{})
 	for _, entries := range traceEntries {

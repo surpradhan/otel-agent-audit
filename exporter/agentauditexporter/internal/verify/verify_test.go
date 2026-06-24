@@ -258,22 +258,6 @@ func TestVerifyLog_WrongKey_KeyIDMismatch(t *testing.T) {
 	}
 }
 
-// TestVerifyLog_WrongKey kept for backwards compat: verifying with wrong key still errors.
-func TestVerifyLog_WrongKey(t *testing.T) {
-	logPath, checkpointPath, _ := makeVerifyFixture(t)
-	_, wrongPub, err := sign.GenerateEd25519Key()
-	if err != nil {
-		t.Fatalf("GenerateEd25519Key: %v", err)
-	}
-	report, err := verify.VerifyLog(logPath, checkpointPath, wrongPub)
-	if err != nil {
-		t.Fatalf("VerifyLog: %v", err)
-	}
-	if len(report.Errors) == 0 {
-		t.Error("expected errors when verifying with wrong key; got none")
-	}
-}
-
 // TestVerifyLog_MultiEpochLog verifies that a log containing entries signed by
 // two different keys returns an error (not a report with per-trace errors).
 // The operator must re-run per epoch with the matching key.
@@ -323,7 +307,9 @@ func TestVerifyLog_MultiEpochLog(t *testing.T) {
 	}
 	_ = lf.Close()
 	// Empty checkpoint file.
-	_, _ = os.Create(checkpointPath)
+	if f, err := os.Create(checkpointPath); err == nil {
+		_ = f.Close()
+	}
 
 	_, err = verify.VerifyLog(logPath, checkpointPath, pub2)
 	if err == nil {
