@@ -1633,6 +1633,8 @@ var _ = record.SchemaVersion
 
 // failSyncFile wraps a logSyncer and returns a configurable error for the first
 // `count` calls to Sync, then passes through to the underlying implementation.
+// Not concurrency-safe: count is decremented without a lock. Safe only for
+// single-goroutine test use where all sealTrace calls run under e.mu.
 type failSyncFile struct {
 	logSyncer
 	syncErr error
@@ -1668,15 +1670,17 @@ func TestFsyncFailure_RollsBackLog(t *testing.T) {
 	}
 	exp.mu.Unlock()
 
-	// Deliver a root span — it is buffered but not yet sealed.
+	// Deliver a root span. bufferSpan detects hasRoot=true and calls sealTrace
+	// synchronously inside ConsumeTraces. The injected Sync error fires there,
+	// rolling back the log entries before ConsumeTraces returns.
 	traceID := [16]byte{0xFA}
 	rootID := [8]byte{0x01}
 	if err := exp.ConsumeTraces(context.Background(), makeSpan(traceID, rootID, zeroParentID, "root-op", 1_000_000, 2_000_000)); err != nil {
 		t.Fatalf("ConsumeTraces: %v", err)
 	}
 
-	// Shutdown force-seals remaining buffers; sealTrace will hit the sync error and
-	// truncate the log back to its pre-write position.
+	// Shutdown finds buffers empty (trace was already sealed-and-rolled-back above)
+	// and closes files cleanly.
 	if err := exp.Shutdown(context.Background()); err != nil {
 		t.Fatalf("Shutdown: %v", err)
 	}

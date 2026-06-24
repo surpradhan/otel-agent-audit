@@ -458,11 +458,32 @@ func (e *agentAuditExporter) sealTrace(traceID string, buf *traceBuffer, checkpo
 		}
 	}
 
+	// rollbackLog truncates the file back to preWritePos and fsyncs the truncation
+	// so that a crash after the call cannot leave the log ahead of the checkpoint.
+	// Used on both write-loop failure and Sync failure below.
+	rollbackLog := func(cause string, causeErr error) {
+		e.logger.Error(cause, zap.String("trace_id", traceID), zap.Error(causeErr))
+		if terr := e.logFile.Truncate(preWritePos); terr != nil {
+			e.logger.Error("agentaudit: rollback log truncate failed — log may be ahead of checkpoint",
+				zap.String("trace_id", traceID), zap.Error(terr))
+			return
+		}
+		// Fsync the truncation so a crash cannot recover the removed entries.
+		if serr := e.logFile.Sync(); serr != nil {
+			e.logger.Error("agentaudit: rollback log sync failed — log may be ahead of checkpoint",
+				zap.String("trace_id", traceID), zap.Error(serr))
+		}
+	}
+
 	logEntries := chain.ToLogEntries(entries)
 	for _, le := range logEntries {
 		if err := e.writeLogEntry(le); err != nil {
-			e.logger.Error("agentaudit: write log entry",
-				zap.String("trace_id", traceID), zap.Error(err))
+			if e.fsyncLog() {
+				rollbackLog("agentaudit: write log entry", err)
+			} else {
+				e.logger.Error("agentaudit: write log entry",
+					zap.String("trace_id", traceID), zap.Error(err))
+			}
 			return
 		}
 	}
@@ -472,17 +493,12 @@ func (e *agentAuditExporter) sealTrace(traceID string, buf *traceBuffer, checkpo
 	// entry_count_mismatch errors on restart. Skipped when FsyncLog is explicitly
 	// set to false (high-throughput testing); default is true.
 	//
-	// On sync failure we truncate the entries we just wrote so the log is never
+	// On Sync failure we truncate (and re-sync the truncation) so the log is never
 	// ahead of the checkpoint. The WAL for this trace is not yet marked sealed,
-	// so the trace is replayed on the next startup and re-sealed cleanly.
+	// so the trace replays cleanly on the next startup.
 	if e.fsyncLog() {
 		if err := e.logFile.Sync(); err != nil {
-			e.logger.Error("agentaudit: sync log file",
-				zap.String("trace_id", traceID), zap.Error(err))
-			if terr := e.logFile.Truncate(preWritePos); terr != nil {
-				e.logger.Error("agentaudit: rollback log after sync failure",
-					zap.String("trace_id", traceID), zap.Error(terr))
-			}
+			rollbackLog("agentaudit: sync log file", err)
 			return
 		}
 	}
