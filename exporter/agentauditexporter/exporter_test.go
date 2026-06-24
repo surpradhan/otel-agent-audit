@@ -1439,5 +1439,83 @@ func TestFsyncLog_Disabled(t *testing.T) {
 	}
 }
 
+// TestEarlyRoot_TruncatedButValid pins the early-root truncation behaviour:
+// when the root span arrives BEFORE its children, the exporter seals on the
+// root and drops any subsequent child spans. The sealed single-entry chain is
+// internally valid (signatures and hashes pass), but it only contains the root.
+//
+// This is the caveat documented in docs/threat-model.md §3b:
+// "If the root span arrives before its children, the trace seals immediately
+// and any subsequent child spans are dropped."
+//
+// Mitigation: use agentauditselect processor (tested in TestMultiSpanTrace_SignsAndVerifies
+// via root-last delivery, which produces a complete 3-entry chain).
+func TestEarlyRoot_TruncatedButValid(t *testing.T) {
+	dir := t.TempDir()
+
+	priv, pub, err := sign.GenerateEd25519Key()
+	if err != nil {
+		t.Fatalf("GenerateEd25519Key: %v", err)
+	}
+	pemBytes, _ := sign.MarshalEd25519PrivateKeyPEM(priv)
+	keyPath := filepath.Join(dir, "key.pem")
+	_ = os.WriteFile(keyPath, pemBytes, 0600)
+
+	cfg := &Config{
+		LogPath:            filepath.Join(dir, "audit.jsonl"),
+		KeyPath:            keyPath,
+		WalPath:            filepath.Join(dir, "wal.jsonl"),
+		CheckpointPath:     filepath.Join(dir, "checkpoint.jsonl"),
+		TraceTimeout:       30 * time.Second,
+		CheckpointInterval: 1,
+	}
+
+	exp := startExporter(t, cfg)
+
+	traceID := [16]byte{0xF4}
+	rootID := [8]byte{0x20}
+	childID := [8]byte{0x21}
+
+	// Send root FIRST — triggers immediate seal with only the root span.
+	tdRoot := makeSpan(traceID, rootID, zeroParentID, "root", 500, 4000)
+	if err := exp.ConsumeTraces(context.Background(), tdRoot); err != nil {
+		t.Fatalf("ConsumeTraces root: %v", err)
+	}
+
+	// Send child AFTER — must be dropped (trace already sealed).
+	tdChild := makeSpan(traceID, childID, rootID, "child", 1000, 2000)
+	if err := exp.ConsumeTraces(context.Background(), tdChild); err != nil {
+		t.Fatalf("ConsumeTraces child: %v", err)
+	}
+
+	if err := exp.Shutdown(context.Background()); err != nil {
+		t.Fatalf("Shutdown: %v", err)
+	}
+
+	// The log must have exactly 1 entry (root only — child was dropped).
+	entries := readLogEntries(t, cfg.LogPath)
+	traceIDStr := pcommon.TraceID(traceID).String()
+	var traceEntries []chain.LogEntry
+	for _, e := range entries {
+		if e.Record.TraceID == traceIDStr {
+			traceEntries = append(traceEntries, e)
+		}
+	}
+	if len(traceEntries) != 1 {
+		t.Errorf("expected 1 entry for early-root trace (root only); got %d", len(traceEntries))
+	}
+
+	// The single-entry chain must be internally valid.
+	report, err := verify.VerifyLog(cfg.LogPath, cfg.CheckpointPath, pub)
+	if err != nil {
+		t.Fatalf("VerifyLog: %v", err)
+	}
+	for _, e := range report.Errors {
+		if e.Kind == "chain" {
+			t.Errorf("chain error for valid (but truncated) single-root chain: %v", e)
+		}
+	}
+}
+
 // Ensure record import doesn't cause "imported and not used" when tests don't directly use it.
 var _ = record.SchemaVersion
