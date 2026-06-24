@@ -52,8 +52,8 @@ func TestAccumulator_BuildEmpty(t *testing.T) {
 	if cp.PrevCheckpointHash != chain.ZeroPrevCheckpointHash {
 		t.Errorf("PrevCheckpointHash: got %q, want ZeroPrevCheckpointHash", cp.PrevCheckpointHash)
 	}
-	if cp.SchemaVersion != "v1" {
-		t.Errorf("SchemaVersion: got %q, want %q", cp.SchemaVersion, "v1")
+	if cp.SchemaVersion != "v2" {
+		t.Errorf("SchemaVersion: got %q, want %q", cp.SchemaVersion, "v2")
 	}
 	if cp.Algorithm != "ed25519" {
 		t.Errorf("Algorithm: got %q, want %q", cp.Algorithm, "ed25519")

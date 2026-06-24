@@ -1,6 +1,6 @@
-# Audit Record Schema — v1
+# Audit Record Schema — v2
 
-> **Status:** Active · **Introduced:** Phase B1 · **Schema version:** `v1`
+> **Status:** Active · **Introduced:** Phase B1 · **Updated:** Phase W8 · **Schema version:** `v2` · Previous: [`v1`](#v1-to-v2-changelog)
 
 This document is the authoritative field-by-field specification for `AuditRecord`
 and the entry construction protocol. It is the cross-impl contract: any
@@ -11,10 +11,15 @@ consumes audit log entries MUST match this spec byte-for-byte.
 
 ## 1. Versioning
 
-Every `AuditRecord` carries `schema_version: "v1"`. The genesis seed for a
+Every `AuditRecord` carries `schema_version: "v2"`. The genesis seed for a
 trace's hash chain includes this string, so records of different schema versions
 never silently interleave (the seed differs → the chains differ → comparison
 fails at the first entry).
+
+**v1 backward compatibility:** v1 logs (schema_version: "v1") remain fully
+verifiable. The verifier reads `schema_version` from the first log entry and
+calls `GenesisSeedForSchema(traceID, schemaVersion)` to re-derive the correct
+genesis seed. Do not mix v1 and v2 entries in the same log file.
 
 **Breaking-change policy:** any change to field names, JSON key names, field
 order, types, or the `SelectedAttributes` allowlist is a breaking chain-format
@@ -34,7 +39,7 @@ changing this order changes canonical bytes).
 
 | JSON key | Go type | Description | Mapping from `ptrace.Span` |
 |---|---|---|---|
-| `schema_version` | `string` | Always `"v1"` | Constant |
+| `schema_version` | `string` | Always `"v2"` | Constant |
 | `trace_id` | `string` | Lowercase hex, no dashes, 32 chars | `span.TraceID().String()` |
 | `span_id` | `string` | Lowercase hex, 16 chars | `span.SpanID().String()` |
 | `parent_span_id` | `string` | Lowercase hex, 16 chars; `""` (empty string) if no parent (root span) — this is the value `pcommon.SpanID{}.String()` returns for a zero span ID | `span.ParentSpanID().String()` |
@@ -75,16 +80,22 @@ changing this order changes canonical bytes).
 objects, not a map. The sort order is fixed by the `attributeAllowlist` in
 `internal/record/record.go`; it matches lexicographic order of the key strings.
 
-**Current allowlist (v1):**
+**Current allowlist (v2):**
 
 | Attribute key | Notes |
 |---|---|
+| `gen_ai.guardrail.action` | (**v2**) Action taken by the guardrail: `"block"`, `"warn"`, etc. |
+| `gen_ai.guardrail.name` | (**v2**) Name of the policy/guardrail that evaluated the span |
+| `gen_ai.guardrail.reason` | (**v2**) Human-readable explanation of the guardrail decision |
+| `gen_ai.guardrail.severity` | (**v2**) Severity level of the guardrail trigger: `"low"`, `"medium"`, `"high"` |
 | `gen_ai.operation.name` | The LLM/agent operation type |
 | `gen_ai.request.model` | Model requested by the client |
 | `gen_ai.response.model` | Model that actually responded (may differ from request) |
 | `gen_ai.system` | LLM provider (e.g. `"openai"`, `"anthropic"`) |
 | `gen_ai.usage.input_tokens` | Prompt token count |
 | `gen_ai.usage.output_tokens` | Completion token count |
+
+See [`docs/guardrail-mapping.md`](guardrail-mapping.md) for detailed attribute semantics and examples.
 
 Only attributes present in the span are included; missing allowlist keys are
 omitted (no null entries). The resulting array preserves the allowlist order.
@@ -113,7 +124,8 @@ this is load-bearing for the chain.
 
 ```
 // For each trace with N spans:
-genesisSeed = SHA256(hex.DecodeString(trace_id) ‖ []byte("v1"))
+genesisSeed = SHA256(hex.DecodeString(trace_id) ‖ []byte(schema_version))
+// e.g. for v2: SHA256(traceIDBytes ‖ "v2")
 
 // Step 1: sort records by (start_time_unix_nano ASC, span_id ASC)
 // Step 2: assign seq_in_trace = i (before canonicalizing)
@@ -174,9 +186,18 @@ function: identical `AuditRecord` values produce byte-identical output across
 all runs and language implementations.
 
 The golden fixtures (paths relative to repo root):
+
+v2 (current):
+- Input: `exporter/agentauditexporter/internal/record/testdata/v2_span_to_record_fixture.json`
+- Canonical output (seq_in_trace=0): `exporter/agentauditexporter/internal/canonical/testdata/v2_canonical_fixture.json`
+- Canonical output (seq_in_trace=1): `exporter/agentauditexporter/internal/canonical/testdata/v2_canonical_seq1_fixture.json`
+- Chain: `exporter/agentauditexporter/internal/chain/testdata/v2_two_span_chain_fixture.json`
+
+v1 (frozen, for regression):
 - Input: `exporter/agentauditexporter/internal/record/testdata/v1_span_to_record_fixture.json`
 - Canonical output (seq_in_trace=0): `exporter/agentauditexporter/internal/canonical/testdata/v1_canonical_fixture.json`
 - Canonical output (seq_in_trace=1): `exporter/agentauditexporter/internal/canonical/testdata/v1_canonical_seq1_fixture.json`
+- Chain: `exporter/agentauditexporter/internal/chain/testdata/v1_two_span_chain_fixture.json`
 
 Note: the canonical fixture files end with a single trailing newline added by editors.
 That newline is **not** part of the canonical bytes — `canonical.Marshal` produces
@@ -206,7 +227,7 @@ sealed traces (default 100) and on `Shutdown`.
 
 ```json
 {
-  "schema_version": "v1",
+  "schema_version": "v2",
   "checkpoint_seq": 1,
   "timestamp": "2026-06-22T14:30:00Z",
   "prev_checkpoint_hash": "0000000000000000000000000000000000000000000000000000000000000000",
@@ -223,7 +244,7 @@ sealed traces (default 100) and on `Shutdown`.
 
 | JSON key | Type | Description |
 |---|---|---|
-| `schema_version` | `string` | Always `"v1"` |
+| `schema_version` | `string` | Always `"v2"` (matches the audit log entries in the same epoch) |
 | `checkpoint_seq` | `uint64` | Starts at 1, increments by 1 per checkpoint. A gap indicates a missing checkpoint |
 | `timestamp` | `string` | RFC3339 UTC timestamp when the checkpoint was built |
 | `prev_checkpoint_hash` | `string` | `hex(SHA256(prev checkpointForSigning bytes))`; `"000…0"` (64 zeros) for the first checkpoint |
@@ -278,11 +299,23 @@ treating this as an error would produce false positives on clean restarts.
 
 ### Cross-impl fixture
 
-- `exporter/agentauditexporter/internal/chain/testdata/v1_checkpoint_fixture.json`
+- v2 (current): `exporter/agentauditexporter/internal/chain/testdata/v2_checkpoint_fixture.json`
+- v1 (frozen): `exporter/agentauditexporter/internal/chain/testdata/v1_checkpoint_fixture.json`
 
 ---
 
-## 9. agentauditselect processor (B3b)
+## 9. v1-to-v2 changelog
+
+| Change | Impact |
+|---|---|
+| `schema_version` bumped `"v1"` → `"v2"` | Genesis seed changes; v1 and v2 chains are never interleaved |
+| Added `gen_ai.guardrail.{action,name,reason,severity}` to `SelectedAttributes` allowlist | New attributes captured in canonical bytes; existing spans without guardrail attrs are unaffected (keys absent → not included) |
+
+**v1 verifiability:** pass `"v1"` as `schemaVersion` to `GenesisSeedForSchema(traceID, schemaVersion)` when verifying v1 logs. The `otel-agent-audit-verify` CLI reads the schema version from the first log entry and selects the correct seed function automatically.
+
+---
+
+## 10. agentauditselect processor (B3b)
 
 The `agentauditselect` processor sits immediately upstream of `agentauditexporter`
 in the collector pipeline. It buffers spans in memory, keyed by `trace_id`, and
@@ -318,7 +351,7 @@ between them (it regroups spans and defeats deterministic ordering).
 
 ---
 
-## 10. Verifier CLI (B4)
+## 11. Verifier CLI (B4)
 
 `otel-agent-audit-verify` is the reference implementation for audit log
 verification. It is built from

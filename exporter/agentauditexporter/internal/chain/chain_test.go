@@ -44,7 +44,7 @@ func makeRecord(traceID, spanID, parentSpanID string, startNano uint64, seq int)
 }
 
 // TestGenesisSeed verifies that GenesisSeed produces the expected SHA256 for a
-// known traceID. The expected value is computed independently: SHA256(traceIDBytes ‖ "v1").
+// known traceID using the current SchemaVersion.
 func TestGenesisSeed(t *testing.T) {
 	traceIDBytes, err := hex.DecodeString(knownTraceID)
 	if err != nil {
@@ -402,14 +402,47 @@ func TestGenerateChainFixture(t *testing.T) {
 	}
 }
 
-// TestTwoSpanChainFixture reads testdata/v1_two_span_chain_fixture.json and
-// verifies that the entry_hash values match independently computed values.
-// This is the cross-impl lock: any reimplementation must produce the same
-// entry_hash for the same record + genesis_seed + prev.
+// TestGenesisSeedForSchema verifies that GenesisSeedForSchema produces different
+// seeds for different schema versions, ensuring v1 and v2 chains can never silently
+// interleave even for the same trace_id.
+func TestGenesisSeedForSchema(t *testing.T) {
+	const traceID = "01010101010101010101010101010101"
+
+	seedV1, err := chain.GenesisSeedForSchema(traceID, "v1")
+	if err != nil {
+		t.Fatalf("GenesisSeedForSchema v1: %v", err)
+	}
+	seedV2, err := chain.GenesisSeedForSchema(traceID, "v2")
+	if err != nil {
+		t.Fatalf("GenesisSeedForSchema v2: %v", err)
+	}
+
+	if string(seedV1) == string(seedV2) {
+		t.Error("v1 and v2 genesis seeds must differ; got identical values")
+	}
+
+	// GenesisSeed() must equal GenesisSeedForSchema(traceID, record.SchemaVersion).
+	seedCurrent, err := chain.GenesisSeed(traceID)
+	if err != nil {
+		t.Fatalf("GenesisSeed: %v", err)
+	}
+	expected, err := chain.GenesisSeedForSchema(traceID, record.SchemaVersion)
+	if err != nil {
+		t.Fatalf("GenesisSeedForSchema current: %v", err)
+	}
+	if string(seedCurrent) != string(expected) {
+		t.Errorf("GenesisSeed() != GenesisSeedForSchema(traceID, record.SchemaVersion)")
+	}
+}
+
+// TestTwoSpanChainFixture is the v2 cross-impl lock: BuildChain on the fixture
+// records must produce the hardcoded v2 entry hashes. Any change to canonical
+// serialisation, genesis-seed computation, or record fields that appears in the
+// hash path requires a schema_version bump.
 func TestTwoSpanChainFixture(t *testing.T) {
 	const traceID = "01010101010101010101010101010101"
 
-	genesisSeed, err := chain.GenesisSeed(traceID)
+	genesisSeed, err := chain.GenesisSeed(traceID) // uses record.SchemaVersion ("v2")
 	if err != nil {
 		t.Fatalf("GenesisSeed: %v", err)
 	}
@@ -447,14 +480,69 @@ func TestTwoSpanChainFixture(t *testing.T) {
 		t.Fatalf("BuildChain: %v", err)
 	}
 
+	const wantHash0 = "55cdd65168375131856de86680f57f2171101dd22efc0a0e4a6abf59bbdfb90a"
+	const wantHash1 = "3e5adf011183ce2128aeca9d337ddf60ea867dbd96f47c16c77e876b36fbc63c"
+
+	if entries[0].EntryHash != wantHash0 {
+		t.Errorf("v2 fixture entry[0].EntryHash:\n  got  %s\n  want %s", entries[0].EntryHash, wantHash0)
+	}
+	if entries[1].EntryHash != wantHash1 {
+		t.Errorf("v2 fixture entry[1].EntryHash:\n  got  %s\n  want %s", entries[1].EntryHash, wantHash1)
+	}
+}
+
+// TestTwoSpanChainFixture_V1Regression locks the v1 entry hashes. These values
+// must never change — v1 logs already exist in production and their hashes must
+// remain reproducible for verifiers that pass "v1" to GenesisSeedForSchema.
+func TestTwoSpanChainFixture_V1Regression(t *testing.T) {
+	const traceID = "01010101010101010101010101010101"
+
+	genesisSeed, err := chain.GenesisSeedForSchema(traceID, "v1")
+	if err != nil {
+		t.Fatalf("GenesisSeedForSchema v1: %v", err)
+	}
+
+	rec0 := record.AuditRecord{
+		SchemaVersion:     "v1",
+		TraceID:           traceID,
+		SpanID:            "aaaaaaaaaaaaaaaa",
+		ParentSpanID:      "bbbbbbbbbbbbbbbb",
+		SeqInTrace:        0,
+		StartTimeUnixNano: 1000000000,
+		EndTimeUnixNano:   2000000000,
+		SpanName:          "child.span",
+		OtelKind:          "Client",
+		AuditKind:         record.AuditKindTask,
+		Status:            "Ok",
+	}
+	rec1 := record.AuditRecord{
+		SchemaVersion:     "v1",
+		TraceID:           traceID,
+		SpanID:            "bbbbbbbbbbbbbbbb",
+		ParentSpanID:      "",
+		SeqInTrace:        1,
+		StartTimeUnixNano: 2000000000,
+		EndTimeUnixNano:   3000000000,
+		SpanName:          "root.span",
+		OtelKind:          "Client",
+		AuditKind:         record.AuditKindTask,
+		Status:            "Ok",
+	}
+
+	signer, _ := makeTestSigner(t)
+	entries, err := chain.BuildChain([]record.AuditRecord{rec0, rec1}, genesisSeed, signer)
+	if err != nil {
+		t.Fatalf("BuildChain: %v", err)
+	}
+
 	const wantHash0 = "fc388777ccc984fd3c0ab20488ae456dad1295621b420aeb7b949c6d125f54dc"
 	const wantHash1 = "a0415a08bbac8ad89462cae146a727dbcfb3022b3f1e5870886fb2deb1538f9c"
 
 	if entries[0].EntryHash != wantHash0 {
-		t.Errorf("fixture entry[0].EntryHash:\n  got  %s\n  want %s", entries[0].EntryHash, wantHash0)
+		t.Errorf("v1 regression entry[0].EntryHash:\n  got  %s\n  want %s", entries[0].EntryHash, wantHash0)
 	}
 	if entries[1].EntryHash != wantHash1 {
-		t.Errorf("fixture entry[1].EntryHash:\n  got  %s\n  want %s", entries[1].EntryHash, wantHash1)
+		t.Errorf("v1 regression entry[1].EntryHash:\n  got  %s\n  want %s", entries[1].EntryHash, wantHash1)
 	}
 }
 
