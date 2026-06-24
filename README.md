@@ -4,6 +4,14 @@ A signed-audit OpenTelemetry Collector component for agent traces.
 Point your existing OTel Collector at it and get a **tamper-evident,
 independently verifiable audit log** — zero re-instrumentation required.
 
+> **Experimental / development-stage software — not independently audited**
+> This project has not undergone a third-party security audit. The hash-chain and
+> Ed25519 signed checkpoints provide tamper-evidence on honest infrastructure, but
+> they do **not** protect against a malicious log operator who holds the signing key
+> and rewrites the entire log. See [docs/threat-model.md](docs/threat-model.md) for
+> the full set of guarantees and limits. Review the code before relying on it for
+> governance or incident-response purposes.
+
 > **Operational constraints (read before deploying)**
 > - Run as **exactly one** Collector instance. Multiple writers to the same sink produce spurious verification failures.
 > - Do **not** place the `batch` processor upstream of `agentauditexporter`. It regroups spans and defeats deterministic ordering.

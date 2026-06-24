@@ -1,5 +1,7 @@
 # Contributing to otel-agent-audit
 
+Please read and follow our [Code of Conduct](CODE_OF_CONDUCT.md).
+
 ## Branch model
 
 `main` is **protected and PR-only** — no direct pushes, no force-push, branch
