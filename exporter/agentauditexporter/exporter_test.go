@@ -1630,3 +1630,82 @@ func TestConfig_Validate_NegativeValues(t *testing.T) {
 
 // Ensure record import doesn't cause "imported and not used" when tests don't directly use it.
 var _ = record.SchemaVersion
+
+// failSyncFile wraps a logSyncer and returns a configurable error for the first
+// `count` calls to Sync, then passes through to the underlying implementation.
+// Not concurrency-safe: count is decremented without a lock. Safe only for
+// single-goroutine test use where all sealTrace calls run under e.mu.
+type failSyncFile struct {
+	logSyncer
+	syncErr error
+	count   int
+}
+
+func (f *failSyncFile) Sync() error {
+	if f.count > 0 {
+		f.count--
+		return f.syncErr
+	}
+	return f.logSyncer.Sync()
+}
+
+// TestFsyncFailure_RollsBackLog verifies the key invariant: when logFile.Sync()
+// returns an error, sealTrace truncates the entries it just wrote so the log is
+// never ahead of the checkpoint. Before this fix the exporter returned early
+// without truncating, leaving log entries that no checkpoint covered — which the
+// verifier then reported as truncation or tampering.
+func TestFsyncFailure_RollsBackLog(t *testing.T) {
+	env := newTestEnv(t)
+	cfg := env.cfg
+	cfg.CheckpointInterval = 1 // would checkpoint immediately on a successful seal
+
+	exp := startExporter(t, cfg)
+
+	// Replace the real log file with a wrapper that fails on the first Sync call.
+	exp.mu.Lock()
+	exp.logFile = &failSyncFile{
+		logSyncer: exp.logFile,
+		syncErr:   fmt.Errorf("simulated EIO"),
+		count:     1,
+	}
+	exp.mu.Unlock()
+
+	// Deliver a root span. bufferSpan detects hasRoot=true and calls sealTrace
+	// synchronously inside ConsumeTraces. The injected Sync error fires there,
+	// rolling back the log entries before ConsumeTraces returns.
+	traceID := [16]byte{0xFA}
+	rootID := [8]byte{0x01}
+	if err := exp.ConsumeTraces(context.Background(), makeSpan(traceID, rootID, zeroParentID, "root-op", 1_000_000, 2_000_000)); err != nil {
+		t.Fatalf("ConsumeTraces: %v", err)
+	}
+
+	// Shutdown finds buffers empty (trace was already sealed-and-rolled-back above)
+	// and closes files cleanly.
+	if err := exp.Shutdown(context.Background()); err != nil {
+		t.Fatalf("Shutdown: %v", err)
+	}
+
+	// Log must be empty: the sync failure triggered a truncate-rollback.
+	entries := readLogEntries(t, cfg.LogPath)
+	if len(entries) != 0 {
+		t.Errorf("expected 0 log entries after sync-failure rollback, got %d", len(entries))
+	}
+
+	// Checkpoint must also be empty: AddTip was never called.
+	cpData, err := os.ReadFile(cfg.CheckpointPath)
+	if err != nil {
+		t.Fatalf("reading checkpoint: %v", err)
+	}
+	if len(bytes.TrimSpace(cpData)) != 0 {
+		t.Errorf("expected empty checkpoint after sync-failure rollback, got %q", cpData)
+	}
+
+	// The verifier must report no errors: an empty log with no checkpoint is valid.
+	report, err := verify.VerifyLog(cfg.LogPath, cfg.CheckpointPath, env.pubKey)
+	if err != nil {
+		t.Fatalf("VerifyLog: %v", err)
+	}
+	if len(report.Errors) != 0 {
+		t.Errorf("expected no verifier errors after rollback; got %v", report.Errors)
+	}
+}

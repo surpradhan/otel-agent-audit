@@ -26,6 +26,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"sync"
 	"time"
@@ -52,11 +53,21 @@ type traceBuffer struct {
 	hasRoot  bool
 }
 
+// logSyncer is the subset of *os.File behaviour used by the exporter's write path.
+// The interface exists so tests can inject a fake that simulates sync failures.
+type logSyncer interface {
+	io.Writer
+	Sync() error
+	Close() error
+	Truncate(size int64) error
+	Seek(offset int64, whence int) (int64, error)
+}
+
 type agentAuditExporter struct {
 	cfg          *Config
 	logger       *zap.Logger
 	signer       sign.Signer
-	logFile      *os.File
+	logFile      logSyncer
 	checkFile    *os.File
 	wal          *wal.WAL
 	accumulator  *chain.Accumulator
@@ -435,11 +446,44 @@ func (e *agentAuditExporter) sealTrace(traceID string, buf *traceBuffer, checkpo
 	}
 
 	// Step 4: write each entry as a JSONL line.
+	// If fsync is enabled, snapshot the log's end offset first so we can
+	// truncate back to it if Sync later fails — keeping the log consistent
+	// with the checkpoint (which is only updated in Step 5 below).
+	var preWritePos int64
+	if e.fsyncLog() {
+		if preWritePos, err = e.logFile.Seek(0, io.SeekEnd); err != nil {
+			e.logger.Error("agentaudit: get log offset before write",
+				zap.String("trace_id", traceID), zap.Error(err))
+			return
+		}
+	}
+
+	// rollbackLog truncates the file back to preWritePos and fsyncs the truncation
+	// so that a crash after the call cannot leave the log ahead of the checkpoint.
+	// Used on both write-loop failure and Sync failure below.
+	rollbackLog := func(cause string, causeErr error) {
+		e.logger.Error(cause, zap.String("trace_id", traceID), zap.Error(causeErr))
+		if terr := e.logFile.Truncate(preWritePos); terr != nil {
+			e.logger.Error("agentaudit: rollback log truncate failed — log may be ahead of checkpoint",
+				zap.String("trace_id", traceID), zap.Error(terr))
+			return
+		}
+		// Fsync the truncation so a crash cannot recover the removed entries.
+		if serr := e.logFile.Sync(); serr != nil {
+			e.logger.Error("agentaudit: rollback log sync failed — log may be ahead of checkpoint",
+				zap.String("trace_id", traceID), zap.Error(serr))
+		}
+	}
+
 	logEntries := chain.ToLogEntries(entries)
 	for _, le := range logEntries {
 		if err := e.writeLogEntry(le); err != nil {
-			e.logger.Error("agentaudit: write log entry",
-				zap.String("trace_id", traceID), zap.Error(err))
+			if e.fsyncLog() {
+				rollbackLog("agentaudit: write log entry", err)
+			} else {
+				e.logger.Error("agentaudit: write log entry",
+					zap.String("trace_id", traceID), zap.Error(err))
+			}
 			return
 		}
 	}
@@ -448,10 +492,13 @@ func (e *agentAuditExporter) sealTrace(traceID string, buf *traceBuffer, checkpo
 	// This ensures a power-loss between the two writes cannot produce spurious
 	// entry_count_mismatch errors on restart. Skipped when FsyncLog is explicitly
 	// set to false (high-throughput testing); default is true.
+	//
+	// On Sync failure we truncate (and re-sync the truncation) so the log is never
+	// ahead of the checkpoint. The WAL for this trace is not yet marked sealed,
+	// so the trace replays cleanly on the next startup.
 	if e.fsyncLog() {
 		if err := e.logFile.Sync(); err != nil {
-			e.logger.Error("agentaudit: sync log file",
-				zap.String("trace_id", traceID), zap.Error(err))
+			rollbackLog("agentaudit: sync log file", err)
 			return
 		}
 	}
