@@ -6,6 +6,14 @@ This document describes how guardrail evaluation events should be instrumented
 as OTel spans so that `agentauditexporter` captures them correctly in
 `selected_attributes`.
 
+> **OpenTelemetry is passive instrumentation — it does not enforce or block
+> anything.** A guardrail/policy decision is made entirely by the agent's own
+> middleware before this component is ever involved. `agentauditexporter` receives
+> the span that carries the outcome of that decision and seals it into a
+> tamper-evident, signed audit log. The `gen_ai.guardrail.action: "block"` value
+> is a record of a governance decision that **already happened** — not a signal
+> that OTel performed the enforcement.
+
 ---
 
 ## Overview
@@ -23,7 +31,7 @@ inference rules).
 | OTel attribute | Type | Required | Description |
 |---|---|---|---|
 | `gen_ai.guardrail.name` | `string` | Yes | Name of the policy or guardrail that evaluated this span. Typically the policy identifier used by the guardrail provider. Example: `"content-policy"`, `"pii-filter"` |
-| `gen_ai.guardrail.action` | `string` | No | Action taken. SHOULD be one of `"block"`, `"warn"`, `"redact"`, `"allow"`. |
+| `gen_ai.guardrail.action` | `string` | No | Action taken by the agent's guardrail middleware (not by OTel). SHOULD be one of `"block"`, `"warn"`, `"redact"`, `"allow"`. This records a decision that already occurred; OTel does not enforce it. |
 | `gen_ai.guardrail.reason` | `string` | No | Human-readable explanation of why the guardrail triggered. MAY be empty or absent when no violation occurred. |
 | `gen_ai.guardrail.severity` | `string` | No | Severity of the detected policy violation. SHOULD be one of `"low"`, `"medium"`, `"high"`. Absent when action is `"allow"`. |
 
