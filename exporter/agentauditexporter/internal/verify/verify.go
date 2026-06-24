@@ -13,6 +13,7 @@ import (
 	"fmt"
 	"os"
 	"sort"
+	"strings"
 
 	"github.com/surpradhan/otel-agent-audit/exporter/agentauditexporter/internal/canonical"
 	"github.com/surpradhan/otel-agent-audit/exporter/agentauditexporter/internal/chain"
@@ -41,6 +42,14 @@ type Report struct {
 	TracesProcessed      int
 	CheckpointsProcessed int
 	Errors               []VerifyError
+}
+
+// pubKeyID returns hex(SHA256(pubKey)) — the same fingerprint scheme used by
+// sign.NewEd25519Signer so the verifier can compare key_id fields without
+// needing to reconstruct a full Ed25519Signer.
+func pubKeyID(pubKey ed25519.PublicKey) string {
+	h := sha256.Sum256(pubKey)
+	return hex.EncodeToString(h[:])
 }
 
 // VerifyChain verifies the hash chain of a set of log entries for a single trace.
@@ -118,6 +127,17 @@ func VerifyCheckpoint(cp chain.Checkpoint, prevSignPayloadHash string, pubKey ed
 // VerifyLog reads a JSONL log file and checkpoint file, verifies all chains and
 // checkpoints, and returns a Report.
 //
+// Key-id handling:
+//   - The verifier computes the fingerprint of the supplied public key as
+//     hex(SHA256(pubKey)) and pre-scans all entries and checkpoints.
+//   - If the log contains more than one distinct key_id (a multi-epoch log),
+//     VerifyLog returns a Go error (not a Report) and stops. Re-run once
+//     per epoch with the key that matches that epoch's key_id.
+//   - If the single key_id in the log does not match the supplied public key,
+//     VerifyLog emits "key_id_mismatch" errors for every trace and checkpoint
+//     without attempting chain verification (which would only produce misleading
+//     signature-failure errors).
+//
 // Policy for traces not covered by any checkpoint: counted in TracesProcessed
 // but not reported as errors (they are "unchecked-by-checkpoint"). Rationale:
 // the final batch before a crash may be in the log before the checkpoint was
@@ -126,9 +146,86 @@ func VerifyLog(logPath, checkpointPath string, pubKey ed25519.PublicKey) (Report
 	var report Report
 
 	// Parse the log file, grouping by trace_id.
-	traceEntries, err := readLogEntries(logPath)
+	traceEntries, duplicateTraces, err := readLogEntries(logPath)
 	if err != nil {
 		return report, err
+	}
+
+	// Parse checkpoints.
+	checkpoints, err := readCheckpoints(checkpointPath)
+	if err != nil {
+		return report, err
+	}
+
+	// Pre-scan: collect all distinct key_ids across log entries and checkpoints.
+	// This allows us to distinguish "wrong key supplied" (key_id_mismatch) from
+	// "bad signature" (chain error) and to detect multi-epoch logs early.
+	// Entries with an empty key_id (pre-key_id-field logs) are excluded from
+	// this scan; for those logs the verifier falls back to direct signature
+	// verification rather than a more precise key_id_mismatch diagnostic.
+	suppliedKeyID := pubKeyID(pubKey)
+	seenKeyIDs := make(map[string]struct{})
+	for _, entries := range traceEntries {
+		for _, e := range entries {
+			if e.Signed.KeyID != "" {
+				seenKeyIDs[e.Signed.KeyID] = struct{}{}
+			}
+		}
+	}
+	for _, cp := range checkpoints {
+		if cp.KeyID != "" {
+			seenKeyIDs[cp.KeyID] = struct{}{}
+		}
+	}
+
+	// Multi-epoch check: more than one distinct key_id means the log spans a
+	// key rotation. Re-run per epoch with the matching key.
+	if len(seenKeyIDs) > 1 {
+		ids := make([]string, 0, len(seenKeyIDs))
+		for id := range seenKeyIDs {
+			ids = append(ids, id)
+		}
+		sort.Strings(ids)
+		return report, fmt.Errorf("multi-epoch log: %d distinct key_ids found; re-run per epoch with the matching key (found: %s)",
+			len(ids), strings.Join(ids, ", "))
+	}
+
+	// Single key_id check: if the log has exactly one key_id and it doesn't
+	// match the supplied key, emit key_id_mismatch for every trace and checkpoint
+	// rather than letting chain verification produce misleading signature errors.
+	if len(seenKeyIDs) == 1 {
+		var logKeyID string
+		for id := range seenKeyIDs {
+			logKeyID = id
+		}
+		if logKeyID != suppliedKeyID {
+			detail := fmt.Sprintf("log signed by %s, supplied key is %s", logKeyID, suppliedKeyID)
+			var verifyErrs []VerifyError
+
+			traceIDs := make([]string, 0, len(traceEntries))
+			for id := range traceEntries {
+				traceIDs = append(traceIDs, id)
+			}
+			sort.Strings(traceIDs)
+			for _, traceID := range traceIDs {
+				verifyErrs = append(verifyErrs, VerifyError{
+					TraceID: traceID,
+					Kind:    "key_id_mismatch",
+					Detail:  detail,
+				})
+				report.TracesProcessed++
+			}
+			for _, cp := range checkpoints {
+				verifyErrs = append(verifyErrs, VerifyError{
+					TraceID: "",
+					Kind:    "key_id_mismatch",
+					Detail:  fmt.Sprintf("checkpoint seq %d: %s", cp.CheckpointSeq, detail),
+				})
+				report.CheckpointsProcessed++
+			}
+			report.Errors = verifyErrs
+			return report, nil
+		}
 	}
 
 	// Verify each trace chain in sorted order for deterministic error output.
@@ -147,6 +244,19 @@ func VerifyLog(logPath, checkpointPath string, pubKey ed25519.PublicKey) (Report
 	chainFailed := make(map[string]struct{}) // set of trace IDs whose chain verification failed
 	var verifyErrs []VerifyError
 	for _, traceID := range traceIDs {
+		// Emit duplicate_trace_segment for post-compact double chains before
+		// attempting chain verification, which would produce confusing results.
+		if _, dup := duplicateTraces[traceID]; dup {
+			verifyErrs = append(verifyErrs, VerifyError{
+				TraceID: traceID,
+				Kind:    "duplicate_trace_segment",
+				Detail:  "more than one entry with the same seq_in_trace; likely an at-least-once re-delivery after WAL compaction — see docs/threat-model.md §5",
+			})
+			chainFailed[traceID] = struct{}{}
+			report.TracesProcessed++
+			continue
+		}
+
 		entries := traceEntries[traceID]
 		tipHash, err := verifyChainReturnTip(entries, pubKey)
 		if err != nil {
@@ -160,12 +270,6 @@ func VerifyLog(logPath, checkpointPath string, pubKey ed25519.PublicKey) (Report
 			verifiedTips[traceID] = tipHash
 		}
 		report.TracesProcessed++
-	}
-
-	// Parse and verify checkpoints.
-	checkpoints, err := readCheckpoints(checkpointPath)
-	if err != nil {
-		return report, err
 	}
 
 	prevHash := chain.ZeroPrevCheckpointHash
@@ -234,13 +338,17 @@ func VerifyLog(logPath, checkpointPath string, pubKey ed25519.PublicKey) (Report
 	return report, nil
 }
 
-func readLogEntries(logPath string) (map[string][]chain.LogEntry, error) {
+// readLogEntries reads and parses all JSONL log entries, grouped by trace_id and
+// sorted by seq_in_trace. The second return value is the set of trace IDs that
+// have duplicate seq_in_trace values (a sign of at-least-once re-delivery after
+// WAL compaction).
+func readLogEntries(logPath string) (map[string][]chain.LogEntry, map[string]struct{}, error) {
 	f, err := os.Open(logPath)
 	if err != nil {
 		if os.IsNotExist(err) {
-			return map[string][]chain.LogEntry{}, nil
+			return map[string][]chain.LogEntry{}, map[string]struct{}{}, nil
 		}
-		return nil, fmt.Errorf("verify: open log %q: %w", logPath, err)
+		return nil, nil, fmt.Errorf("verify: open log %q: %w", logPath, err)
 	}
 	defer func() { _ = f.Close() }()
 
@@ -254,24 +362,31 @@ func readLogEntries(logPath string) (map[string][]chain.LogEntry, error) {
 		}
 		e, err := chain.UnmarshalLogEntry(line)
 		if err != nil {
-			return nil, fmt.Errorf("verify: unmarshal log entry: %w", err)
+			return nil, nil, fmt.Errorf("verify: unmarshal log entry: %w", err)
 		}
 		result[e.Record.TraceID] = append(result[e.Record.TraceID], e)
 	}
 	if err := scanner.Err(); err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 
-	// Sort each trace's entries by seq_in_trace so VerifyChain sees them in
-	// chain order regardless of log write order.
+	// Sort each trace's entries by seq_in_trace and detect duplicates.
+	duplicates := map[string]struct{}{}
 	for id := range result {
 		entries := result[id]
 		sort.Slice(entries, func(i, j int) bool {
 			return entries[i].Record.SeqInTrace < entries[j].Record.SeqInTrace
 		})
+		// Scan for consecutive entries with the same seq_in_trace.
+		for i := 1; i < len(entries); i++ {
+			if entries[i].Record.SeqInTrace == entries[i-1].Record.SeqInTrace {
+				duplicates[id] = struct{}{}
+				break
+			}
+		}
 		result[id] = entries
 	}
-	return result, nil
+	return result, duplicates, nil
 }
 
 func readCheckpoints(checkPath string) ([]chain.Checkpoint, error) {
@@ -284,7 +399,8 @@ func readCheckpoints(checkPath string) ([]chain.Checkpoint, error) {
 	}
 	defer func() { _ = f.Close() }()
 
-	var cps []chain.Checkpoint
+	// Collect all non-empty lines first so we can identify the last one.
+	var rawLines [][]byte
 	scanner := bufio.NewScanner(f)
 	scanner.Buffer(make([]byte, 64*1024), maxScanTokenSize)
 	for scanner.Scan() {
@@ -292,11 +408,27 @@ func readCheckpoints(checkPath string) ([]chain.Checkpoint, error) {
 		if len(line) == 0 {
 			continue
 		}
+		cp := make([]byte, len(line))
+		copy(cp, line)
+		rawLines = append(rawLines, cp)
+	}
+	if err := scanner.Err(); err != nil {
+		return nil, fmt.Errorf("verify: scanning checkpoint %q: %w", checkPath, err)
+	}
+
+	var cps []chain.Checkpoint
+	for i, line := range rawLines {
 		var cp chain.Checkpoint
 		if err := json.Unmarshal(line, &cp); err != nil {
-			return nil, fmt.Errorf("verify: unmarshal checkpoint: %w", err)
+			// The final line of a checkpoint file may be a partial write from a
+			// crash; skip it (same tolerance as readLastCheckpoint in the exporter).
+			// Any non-final unparseable line indicates corruption or tampering.
+			if i == len(rawLines)-1 {
+				continue
+			}
+			return nil, fmt.Errorf("verify: unmarshal checkpoint line %d: %w", i+1, err)
 		}
 		cps = append(cps, cp)
 	}
-	return cps, scanner.Err()
+	return cps, nil
 }

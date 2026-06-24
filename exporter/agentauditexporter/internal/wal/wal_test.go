@@ -157,6 +157,76 @@ func TestWAL_CompactSafe_Concurrent(t *testing.T) {
 	// No assertions needed beyond the race detector not triggering.
 }
 
+// TestWAL_Open_InvalidPath verifies that Open returns an error when the parent
+// directory does not exist.
+func TestWAL_Open_InvalidPath(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "nonexistent_subdir", "test.wal")
+	_, err := wal.Open(path)
+	if err == nil {
+		t.Fatal("expected error when parent directory does not exist, got nil")
+	}
+}
+
+// TestWAL_Close_Idempotent verifies that calling Close a second time on an
+// already-closed WAL returns nil (the nil-file guard in Close is exercised).
+func TestWAL_Close_Idempotent(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "idempotent.wal")
+	w, err := wal.Open(path)
+	if err != nil {
+		t.Fatalf("wal.Open: %v", err)
+	}
+	if err := w.Close(); err != nil {
+		t.Fatalf("first Close: %v", err)
+	}
+	if err := w.Close(); err != nil {
+		t.Errorf("second Close (already closed): %v", err)
+	}
+}
+
+// TestWAL_Replay_UnlinkedFile verifies that Replay returns an empty map when the
+// WAL file has been deleted from the filesystem after Open (the append fd still
+// holds the inode, but os.Open on the path fails with IsNotExist).
+func TestWAL_Replay_UnlinkedFile(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "unlinked.wal")
+	w, err := wal.Open(path)
+	if err != nil {
+		t.Fatalf("wal.Open: %v", err)
+	}
+	defer func() { _ = w.Close() }()
+
+	if err := os.Remove(path); err != nil {
+		t.Fatalf("os.Remove: %v", err)
+	}
+
+	buffers, err := w.Replay()
+	if err != nil {
+		t.Fatalf("Replay on unlinked file: %v", err)
+	}
+	if len(buffers) != 0 {
+		t.Errorf("expected empty buffers for unlinked WAL, got %d entries", len(buffers))
+	}
+}
+
+// TestWAL_Compact_UnlinkedFile verifies that Compact returns nil when the WAL
+// file has been deleted from the filesystem after Open (the os.IsNotExist
+// early-return path in Compact).
+func TestWAL_Compact_UnlinkedFile(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "compact-unlinked.wal")
+	w, err := wal.Open(path)
+	if err != nil {
+		t.Fatalf("wal.Open: %v", err)
+	}
+	defer func() { _ = w.Close() }()
+
+	if err := os.Remove(path); err != nil {
+		t.Fatalf("os.Remove: %v", err)
+	}
+
+	if err := w.Compact(); err != nil {
+		t.Fatalf("Compact on unlinked file: %v", err)
+	}
+}
+
 // TestWAL_ReplayTolerantPartialLine verifies that a truncated final line
 // (simulating a crash mid-write) does not cause Replay to return an error.
 func TestWAL_ReplayTolerantPartialLine(t *testing.T) {

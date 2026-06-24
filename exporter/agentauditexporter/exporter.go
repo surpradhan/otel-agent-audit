@@ -82,6 +82,16 @@ func (e *agentAuditExporter) effectiveCheckpointInterval() int {
 	return 100
 }
 
+// fsyncLog reports whether the audit-log file should be fsynced after each
+// sealed trace's entries are written. Returns true unless FsyncLog is
+// explicitly set to false in the config.
+func (e *agentAuditExporter) fsyncLog() bool {
+	if e.cfg.FsyncLog != nil {
+		return *e.cfg.FsyncLog
+	}
+	return true
+}
+
 func newAgentAuditExporter(cfg *Config, logger *zap.Logger) *agentAuditExporter {
 	if logger == nil {
 		logger = zap.NewNop()
@@ -429,6 +439,18 @@ func (e *agentAuditExporter) sealTrace(traceID string, buf *traceBuffer, checkpo
 	for _, le := range logEntries {
 		if err := e.writeLogEntry(le); err != nil {
 			e.logger.Error("agentaudit: write log entry",
+				zap.String("trace_id", traceID), zap.Error(err))
+			return
+		}
+	}
+
+	// Step 4b: fsync the audit log before the checkpoint commits to these entries.
+	// This ensures a power-loss between the two writes cannot produce spurious
+	// entry_count_mismatch errors on restart. Skipped when FsyncLog is explicitly
+	// set to false (high-throughput testing); default is true.
+	if e.fsyncLog() {
+		if err := e.logFile.Sync(); err != nil {
+			e.logger.Error("agentaudit: sync log file",
 				zap.String("trace_id", traceID), zap.Error(err))
 			return
 		}

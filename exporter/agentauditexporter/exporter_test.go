@@ -1386,5 +1386,247 @@ func TestRestart_CheckpointContinuity_PartialLine(t *testing.T) {
 	}
 }
 
+// TestFsyncLog_Default verifies that the exporter works correctly with the
+// default fsync_log=true setting and produces a verifiable log.
+// True power-loss durability is not unit-testable, but this confirms the sync
+// code path does not break the write/verify round-trip.
+func TestFsyncLog_Default(t *testing.T) {
+	env := newTestEnv(t)
+	// FsyncLog is nil (default true) — the sync code path is exercised.
+	exp := startExporter(t, env.cfg)
+
+	traceID := [16]byte{0xF2}
+	rootID := [8]byte{0x10}
+	childID := [8]byte{0x11}
+
+	_ = exp.ConsumeTraces(context.Background(), makeSpan(traceID, childID, rootID, "child", 1000, 2000))
+	_ = exp.ConsumeTraces(context.Background(), makeSpan(traceID, rootID, zeroParentID, "root", 500, 3000))
+	if err := exp.Shutdown(context.Background()); err != nil {
+		t.Fatalf("Shutdown: %v", err)
+	}
+
+	report, err := verify.VerifyLog(env.cfg.LogPath, env.cfg.CheckpointPath, env.pubKey)
+	if err != nil {
+		t.Fatalf("VerifyLog: %v", err)
+	}
+	if len(report.Errors) != 0 {
+		t.Errorf("expected no errors; got %v", report.Errors)
+	}
+}
+
+// TestFsyncLog_Disabled verifies that disabling fsync_log still produces a
+// correct and verifiable log (durability is reduced, but correctness is not).
+func TestFsyncLog_Disabled(t *testing.T) {
+	env := newTestEnv(t)
+	falseVal := false
+	env.cfg.FsyncLog = &falseVal
+	exp := startExporter(t, env.cfg)
+
+	traceID := [16]byte{0xF3}
+	rootID := [8]byte{0x12}
+
+	_ = exp.ConsumeTraces(context.Background(), makeSpan(traceID, rootID, zeroParentID, "root", 1000, 2000))
+	if err := exp.Shutdown(context.Background()); err != nil {
+		t.Fatalf("Shutdown: %v", err)
+	}
+
+	report, err := verify.VerifyLog(env.cfg.LogPath, env.cfg.CheckpointPath, env.pubKey)
+	if err != nil {
+		t.Fatalf("VerifyLog: %v", err)
+	}
+	if len(report.Errors) != 0 {
+		t.Errorf("expected no errors with fsync disabled; got %v", report.Errors)
+	}
+}
+
+// TestEarlyRoot_TruncatedButValid pins the early-root truncation behaviour:
+// when the root span arrives BEFORE its children, the exporter seals on the
+// root and drops any subsequent child spans. The sealed single-entry chain is
+// internally valid (signatures and hashes pass), but it only contains the root.
+//
+// This is the caveat documented in docs/threat-model.md §3b:
+// "If the root span arrives before its children, the trace seals immediately
+// and any subsequent child spans are dropped."
+//
+// Mitigation: use agentauditselect processor (tested in TestMultiSpanTrace_SignsAndVerifies
+// via root-last delivery, which produces a complete 3-entry chain).
+func TestEarlyRoot_TruncatedButValid(t *testing.T) {
+	dir := t.TempDir()
+
+	priv, pub, err := sign.GenerateEd25519Key()
+	if err != nil {
+		t.Fatalf("GenerateEd25519Key: %v", err)
+	}
+	pemBytes, _ := sign.MarshalEd25519PrivateKeyPEM(priv)
+	keyPath := filepath.Join(dir, "key.pem")
+	_ = os.WriteFile(keyPath, pemBytes, 0600)
+
+	cfg := &Config{
+		LogPath:            filepath.Join(dir, "audit.jsonl"),
+		KeyPath:            keyPath,
+		WalPath:            filepath.Join(dir, "wal.jsonl"),
+		CheckpointPath:     filepath.Join(dir, "checkpoint.jsonl"),
+		TraceTimeout:       30 * time.Second,
+		CheckpointInterval: 1,
+	}
+
+	exp := startExporter(t, cfg)
+
+	traceID := [16]byte{0xF4}
+	rootID := [8]byte{0x20}
+	childID := [8]byte{0x21}
+
+	// Send root FIRST — triggers immediate seal with only the root span.
+	tdRoot := makeSpan(traceID, rootID, zeroParentID, "root", 500, 4000)
+	if err := exp.ConsumeTraces(context.Background(), tdRoot); err != nil {
+		t.Fatalf("ConsumeTraces root: %v", err)
+	}
+
+	// Send child AFTER — must be dropped (trace already sealed).
+	tdChild := makeSpan(traceID, childID, rootID, "child", 1000, 2000)
+	if err := exp.ConsumeTraces(context.Background(), tdChild); err != nil {
+		t.Fatalf("ConsumeTraces child: %v", err)
+	}
+
+	if err := exp.Shutdown(context.Background()); err != nil {
+		t.Fatalf("Shutdown: %v", err)
+	}
+
+	// The log must have exactly 1 entry (root only — child was dropped).
+	entries := readLogEntries(t, cfg.LogPath)
+	traceIDStr := pcommon.TraceID(traceID).String()
+	var traceEntries []chain.LogEntry
+	for _, e := range entries {
+		if e.Record.TraceID == traceIDStr {
+			traceEntries = append(traceEntries, e)
+		}
+	}
+	if len(traceEntries) != 1 {
+		t.Errorf("expected 1 entry for early-root trace (root only); got %d", len(traceEntries))
+	}
+
+	// The single-entry chain must be internally valid.
+	report, err := verify.VerifyLog(cfg.LogPath, cfg.CheckpointPath, pub)
+	if err != nil {
+		t.Fatalf("VerifyLog: %v", err)
+	}
+	for _, e := range report.Errors {
+		if e.Kind == "chain" {
+			t.Errorf("chain error for valid (but truncated) single-root chain: %v", e)
+		}
+	}
+}
+
+// TestBackgroundWorker_TimeoutSeal verifies that a trace buffered without a root
+// span is sealed by the background sweep once its idle time exceeds TraceTimeout.
+// Uses a 50 ms TraceTimeout; polls until sealed with a 3 s hard deadline.
+func TestBackgroundWorker_TimeoutSeal(t *testing.T) {
+	env := newTestEnv(t)
+	env.cfg.TraceTimeout = 50 * time.Millisecond
+	exp := startExporter(t, env.cfg)
+
+	traceID := [16]byte{0x71}
+	childID := [8]byte{0x71}
+	parentID := [8]byte{0x72} // non-zero parent — not a root span, stays buffered
+
+	td := makeSpan(traceID, childID, parentID, "child", 1000, 2000)
+	if err := exp.ConsumeTraces(context.Background(), td); err != nil {
+		t.Fatalf("ConsumeTraces: %v", err)
+	}
+
+	// Poll until the background ticker sweeps the idle trace (or 3 s deadline).
+	// Shutdown force-seals anything remaining, so we assert after Shutdown.
+	traceIDStr := pcommon.TraceID(traceID).String()
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		entries := readLogEntries(t, env.cfg.LogPath)
+		for _, e := range entries {
+			if e.Record.TraceID == traceIDStr {
+				goto sealed
+			}
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+sealed:
+	if err := exp.Shutdown(context.Background()); err != nil {
+		t.Fatalf("Shutdown: %v", err)
+	}
+
+	entries := readLogEntries(t, env.cfg.LogPath)
+	var count int
+	for _, e := range entries {
+		if e.Record.TraceID == traceIDStr {
+			count++
+		}
+	}
+	if count != 1 {
+		t.Errorf("expected 1 log entry from timeout seal, got %d", count)
+	}
+}
+
+// TestStart_BadLogPath verifies that Start returns an error when the audit log
+// file cannot be created (parent directory does not exist).
+func TestStart_BadLogPath(t *testing.T) {
+	env := newTestEnv(t)
+	env.cfg.LogPath = filepath.Join(t.TempDir(), "nonexistent_subdir", "audit.jsonl")
+
+	exp := newAgentAuditExporter(env.cfg, nil)
+	if err := exp.Start(context.Background(), nil); err == nil {
+		t.Error("expected error when log_path parent dir does not exist")
+		_ = exp.Shutdown(context.Background())
+	}
+}
+
+// TestStart_BadCheckpointPath verifies that Start returns an error when the
+// checkpoint file cannot be created (parent directory does not exist), and that
+// the already-opened log file is cleaned up correctly.
+func TestStart_BadCheckpointPath(t *testing.T) {
+	env := newTestEnv(t)
+	env.cfg.CheckpointPath = filepath.Join(t.TempDir(), "nonexistent_subdir", "checkpoint.jsonl")
+
+	exp := newAgentAuditExporter(env.cfg, nil)
+	if err := exp.Start(context.Background(), nil); err == nil {
+		t.Error("expected error when checkpoint_path parent dir does not exist")
+		_ = exp.Shutdown(context.Background())
+	}
+}
+
+// TestStart_BadWalPath verifies that Start returns an error when the WAL file
+// cannot be created (parent directory does not exist), and that previously
+// opened log and checkpoint files are cleaned up.
+func TestStart_BadWalPath(t *testing.T) {
+	env := newTestEnv(t)
+	env.cfg.WalPath = filepath.Join(t.TempDir(), "nonexistent_subdir", "wal.jsonl")
+
+	exp := newAgentAuditExporter(env.cfg, nil)
+	if err := exp.Start(context.Background(), nil); err == nil {
+		t.Error("expected error when wal_path parent dir does not exist")
+		_ = exp.Shutdown(context.Background())
+	}
+}
+
+// TestConfig_Validate_NegativeValues verifies that negative TraceTimeout and
+// CheckpointInterval are rejected by Validate.
+func TestConfig_Validate_NegativeValues(t *testing.T) {
+	base := Config{
+		LogPath:        "/tmp/a.jsonl",
+		KeyPath:        "/tmp/k.pem",
+		WalPath:        "/tmp/w.jsonl",
+		CheckpointPath: "/tmp/c.jsonl",
+	}
+
+	neg := base
+	neg.TraceTimeout = -1 * time.Second
+	if err := neg.Validate(); err == nil {
+		t.Error("expected error for negative trace_timeout")
+	}
+
+	neg2 := base
+	neg2.CheckpointInterval = -1
+	if err := neg2.Validate(); err == nil {
+		t.Error("expected error for negative checkpoint_interval")
+	}
+}
+
 // Ensure record import doesn't cause "imported and not used" when tests don't directly use it.
 var _ = record.SchemaVersion

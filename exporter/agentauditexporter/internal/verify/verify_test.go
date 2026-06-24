@@ -234,7 +234,11 @@ func TestVerifyChain_Empty(t *testing.T) {
 	}
 }
 
-func TestVerifyLog_WrongKey(t *testing.T) {
+// TestVerifyLog_WrongKey_KeyIDMismatch asserts that supplying the wrong public
+// key produces "key_id_mismatch" errors (not misleading "chain" errors).
+// A key_id mismatch is detected before signature verification, so the error
+// kind unambiguously tells the operator to check which key epoch they need.
+func TestVerifyLog_WrongKey_KeyIDMismatch(t *testing.T) {
 	logPath, checkpointPath, _ := makeVerifyFixture(t)
 	_, wrongPub, err := sign.GenerateEd25519Key()
 	if err != nil {
@@ -245,6 +249,133 @@ func TestVerifyLog_WrongKey(t *testing.T) {
 		t.Fatalf("VerifyLog: %v", err)
 	}
 	if len(report.Errors) == 0 {
-		t.Error("expected errors when verifying with wrong key; got none")
+		t.Fatal("expected errors when verifying with wrong key; got none")
+	}
+	for _, e := range report.Errors {
+		if e.Kind != "key_id_mismatch" {
+			t.Errorf("expected kind=key_id_mismatch, got kind=%s detail=%s", e.Kind, e.Detail)
+		}
+	}
+}
+
+// TestVerifyLog_MultiEpochLog verifies that a log containing entries signed by
+// two different keys returns an error (not a report with per-trace errors).
+// The operator must re-run per epoch with the matching key.
+func TestVerifyLog_MultiEpochLog(t *testing.T) {
+	dir := t.TempDir()
+	logPath := filepath.Join(dir, "audit.jsonl")
+	checkpointPath := filepath.Join(dir, "checkpoint.jsonl")
+
+	// Build two entries signed by different keys.
+	priv1, _, err := sign.GenerateEd25519Key()
+	if err != nil {
+		t.Fatalf("GenerateEd25519Key 1: %v", err)
+	}
+	signer1 := sign.NewEd25519Signer(priv1)
+
+	priv2, pub2, err := sign.GenerateEd25519Key()
+	if err != nil {
+		t.Fatalf("GenerateEd25519Key 2: %v", err)
+	}
+	signer2 := sign.NewEd25519Signer(priv2)
+
+	makeEntry := func(signer sign.Signer, traceID, spanID string, seq int) chain.LogEntry {
+		rec := record.AuditRecord{
+			SchemaVersion: record.SchemaVersion,
+			TraceID:       traceID,
+			SpanID:        spanID,
+			SeqInTrace:    seq,
+			SpanName:      "span",
+			OtelKind:      "Internal",
+			AuditKind:     record.AuditKindTask,
+			Status:        "Ok",
+		}
+		seed, _ := chain.GenesisSeed(traceID)
+		entries, _ := chain.BuildChain([]record.AuditRecord{rec}, seed, signer)
+		return chain.ToLogEntries(entries)[0]
+	}
+
+	traceID1 := "01010101010101010101010101010101"
+	traceID2 := "02020202020202020202020202020202"
+	e1 := makeEntry(signer1, traceID1, "0102030405060708", 0)
+	e2 := makeEntry(signer2, traceID2, "0807060504030201", 0)
+
+	lf, _ := os.Create(logPath)
+	for _, e := range []chain.LogEntry{e1, e2} {
+		line, _ := json.Marshal(e)
+		_, _ = lf.Write(append(line, '\n'))
+	}
+	_ = lf.Close()
+	// Empty checkpoint file.
+	if f, err := os.Create(checkpointPath); err == nil {
+		_ = f.Close()
+	}
+
+	_, err = verify.VerifyLog(logPath, checkpointPath, pub2)
+	if err == nil {
+		t.Fatal("expected an error for multi-epoch log; got nil")
+	}
+	if !strings.Contains(err.Error(), "multi-epoch log") {
+		t.Errorf("expected 'multi-epoch log' in error, got: %v", err)
+	}
+}
+
+// TestVerifyLog_DuplicateTraceSegment verifies that a log with two entries
+// sharing the same (trace_id, seq_in_trace) produces a "duplicate_trace_segment"
+// error rather than a confusing chain error.
+func TestVerifyLog_DuplicateTraceSegment(t *testing.T) {
+	logPath, checkpointPath, pub := makeVerifyFixture(t)
+
+	// Duplicate the single entry to simulate a post-compact re-delivery.
+	data, err := os.ReadFile(logPath)
+	if err != nil {
+		t.Fatalf("read log: %v", err)
+	}
+	line := strings.TrimRight(string(data), "\n")
+	duplicated := line + "\n" + line + "\n"
+	if err := os.WriteFile(logPath, []byte(duplicated), 0600); err != nil {
+		t.Fatalf("write log: %v", err)
+	}
+
+	report, err := verify.VerifyLog(logPath, checkpointPath, pub)
+	if err != nil {
+		t.Fatalf("VerifyLog: %v", err)
+	}
+	var found bool
+	for _, e := range report.Errors {
+		if e.Kind == "duplicate_trace_segment" {
+			found = true
+		}
+		if e.Kind == "chain" {
+			t.Errorf("got misleading chain error for duplicate segment: %v", e)
+		}
+	}
+	if !found {
+		t.Errorf("expected duplicate_trace_segment error; got: %v", report.Errors)
+	}
+}
+
+// TestVerifyLog_PartialLastCheckpointLine covers the crash-recovery scenario from
+// docs/threat-model.md §3a: a power-loss between the log write and the checkpoint
+// fsync can leave a truncated final line in the checkpoint file. The exporter skips
+// such lines on restart (readLastCheckpoint); the verifier must do the same so an
+// operator can immediately re-run the verifier after a restart without a spurious error.
+func TestVerifyLog_PartialLastCheckpointLine(t *testing.T) {
+	logPath, checkpointPath, pub := makeVerifyFixture(t)
+
+	// Append a truncated JSON object that cannot be parsed.
+	cf, err := os.OpenFile(checkpointPath, os.O_APPEND|os.O_WRONLY, 0600)
+	if err != nil {
+		t.Fatalf("open checkpoint for append: %v", err)
+	}
+	_, _ = cf.WriteString(`{"schema_version":"v1","checkpoint_seq":99` + "\n")
+	_ = cf.Close()
+
+	report, err := verify.VerifyLog(logPath, checkpointPath, pub)
+	if err != nil {
+		t.Fatalf("VerifyLog with partial last checkpoint line: %v", err)
+	}
+	if len(report.Errors) != 0 {
+		t.Errorf("expected no errors after partial last line; got %v", report.Errors)
 	}
 }
