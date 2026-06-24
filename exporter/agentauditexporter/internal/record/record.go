@@ -14,7 +14,10 @@ import (
 // SchemaVersion is the current audit-record schema version.
 // It is included in the genesis seed so chains of different schema versions
 // never silently interleave.
-const SchemaVersion = "v1"
+//
+// v2 adds gen_ai.guardrail.* attributes to the capture allowlist.
+// v1 logs remain verifiable with GenesisSeedForSchema(traceID, "v1").
+const SchemaVersion = "v2"
 
 // AuditKind classifies the semantic role of a span in the audit log.
 type AuditKind string
@@ -67,6 +70,10 @@ type AuditRecord struct {
 // is fixed so iteration produces a deterministically ordered slice without a
 // runtime sort step.
 var attributeAllowlist = []string{
+	"gen_ai.guardrail.action",
+	"gen_ai.guardrail.name",
+	"gen_ai.guardrail.reason",
+	"gen_ai.guardrail.severity",
 	"gen_ai.operation.name",
 	"gen_ai.request.model",
 	"gen_ai.response.model",

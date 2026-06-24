@@ -67,7 +67,7 @@ func verifyChainReturnTip(entries []chain.LogEntry, pubKey ed25519.PublicKey) (s
 		return "", nil
 	}
 
-	genesisSeed, err := chain.GenesisSeed(entries[0].Record.TraceID)
+	genesisSeed, err := chain.GenesisSeedForSchema(entries[0].Record.TraceID, entries[0].Record.SchemaVersion)
 	if err != nil {
 		return "", err
 	}

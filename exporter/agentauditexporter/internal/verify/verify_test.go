@@ -379,3 +379,80 @@ func TestVerifyLog_PartialLastCheckpointLine(t *testing.T) {
 		t.Errorf("expected no errors after partial last line; got %v", report.Errors)
 	}
 }
+
+// TestVerifyLog_HappyPath_V1Log is an integration test for the version-aware
+// genesis-seed path: it builds a v1 log on disk (records with SchemaVersion "v1",
+// chain built with GenesisSeedForSchema(traceID, "v1")), then calls VerifyLog and
+// asserts zero errors. This ensures the verifier correctly reads SchemaVersion from
+// entries[0].Record.SchemaVersion rather than always using record.SchemaVersion.
+//
+// Note: the checkpoint is built with chain.NewAccumulator which uses the current
+// record.SchemaVersion ("v2") for the checkpoint's schema_version field. This is an
+// intentional simplification — the verifier does not enforce that log and checkpoint
+// schema_version values agree, so the v1/v2 mismatch is harmless in this test.
+func TestVerifyLog_HappyPath_V1Log(t *testing.T) {
+	priv, pubKey, err := sign.GenerateEd25519Key()
+	if err != nil {
+		t.Fatalf("GenerateEd25519Key: %v", err)
+	}
+	signer := sign.NewEd25519Signer(priv)
+
+	recs := []record.AuditRecord{
+		{
+			SchemaVersion: "v1",
+			TraceID:       fixtureTraceID,
+			SpanID:        "0102030405060708",
+			ParentSpanID:  "0000000000000000",
+			SeqInTrace:    0,
+			SpanName:      "v1-root",
+			OtelKind:      "Internal",
+			AuditKind:     record.AuditKindTask,
+			Status:        "Ok",
+		},
+	}
+
+	genesisSeed, err := chain.GenesisSeedForSchema(fixtureTraceID, "v1")
+	if err != nil {
+		t.Fatalf("GenesisSeedForSchema v1: %v", err)
+	}
+	entries, err := chain.BuildChain(recs, genesisSeed, signer)
+	if err != nil {
+		t.Fatalf("BuildChain: %v", err)
+	}
+
+	dir := t.TempDir()
+	logPath := filepath.Join(dir, "v1audit.jsonl")
+	checkpointPath := filepath.Join(dir, "v1checkpoint.jsonl")
+
+	lf, err := os.Create(logPath)
+	if err != nil {
+		t.Fatalf("create log: %v", err)
+	}
+	for _, e := range chain.ToLogEntries(entries) {
+		line, _ := json.Marshal(e)
+		_, _ = lf.Write(append(line, '\n'))
+	}
+	_ = lf.Close()
+
+	acc := chain.NewAccumulator(signer, 0, chain.ZeroPrevCheckpointHash)
+	acc.AddTip(fixtureTraceID, chain.TipHash(entries), len(entries))
+	cp, err := acc.Build(time.Now())
+	if err != nil {
+		t.Fatalf("Build checkpoint: %v", err)
+	}
+	cf, err := os.Create(checkpointPath)
+	if err != nil {
+		t.Fatalf("create checkpoint: %v", err)
+	}
+	cpLine, _ := json.Marshal(cp)
+	_, _ = cf.Write(append(cpLine, '\n'))
+	_ = cf.Close()
+
+	report, err := verify.VerifyLog(logPath, checkpointPath, []byte(pubKey))
+	if err != nil {
+		t.Fatalf("VerifyLog v1 log: %v", err)
+	}
+	if len(report.Errors) != 0 {
+		t.Errorf("expected zero errors for valid v1 log, got %d: %v", len(report.Errors), report.Errors)
+	}
+}

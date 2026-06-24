@@ -56,17 +56,29 @@ func SortRecords(records []record.AuditRecord) {
 	})
 }
 
-// GenesisSeed computes SHA256(hex.DecodeString(traceID) || []byte(record.SchemaVersion)).
-// Returns an error if traceID is not valid lowercase hex (32 hex chars = 16 bytes).
-func GenesisSeed(traceID string) ([]byte, error) {
+// GenesisSeedForSchema computes SHA256(hex.DecodeString(traceID) || []byte(schemaVersion)).
+// Use this when the schema version must be taken from the log entry (e.g. in
+// the verifier, which must handle both v1 and v2 logs).
+// Returns an error if traceID is invalid hex or schemaVersion is empty (which
+// indicates a corrupted or zero-value log entry rather than a valid schema).
+func GenesisSeedForSchema(traceID, schemaVersion string) ([]byte, error) {
+	if schemaVersion == "" {
+		return nil, fmt.Errorf("chain: empty schemaVersion for trace ID %q", traceID)
+	}
 	traceIDBytes, err := hex.DecodeString(traceID)
 	if err != nil {
 		return nil, fmt.Errorf("chain: decoding trace ID %q: %w", traceID, err)
 	}
 	h := sha256.New()
 	h.Write(traceIDBytes)
-	h.Write([]byte(record.SchemaVersion))
+	h.Write([]byte(schemaVersion))
 	return h.Sum(nil), nil
+}
+
+// GenesisSeed computes SHA256(hex.DecodeString(traceID) || []byte(record.SchemaVersion)).
+// Returns an error if traceID is not valid lowercase hex (32 hex chars = 16 bytes).
+func GenesisSeed(traceID string) ([]byte, error) {
+	return GenesisSeedForSchema(traceID, record.SchemaVersion)
 }
 
 // TipHash returns the EntryHash of the last entry in a chain.
