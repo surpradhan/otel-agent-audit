@@ -1,9 +1,11 @@
 package chain_test
 
 import (
+	"bufio"
 	"crypto/sha256"
 	"encoding/base64"
 	"encoding/hex"
+	"os"
 	"testing"
 
 	"github.com/surpradhan/otel-agent-audit/exporter/agentauditexporter/internal/canonical"
@@ -543,6 +545,67 @@ func TestTwoSpanChainFixture_V1Regression(t *testing.T) {
 	}
 	if entries[1].EntryHash != wantHash1 {
 		t.Errorf("v1 regression entry[1].EntryHash:\n  got  %s\n  want %s", entries[1].EntryHash, wantHash1)
+	}
+}
+
+// TestGenesisSeedForSchema_EmptySchemaVersion verifies that an empty schemaVersion
+// is rejected with an error, preventing silent wrong-seed computation for corrupted
+// log entries where schema_version decoded to "".
+func TestGenesisSeedForSchema_EmptySchemaVersion(t *testing.T) {
+	_, err := chain.GenesisSeedForSchema(knownTraceID, "")
+	if err == nil {
+		t.Error("expected error for empty schemaVersion, got nil")
+	}
+}
+
+// TestTwoSpanChainFixture_FromFile is the file-backed cross-impl lock: it reads
+// testdata/v2_two_span_chain_fixture.json, re-computes the entry hashes from
+// the stored records, and asserts they match the stored entry_hash values.
+// An external Python verifier should be able to reproduce the same hashes from
+// the same file.
+func TestTwoSpanChainFixture_FromFile(t *testing.T) {
+	const fixturePath = "testdata/v2_two_span_chain_fixture.json"
+	f, err := os.Open(fixturePath)
+	if err != nil {
+		t.Fatalf("open %s: %v", fixturePath, err)
+	}
+	defer f.Close()
+
+	var logEntries []chain.LogEntry
+	sc := bufio.NewScanner(f)
+	for sc.Scan() {
+		le, err := chain.UnmarshalLogEntry(sc.Bytes())
+		if err != nil {
+			t.Fatalf("UnmarshalLogEntry: %v", err)
+		}
+		logEntries = append(logEntries, le)
+	}
+	if err := sc.Err(); err != nil {
+		t.Fatalf("scanner: %v", err)
+	}
+	if len(logEntries) != 2 {
+		t.Fatalf("expected 2 entries in fixture, got %d", len(logEntries))
+	}
+
+	traceID := logEntries[0].Record.TraceID
+	schemaVersion := logEntries[0].Record.SchemaVersion
+	genesisSeed, err := chain.GenesisSeedForSchema(traceID, schemaVersion)
+	if err != nil {
+		t.Fatalf("GenesisSeedForSchema: %v", err)
+	}
+
+	signer, _ := makeTestSigner(t)
+	recs := []record.AuditRecord{logEntries[0].Record, logEntries[1].Record}
+	computed, err := chain.BuildChain(recs, genesisSeed, signer)
+	if err != nil {
+		t.Fatalf("BuildChain: %v", err)
+	}
+
+	for i, le := range logEntries {
+		if computed[i].EntryHash != le.Signed.EntryHash {
+			t.Errorf("entry[%d] entry_hash mismatch:\n  computed %s\n  fixture  %s",
+				i, computed[i].EntryHash, le.Signed.EntryHash)
+		}
 	}
 }
 

@@ -213,12 +213,11 @@ func TestAccumulator_PendingCount(t *testing.T) {
 	}
 }
 
-// TestCheckpointSigningPayloadFixture is the cross-impl lock test for the
-// checkpoint signing payload. It verifies that the compact JSON of
-// checkpointForSigning for known inputs matches the golden fixture byte-for-byte.
-// Any encoding change here is a breaking chain-format change and requires a
-// schema_version bump per CLAUDE.md.
-func TestCheckpointSigningPayloadFixture(t *testing.T) {
+// TestCheckpointSigningPayloadFixture_V1Regression is the frozen v1 cross-impl
+// lock for the checkpoint signing payload. The v1 bytes must never change — they
+// are load-bearing for any verifier that re-derives prev_checkpoint_hash from a
+// v1-era checkpoint file.
+func TestCheckpointSigningPayloadFixture_V1Regression(t *testing.T) {
 	cfs := checkpointForSigning{
 		SchemaVersion:      "v1",
 		CheckpointSeq:      1,
@@ -247,6 +246,42 @@ func TestCheckpointSigningPayloadFixture(t *testing.T) {
 	gotStr := strings.TrimRight(string(got), "\n\r ")
 	wantStr := strings.TrimRight(string(want), "\n\r ")
 	if gotStr != wantStr {
-		t.Errorf("checkpoint signing payload diverges from golden fixture.\ngot:  %s\nwant: %s", got, want)
+		t.Errorf("v1 checkpoint payload diverges from frozen fixture.\ngot:  %s\nwant: %s", got, want)
+	}
+}
+
+// TestCheckpointSigningPayloadFixture_V2 is the v2 cross-impl lock: the compact
+// JSON of checkpointForSigning for the v2 fixture inputs must match
+// testdata/v2_checkpoint_fixture.json byte-for-byte.
+func TestCheckpointSigningPayloadFixture_V2(t *testing.T) {
+	cfs := checkpointForSigning{
+		SchemaVersion:      "v2",
+		CheckpointSeq:      1,
+		Timestamp:          "2026-06-22T00:00:00Z",
+		PrevCheckpointHash: chain.ZeroPrevCheckpointHash,
+		TraceTips: []chain.TraceTip{{
+			TraceID:    "01010101010101010101010101010101",
+			TipHash:    "3e5adf011183ce2128aeca9d337ddf60ea867dbd96f47c16c77e876b36fbc63c",
+			EntryCount: 2,
+		}},
+		KeyID:     "PLACEHOLDER",
+		Algorithm: "ed25519",
+	}
+
+	got, err := json.Marshal(cfs)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+
+	const fixturePath = "testdata/v2_checkpoint_fixture.json"
+	want, err := os.ReadFile(fixturePath)
+	if err != nil {
+		t.Fatalf("reading fixture %s: %v", fixturePath, err)
+	}
+
+	gotStr := strings.TrimRight(string(got), "\n\r ")
+	wantStr := strings.TrimRight(string(want), "\n\r ")
+	if gotStr != wantStr {
+		t.Errorf("v2 checkpoint payload diverges from golden fixture.\ngot:  %s\nwant: %s", got, want)
 	}
 }
