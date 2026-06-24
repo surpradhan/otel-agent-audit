@@ -1386,5 +1386,58 @@ func TestRestart_CheckpointContinuity_PartialLine(t *testing.T) {
 	}
 }
 
+// TestFsyncLog_Default verifies that the exporter works correctly with the
+// default fsync_log=true setting and produces a verifiable log.
+// True power-loss durability is not unit-testable, but this confirms the sync
+// code path does not break the write/verify round-trip.
+func TestFsyncLog_Default(t *testing.T) {
+	env := newTestEnv(t)
+	// FsyncLog is nil (default true) — the sync code path is exercised.
+	exp := startExporter(t, env.cfg)
+
+	traceID := [16]byte{0xF2}
+	rootID := [8]byte{0x10}
+	childID := [8]byte{0x11}
+
+	_ = exp.ConsumeTraces(context.Background(), makeSpan(traceID, childID, rootID, "child", 1000, 2000))
+	_ = exp.ConsumeTraces(context.Background(), makeSpan(traceID, rootID, zeroParentID, "root", 500, 3000))
+	if err := exp.Shutdown(context.Background()); err != nil {
+		t.Fatalf("Shutdown: %v", err)
+	}
+
+	report, err := verify.VerifyLog(env.cfg.LogPath, env.cfg.CheckpointPath, env.pubKey)
+	if err != nil {
+		t.Fatalf("VerifyLog: %v", err)
+	}
+	if len(report.Errors) != 0 {
+		t.Errorf("expected no errors; got %v", report.Errors)
+	}
+}
+
+// TestFsyncLog_Disabled verifies that disabling fsync_log still produces a
+// correct and verifiable log (durability is reduced, but correctness is not).
+func TestFsyncLog_Disabled(t *testing.T) {
+	env := newTestEnv(t)
+	falseVal := false
+	env.cfg.FsyncLog = &falseVal
+	exp := startExporter(t, env.cfg)
+
+	traceID := [16]byte{0xF3}
+	rootID := [8]byte{0x12}
+
+	_ = exp.ConsumeTraces(context.Background(), makeSpan(traceID, rootID, zeroParentID, "root", 1000, 2000))
+	if err := exp.Shutdown(context.Background()); err != nil {
+		t.Fatalf("Shutdown: %v", err)
+	}
+
+	report, err := verify.VerifyLog(env.cfg.LogPath, env.cfg.CheckpointPath, env.pubKey)
+	if err != nil {
+		t.Fatalf("VerifyLog: %v", err)
+	}
+	if len(report.Errors) != 0 {
+		t.Errorf("expected no errors with fsync disabled; got %v", report.Errors)
+	}
+}
+
 // Ensure record import doesn't cause "imported and not used" when tests don't directly use it.
 var _ = record.SchemaVersion

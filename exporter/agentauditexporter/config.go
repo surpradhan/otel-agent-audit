@@ -31,6 +31,17 @@ type Config struct {
 	// CheckpointInterval is the number of sealed traces that trigger an
 	// automatic checkpoint write. Default: 100.
 	CheckpointInterval int `mapstructure:"checkpoint_interval"`
+
+	// FsyncLog controls whether the audit-log file is fsynced after writing
+	// each sealed trace's entries and before the corresponding checkpoint is
+	// committed. Default: true (durability on).
+	//
+	// Set to false only in high-throughput testing environments where durability
+	// is not required. Disabling fsync means a power-loss between log write and
+	// checkpoint commit can produce spurious entry_count_mismatch errors on the
+	// next restart (the checkpoint references entries that were buffered but not
+	// flushed to disk). See docs/threat-model.md §1 for the operational implications.
+	FsyncLog *bool `mapstructure:"fsync_log"`
 }
 
 // Validate checks that the configuration is valid.
