@@ -234,6 +234,31 @@ func TestVerifyChain_Empty(t *testing.T) {
 	}
 }
 
+// TestVerifyLog_WrongKey_KeyIDMismatch asserts that supplying the wrong public
+// key produces "key_id_mismatch" errors (not misleading "chain" errors).
+// A key_id mismatch is detected before signature verification, so the error
+// kind unambiguously tells the operator to check which key epoch they need.
+func TestVerifyLog_WrongKey_KeyIDMismatch(t *testing.T) {
+	logPath, checkpointPath, _ := makeVerifyFixture(t)
+	_, wrongPub, err := sign.GenerateEd25519Key()
+	if err != nil {
+		t.Fatalf("GenerateEd25519Key: %v", err)
+	}
+	report, err := verify.VerifyLog(logPath, checkpointPath, wrongPub)
+	if err != nil {
+		t.Fatalf("VerifyLog: %v", err)
+	}
+	if len(report.Errors) == 0 {
+		t.Fatal("expected errors when verifying with wrong key; got none")
+	}
+	for _, e := range report.Errors {
+		if e.Kind != "key_id_mismatch" {
+			t.Errorf("expected kind=key_id_mismatch, got kind=%s detail=%s", e.Kind, e.Detail)
+		}
+	}
+}
+
+// TestVerifyLog_WrongKey kept for backwards compat: verifying with wrong key still errors.
 func TestVerifyLog_WrongKey(t *testing.T) {
 	logPath, checkpointPath, _ := makeVerifyFixture(t)
 	_, wrongPub, err := sign.GenerateEd25519Key()
@@ -246,5 +271,100 @@ func TestVerifyLog_WrongKey(t *testing.T) {
 	}
 	if len(report.Errors) == 0 {
 		t.Error("expected errors when verifying with wrong key; got none")
+	}
+}
+
+// TestVerifyLog_MultiEpochLog verifies that a log containing entries signed by
+// two different keys returns an error (not a report with per-trace errors).
+// The operator must re-run per epoch with the matching key.
+func TestVerifyLog_MultiEpochLog(t *testing.T) {
+	dir := t.TempDir()
+	logPath := filepath.Join(dir, "audit.jsonl")
+	checkpointPath := filepath.Join(dir, "checkpoint.jsonl")
+
+	// Build two entries signed by different keys.
+	priv1, _, err := sign.GenerateEd25519Key()
+	if err != nil {
+		t.Fatalf("GenerateEd25519Key 1: %v", err)
+	}
+	signer1 := sign.NewEd25519Signer(priv1)
+
+	priv2, pub2, err := sign.GenerateEd25519Key()
+	if err != nil {
+		t.Fatalf("GenerateEd25519Key 2: %v", err)
+	}
+	signer2 := sign.NewEd25519Signer(priv2)
+
+	makeEntry := func(signer sign.Signer, traceID, spanID string, seq int) chain.LogEntry {
+		rec := record.AuditRecord{
+			SchemaVersion: record.SchemaVersion,
+			TraceID:       traceID,
+			SpanID:        spanID,
+			SeqInTrace:    seq,
+			SpanName:      "span",
+			OtelKind:      "Internal",
+			AuditKind:     record.AuditKindTask,
+			Status:        "Ok",
+		}
+		seed, _ := chain.GenesisSeed(traceID)
+		entries, _ := chain.BuildChain([]record.AuditRecord{rec}, seed, signer)
+		return chain.ToLogEntries(entries)[0]
+	}
+
+	traceID1 := "01010101010101010101010101010101"
+	traceID2 := "02020202020202020202020202020202"
+	e1 := makeEntry(signer1, traceID1, "0102030405060708", 0)
+	e2 := makeEntry(signer2, traceID2, "0807060504030201", 0)
+
+	lf, _ := os.Create(logPath)
+	for _, e := range []chain.LogEntry{e1, e2} {
+		line, _ := json.Marshal(e)
+		_, _ = lf.Write(append(line, '\n'))
+	}
+	_ = lf.Close()
+	// Empty checkpoint file.
+	_, _ = os.Create(checkpointPath)
+
+	_, err = verify.VerifyLog(logPath, checkpointPath, pub2)
+	if err == nil {
+		t.Fatal("expected an error for multi-epoch log; got nil")
+	}
+	if !strings.Contains(err.Error(), "multi-epoch log") {
+		t.Errorf("expected 'multi-epoch log' in error, got: %v", err)
+	}
+}
+
+// TestVerifyLog_DuplicateTraceSegment verifies that a log with two entries
+// sharing the same (trace_id, seq_in_trace) produces a "duplicate_trace_segment"
+// error rather than a confusing chain error.
+func TestVerifyLog_DuplicateTraceSegment(t *testing.T) {
+	logPath, checkpointPath, pub := makeVerifyFixture(t)
+
+	// Duplicate the single entry to simulate a post-compact re-delivery.
+	data, err := os.ReadFile(logPath)
+	if err != nil {
+		t.Fatalf("read log: %v", err)
+	}
+	line := strings.TrimRight(string(data), "\n")
+	duplicated := line + "\n" + line + "\n"
+	if err := os.WriteFile(logPath, []byte(duplicated), 0600); err != nil {
+		t.Fatalf("write log: %v", err)
+	}
+
+	report, err := verify.VerifyLog(logPath, checkpointPath, pub)
+	if err != nil {
+		t.Fatalf("VerifyLog: %v", err)
+	}
+	var found bool
+	for _, e := range report.Errors {
+		if e.Kind == "duplicate_trace_segment" {
+			found = true
+		}
+		if e.Kind == "chain" {
+			t.Errorf("got misleading chain error for duplicate segment: %v", e)
+		}
+	}
+	if !found {
+		t.Errorf("expected duplicate_trace_segment error; got: %v", report.Errors)
 	}
 }

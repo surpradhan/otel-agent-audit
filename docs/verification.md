@@ -93,6 +93,32 @@ Status: FAILED (1 error(s))
 - A missing log or checkpoint file is treated as empty — no error is returned.
 - An unparseable line in the log or checkpoint file (e.g. a truncated line from a crash) causes the verifier to return an I/O error (exit 2). The WAL, not the audit log, absorbs crash-partial writes; the audit log only receives complete JSONL entries.
 
+## Key-id verification
+
+Every log entry and checkpoint carries a `key_id` field equal to
+`hex(SHA256(ed25519PublicKeyBytes))`. The verifier computes this fingerprint from
+the supplied public key and compares it to the log before attempting any
+signature verification. This produces actionable errors instead of confusing
+"signature failed" messages when the wrong key is used.
+
+| Scenario | Verifier behaviour |
+|----------|-------------------|
+| Correct key supplied | Chain and checkpoint signatures are verified normally |
+| Wrong key supplied (single epoch) | `key_id_mismatch` error for each trace and checkpoint; no misleading signature errors |
+| Log spans multiple key epochs | `VerifyLog` returns an error: "multi-epoch log: re-run per epoch with the matching key" — see below |
+
+### Multi-epoch logs
+
+When a signing key is rotated, entries before the rotation carry the old
+`key_id` and entries after carry the new `key_id`. The verifier detects more
+than one distinct `key_id` in the log and returns an error. To verify a
+multi-epoch log:
+
+1. Identify the key epochs: `jq -r '.signed.key_id' audit.jsonl | sort -u`
+2. Identify the checkpoint epochs: `jq -r '.key_id' checkpoint.jsonl | sort -u`
+3. For each epoch, extract the relevant log/checkpoint lines and run the verifier
+   with the key for that epoch.
+
 ## Key distribution (v1 scope)
 
 Key distribution is the operator's responsibility. Recommended practices:
@@ -103,3 +129,18 @@ Key distribution is the operator's responsibility. Recommended practices:
 - Key rotation is not defined for v1; after rotation, entries carry the new
   `key_id`. Run the verifier once per epoch, each time with the key that matches
   that epoch's `key_id`.
+
+## Intra-trace completeness caveat
+
+The exporter seals a trace **the moment any root span (`parent_span_id` is empty)
+arrives**. If the root span arrives **before** its children, the trace seals
+immediately and subsequent child spans are dropped. The sealed chain is
+internally valid but represents an incomplete trace.
+
+To ensure completeness, place the `agentauditselect` processor immediately
+upstream of `agentauditexporter`. It buffers spans per trace until the root
+arrives, then forwards the complete trace as one batch. Without it, completeness
+depends on the agent SDK sending the root span last.
+
+See [docs/threat-model.md §3b](threat-model.md#3b-intra-trace-completeness-early-root-truncation)
+for the full discussion.
