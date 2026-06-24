@@ -354,3 +354,28 @@ func TestVerifyLog_DuplicateTraceSegment(t *testing.T) {
 		t.Errorf("expected duplicate_trace_segment error; got: %v", report.Errors)
 	}
 }
+
+// TestVerifyLog_PartialLastCheckpointLine covers the crash-recovery scenario from
+// docs/threat-model.md §3a: a power-loss between the log write and the checkpoint
+// fsync can leave a truncated final line in the checkpoint file. The exporter skips
+// such lines on restart (readLastCheckpoint); the verifier must do the same so an
+// operator can immediately re-run the verifier after a restart without a spurious error.
+func TestVerifyLog_PartialLastCheckpointLine(t *testing.T) {
+	logPath, checkpointPath, pub := makeVerifyFixture(t)
+
+	// Append a truncated JSON object that cannot be parsed.
+	cf, err := os.OpenFile(checkpointPath, os.O_APPEND|os.O_WRONLY, 0600)
+	if err != nil {
+		t.Fatalf("open checkpoint for append: %v", err)
+	}
+	_, _ = cf.WriteString(`{"schema_version":"v1","checkpoint_seq":99` + "\n")
+	_ = cf.Close()
+
+	report, err := verify.VerifyLog(logPath, checkpointPath, pub)
+	if err != nil {
+		t.Fatalf("VerifyLog with partial last checkpoint line: %v", err)
+	}
+	if len(report.Errors) != 0 {
+		t.Errorf("expected no errors after partial last line; got %v", report.Errors)
+	}
+}

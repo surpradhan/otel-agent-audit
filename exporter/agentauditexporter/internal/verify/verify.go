@@ -399,7 +399,8 @@ func readCheckpoints(checkPath string) ([]chain.Checkpoint, error) {
 	}
 	defer func() { _ = f.Close() }()
 
-	var cps []chain.Checkpoint
+	// Collect all non-empty lines first so we can identify the last one.
+	var rawLines [][]byte
 	scanner := bufio.NewScanner(f)
 	scanner.Buffer(make([]byte, 64*1024), maxScanTokenSize)
 	for scanner.Scan() {
@@ -407,11 +408,27 @@ func readCheckpoints(checkPath string) ([]chain.Checkpoint, error) {
 		if len(line) == 0 {
 			continue
 		}
+		cp := make([]byte, len(line))
+		copy(cp, line)
+		rawLines = append(rawLines, cp)
+	}
+	if err := scanner.Err(); err != nil {
+		return nil, fmt.Errorf("verify: scanning checkpoint %q: %w", checkPath, err)
+	}
+
+	var cps []chain.Checkpoint
+	for i, line := range rawLines {
 		var cp chain.Checkpoint
 		if err := json.Unmarshal(line, &cp); err != nil {
-			return nil, fmt.Errorf("verify: unmarshal checkpoint: %w", err)
+			// The final line of a checkpoint file may be a partial write from a
+			// crash; skip it (same tolerance as readLastCheckpoint in the exporter).
+			// Any non-final unparseable line indicates corruption or tampering.
+			if i == len(rawLines)-1 {
+				continue
+			}
+			return nil, fmt.Errorf("verify: unmarshal checkpoint line %d: %w", i+1, err)
 		}
 		cps = append(cps, cp)
 	}
-	return cps, scanner.Err()
+	return cps, nil
 }
