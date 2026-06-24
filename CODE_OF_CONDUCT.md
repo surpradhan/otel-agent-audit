@@ -61,8 +61,7 @@ representative at an online or offline event.
 Instances of abusive, harassing, or otherwise unacceptable behavior may be
 reported to the community leaders responsible for enforcement at:
 
-<!-- MAINTAINER: replace the placeholder below with your preferred contact for CoC reports -->
-**[MAINTAINER CONTACT — e.g. your GitHub username or email address]**
+**surabhi7pradhan@gmail.com**
 
 All complaints will be reviewed and investigated promptly and fairly.
 

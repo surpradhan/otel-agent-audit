@@ -31,8 +31,7 @@ Use GitHub's private vulnerability reporting instead:
 GitHub's private reporting keeps the disclosure confidential until a fix is
 available.
 
-<!-- MAINTAINER: optionally add a contact email below if you prefer a backup channel -->
-<!-- Alternatively: email [your-email@example.com] with subject line "[otel-agent-audit] Security Report" -->
+Alternatively: email surabhi7pradhan@gmail.com with subject line `[otel-agent-audit] Security Report`.
 
 ---
 
