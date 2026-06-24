@@ -8,8 +8,8 @@ as OTel spans so that `agentauditexporter` captures them correctly in
 
 > **OpenTelemetry is passive instrumentation — it does not enforce or block
 > anything.** A guardrail/policy decision is made entirely by the agent's own
-> middleware before this component is ever involved. `agentauditexporter` merely
-> observes the span that records the outcome of that decision and seals it into a
+> middleware before this component is ever involved. `agentauditexporter` receives
+> the span that carries the outcome of that decision and seals it into a
 > tamper-evident, signed audit log. The `gen_ai.guardrail.action: "block"` value
 > is a record of a governance decision that **already happened** — not a signal
 > that OTel performed the enforcement.

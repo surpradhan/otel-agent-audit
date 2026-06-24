@@ -84,7 +84,7 @@ objects, not a map. The sort order is fixed by the `attributeAllowlist` in
 
 | Attribute key | Notes |
 |---|---|
-| `gen_ai.guardrail.action` | (**v2**) Action taken by the guardrail: `"block"`, `"warn"`, etc. |
+| `gen_ai.guardrail.action` | (**v2**) Action taken by the agent's guardrail middleware (not by OTel); records a decision that already occurred. Values: `"block"`, `"warn"`, `"redact"`, `"allow"`. |
 | `gen_ai.guardrail.name` | (**v2**) Name of the policy/guardrail that evaluated the span |
 | `gen_ai.guardrail.reason` | (**v2**) Human-readable explanation of the guardrail decision |
 | `gen_ai.guardrail.severity` | (**v2**) Severity level of the guardrail trigger: `"low"`, `"medium"`, `"high"` |
