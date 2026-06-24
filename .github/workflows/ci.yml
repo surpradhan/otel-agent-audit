@@ -24,6 +24,16 @@ jobs:
         run: cd exporter/agentauditexporter && go test -race -coverprofile=../../coverage.out ./...
       - name: Report coverage
         run: cd exporter/agentauditexporter && go tool cover -func=../../coverage.out | grep total
+      - name: Coverage gate — exporter main package (≥80%)
+        run: |
+          cd exporter/agentauditexporter
+          go test -race -coverprofile=/tmp/cov-main.out .
+          go tool cover -func=/tmp/cov-main.out | awk '/^total:/{gsub(/%/,"",$NF); p=$NF+0; printf "exporter main: %.1f%%\n",p; if(p<80){printf "FAIL: %.1f%% < 80%%\n",p; exit 1}}'
+      - name: Coverage gate — internal/wal (≥80%)
+        run: |
+          cd exporter/agentauditexporter
+          go test -race -coverprofile=/tmp/cov-wal.out ./internal/wal/
+          go tool cover -func=/tmp/cov-wal.out | awk '/^total:/{gsub(/%/,"",$NF); p=$NF+0; printf "internal/wal: %.1f%%\n",p; if(p<80){printf "FAIL: %.1f%% < 80%%\n",p; exit 1}}'
       - name: Run processor tests
         run: cd processor/agentauditselect && go test -race ./...
       - name: Build verifier CLI

@@ -1517,5 +1517,107 @@ func TestEarlyRoot_TruncatedButValid(t *testing.T) {
 	}
 }
 
+// TestBackgroundWorker_TimeoutSeal verifies that a trace buffered without a root
+// span is sealed by the background sweep once its idle time exceeds TraceTimeout.
+// Uses a very short TraceTimeout to make the sweep fire within 200 ms.
+func TestBackgroundWorker_TimeoutSeal(t *testing.T) {
+	env := newTestEnv(t)
+	env.cfg.TraceTimeout = 50 * time.Millisecond
+	exp := startExporter(t, env.cfg)
+
+	traceID := [16]byte{0x71}
+	childID := [8]byte{0x71}
+	parentID := [8]byte{0x72} // non-zero parent — not a root span, stays buffered
+
+	td := makeSpan(traceID, childID, parentID, "child", 1000, 2000)
+	if err := exp.ConsumeTraces(context.Background(), td); err != nil {
+		t.Fatalf("ConsumeTraces: %v", err)
+	}
+
+	// Wait for the background ticker (fires every traceTimeout/2 = 25 ms) to sweep
+	// and seal the now-idle trace.
+	time.Sleep(200 * time.Millisecond)
+
+	if err := exp.Shutdown(context.Background()); err != nil {
+		t.Fatalf("Shutdown: %v", err)
+	}
+
+	entries := readLogEntries(t, env.cfg.LogPath)
+	traceIDStr := pcommon.TraceID(traceID).String()
+	var count int
+	for _, e := range entries {
+		if e.Record.TraceID == traceIDStr {
+			count++
+		}
+	}
+	if count != 1 {
+		t.Errorf("expected 1 log entry from timeout seal, got %d", count)
+	}
+}
+
+// TestStart_BadLogPath verifies that Start returns an error when the audit log
+// file cannot be created (parent directory does not exist).
+func TestStart_BadLogPath(t *testing.T) {
+	env := newTestEnv(t)
+	env.cfg.LogPath = filepath.Join(t.TempDir(), "nonexistent_subdir", "audit.jsonl")
+
+	exp := newAgentAuditExporter(env.cfg, nil)
+	if err := exp.Start(context.Background(), nil); err == nil {
+		t.Error("expected error when log_path parent dir does not exist")
+		_ = exp.Shutdown(context.Background())
+	}
+}
+
+// TestStart_BadCheckpointPath verifies that Start returns an error when the
+// checkpoint file cannot be created (parent directory does not exist), and that
+// the already-opened log file is cleaned up correctly.
+func TestStart_BadCheckpointPath(t *testing.T) {
+	env := newTestEnv(t)
+	env.cfg.CheckpointPath = filepath.Join(t.TempDir(), "nonexistent_subdir", "checkpoint.jsonl")
+
+	exp := newAgentAuditExporter(env.cfg, nil)
+	if err := exp.Start(context.Background(), nil); err == nil {
+		t.Error("expected error when checkpoint_path parent dir does not exist")
+		_ = exp.Shutdown(context.Background())
+	}
+}
+
+// TestStart_BadWalPath verifies that Start returns an error when the WAL file
+// cannot be created (parent directory does not exist), and that previously
+// opened log and checkpoint files are cleaned up.
+func TestStart_BadWalPath(t *testing.T) {
+	env := newTestEnv(t)
+	env.cfg.WalPath = filepath.Join(t.TempDir(), "nonexistent_subdir", "wal.jsonl")
+
+	exp := newAgentAuditExporter(env.cfg, nil)
+	if err := exp.Start(context.Background(), nil); err == nil {
+		t.Error("expected error when wal_path parent dir does not exist")
+		_ = exp.Shutdown(context.Background())
+	}
+}
+
+// TestConfig_Validate_NegativeValues verifies that negative TraceTimeout and
+// CheckpointInterval are rejected by Validate.
+func TestConfig_Validate_NegativeValues(t *testing.T) {
+	base := Config{
+		LogPath:        "/tmp/a.jsonl",
+		KeyPath:        "/tmp/k.pem",
+		WalPath:        "/tmp/w.jsonl",
+		CheckpointPath: "/tmp/c.jsonl",
+	}
+
+	neg := base
+	neg.TraceTimeout = -1 * time.Second
+	if err := neg.Validate(); err == nil {
+		t.Error("expected error for negative trace_timeout")
+	}
+
+	neg2 := base
+	neg2.CheckpointInterval = -1
+	if err := neg2.Validate(); err == nil {
+		t.Error("expected error for negative checkpoint_interval")
+	}
+}
+
 // Ensure record import doesn't cause "imported and not used" when tests don't directly use it.
 var _ = record.SchemaVersion
