@@ -84,6 +84,47 @@ func TestMarshal_GoldenFixture_V1Regression(t *testing.T) {
 	}
 }
 
+// TestMarshal_GoldenFixture_Seq1 locks the v2 canonical bytes for the seq_in_trace=1
+// record. Together with TestMarshal_GoldenFixture (seq=0) this covers the full
+// two-span chain fixture used in TestTwoSpanChainFixture_FromFile.
+func TestMarshal_GoldenFixture_Seq1(t *testing.T) {
+	rec := record.AuditRecord{
+		SchemaVersion:     record.SchemaVersion,
+		TraceID:           "01010101010101010101010101010101",
+		SpanID:            "0102030405060708",
+		ParentSpanID:      "",
+		SeqInTrace:        1,
+		StartTimeUnixNano: 2000000000,
+		EndTimeUnixNano:   3000000000,
+		SpanName:          "gen_ai.chat",
+		OtelKind:          "Client",
+		GenAIOperation:    "chat",
+		AuditKind:         record.AuditKindTask,
+		SelectedAttributes: []record.AttributeEntry{
+			{Key: "gen_ai.operation.name", Value: "chat"},
+			{Key: "gen_ai.request.model", Value: "gpt-4o"},
+			{Key: "gen_ai.system", Value: "openai"},
+		},
+		Status: "Ok",
+	}
+	got, err := Marshal(rec)
+	if err != nil {
+		t.Fatalf("Marshal: %v", err)
+	}
+
+	const fixturePath = "testdata/v2_canonical_seq1_fixture.json"
+	want, err := os.ReadFile(fixturePath)
+	if err != nil {
+		t.Fatalf("reading fixture %s: %v", fixturePath, err)
+	}
+
+	gotStr := strings.TrimRight(string(got), "\n\r ")
+	wantStr := strings.TrimRight(string(want), "\n\r ")
+	if gotStr != wantStr {
+		t.Errorf("canonical bytes diverge from v2 seq1 golden fixture.\ngot:  %s\nwant: %s", got, want)
+	}
+}
+
 func TestMarshal_Deterministic(t *testing.T) {
 	rec := fixtureRecord()
 	a, err := Marshal(rec)

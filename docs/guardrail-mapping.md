@@ -66,8 +66,9 @@ omitted — there are never null entries.
 ## Verifier output
 
 When verifying a log that contains guardrail spans, the `otel-agent-audit-verify`
-CLI includes them in the per-trace summary. Guardrail actions of `"block"` or
-`"redact"` are flagged in the report as policy enforcement events.
+CLI verifies their chain integrity and signatures identically to other span types.
+Guardrail spans receive no special treatment in the report output; filtering by
+`audit_kind` or `gen_ai.guardrail.action` value requires post-processing the log.
 
 ---
 

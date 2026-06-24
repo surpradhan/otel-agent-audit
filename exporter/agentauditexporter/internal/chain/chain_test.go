@@ -569,7 +569,7 @@ func TestTwoSpanChainFixture_FromFile(t *testing.T) {
 	if err != nil {
 		t.Fatalf("open %s: %v", fixturePath, err)
 	}
-	defer f.Close()
+	defer func() { _ = f.Close() }()
 
 	var logEntries []chain.LogEntry
 	sc := bufio.NewScanner(f)

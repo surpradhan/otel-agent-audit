@@ -385,6 +385,11 @@ func TestVerifyLog_PartialLastCheckpointLine(t *testing.T) {
 // chain built with GenesisSeedForSchema(traceID, "v1")), then calls VerifyLog and
 // asserts zero errors. This ensures the verifier correctly reads SchemaVersion from
 // entries[0].Record.SchemaVersion rather than always using record.SchemaVersion.
+//
+// Note: the checkpoint is built with chain.NewAccumulator which uses the current
+// record.SchemaVersion ("v2") for the checkpoint's schema_version field. This is an
+// intentional simplification — the verifier does not enforce that log and checkpoint
+// schema_version values agree, so the v1/v2 mismatch is harmless in this test.
 func TestVerifyLog_HappyPath_V1Log(t *testing.T) {
 	priv, pubKey, err := sign.GenerateEd25519Key()
 	if err != nil {
