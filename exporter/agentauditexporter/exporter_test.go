@@ -1519,7 +1519,7 @@ func TestEarlyRoot_TruncatedButValid(t *testing.T) {
 
 // TestBackgroundWorker_TimeoutSeal verifies that a trace buffered without a root
 // span is sealed by the background sweep once its idle time exceeds TraceTimeout.
-// Uses a very short TraceTimeout to make the sweep fire within 200 ms.
+// Uses a 50 ms TraceTimeout; polls until sealed with a 3 s hard deadline.
 func TestBackgroundWorker_TimeoutSeal(t *testing.T) {
 	env := newTestEnv(t)
 	env.cfg.TraceTimeout = 50 * time.Millisecond
