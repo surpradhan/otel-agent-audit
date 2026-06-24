@@ -122,7 +122,9 @@ make demo
 ```
 
 This generates a fixture trace, builds the chain locally, and runs the
-verifier — no Collector or network needed. See [demo/](demo/) for details.
+verifier — no Collector or network needed. See
+[exporter/agentauditexporter/cmd/demo](exporter/agentauditexporter/cmd/demo)
+for the source.
 
 ---
 
