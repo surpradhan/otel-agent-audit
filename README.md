@@ -1,21 +1,33 @@
 # otel-agent-audit
 
-A signed-audit OpenTelemetry Collector component for agent traces.
-Point your existing OTel Collector at it and get a **tamper-evident,
-independently verifiable audit log** — zero re-instrumentation required.
+A signed-audit OpenTelemetry Collector component for agent traces. Point your
+existing OTel Collector at it and get a **tamper-evident, independently
+verifiable audit log** with zero re-instrumentation.
 
-> **Experimental / development-stage software — not independently audited**
-> This project has not undergone a third-party security audit. The hash-chain and
-> Ed25519 signed checkpoints provide tamper-evidence on honest infrastructure, but
-> they do **not** protect against a malicious log operator who holds the signing key
-> and rewrites the entire log. See [docs/threat-model.md](docs/threat-model.md) for
-> the full set of guarantees and limits. Review the code before relying on it for
-> governance or incident-response purposes.
+**Use this if** you run OTel-instrumented AI agents and need a cryptographically
+verifiable record of what happened. Governance and guardrail decisions that are
+already present in your spans get sealed into a per-trace hash-chain, signed with
+Ed25519, and made checkable by anyone holding only the public key. It is
+**observability only** and does not enforce or block.
 
-> **Operational constraints (read before deploying)**
-> - Run as **exactly one** Collector instance. Multiple writers to the same sink produce spurious verification failures.
-> - Do **not** place the `batch` processor upstream of `agentauditexporter`. It regroups spans and defeats deterministic ordering.
-> - **EU AI Act Article 12** is technology-neutral and does not mandate cryptographic audit logs. This component is a useful tamper-evidence tool, not a certified compliance product. See [docs/threat-model.md](docs/threat-model.md#6-eu-ai-act-article-12--disclaimer).
+### See it work in 30 seconds
+
+Runs entirely locally, no Collector or network required (needs Go 1.25+):
+
+```bash
+make demo
+```
+
+This generates a fixture trace, builds the chain locally, and runs the verifier
+end to end. Annotated source:
+[exporter/agentauditexporter/cmd/demo](exporter/agentauditexporter/cmd/demo).
+
+> ⚠️ **Experimental, not independently audited.** The hash-chain and Ed25519
+> signed checkpoints provide tamper-evidence **on honest infrastructure**. They do
+> **not** protect against a malicious log operator who holds the signing key and
+> rewrites the whole log. Review the code and the
+> [threat model](docs/threat-model.md) before relying on it for governance or
+> incident-response purposes.
 
 ---
 
@@ -40,12 +52,15 @@ independently verifiable audit log** — zero re-instrumentation required.
 Each trace produces a **per-trace hash-chain** ordered deterministically by
 `(start_time_unix_nano, span_id)`. Every entry is signed with Ed25519. Signed
 checkpoints commit to all sealed trace tips at a configurable cadence. Because
-verification uses only the **public key**, anyone with the log + public key can
-verify independently — no secrets needed.
+verification uses only the **public key**, anyone with the log plus the public
+key can verify independently, with no secrets required.
 
 ---
 
 ## Quickstart
+
+**Prerequisites:** Go **1.25+** (the modules and the pinned Collector v0.154.0
+require it).
 
 ### 1. Build
 
@@ -55,7 +70,7 @@ go install go.opentelemetry.io/collector/cmd/builder@v0.154.0
 
 # Build the demo collector distro
 GOWORK=off builder --config=ocb/builder-config.yaml
-# Output: dist/otelcol-agentaudit (or dist/ depending on OCB version)
+# Output: ./dist/otel-agent-audit-collector
 
 # Build the verifier CLI
 cd exporter/agentauditexporter
@@ -102,7 +117,9 @@ service:
       exporters:  [agentaudit]
 ```
 
-> **Important:** `agentauditselect` must be the last processor, immediately before `agentaudit`. Do not place `batch` between them.
+> **Important:** `agentauditselect` must be the last processor, immediately
+> before `agentaudit`. Do not place `batch` between them (see Operational
+> constraints below).
 
 ### 4. Feed traces, then verify
 
@@ -123,16 +140,18 @@ Checkpoints processed: 1
 Status: OK
 ```
 
-### 5. Offline demo
+---
 
-```bash
-make demo
-```
+## Operational constraints (read before deploying)
 
-This generates a fixture trace, builds the chain locally, and runs the
-verifier — no Collector or network needed. See
-[exporter/agentauditexporter/cmd/demo](exporter/agentauditexporter/cmd/demo)
-for the annotated source.
+- **Single writer.** Run as **exactly one** Collector instance. Multiple writers
+  to the same sink produce spurious verification failures.
+- **No `batch` upstream.** Do **not** place the `batch` processor upstream of
+  `agentauditexporter`. It regroups spans and defeats deterministic ordering.
+- **Not a compliance certification.** **EU AI Act Article 12** is
+  technology-neutral and does not mandate cryptographic audit logs. This
+  component is a useful tamper-evidence tool, not a certified compliance product.
+  See [docs/threat-model.md](docs/threat-model.md#6-eu-ai-act-article-12--disclaimer).
 
 ---
 
@@ -169,4 +188,4 @@ drift-guard conventions.
 
 ## License
 
-MIT — see [LICENSE](LICENSE).
+MIT. See [LICENSE](LICENSE).
