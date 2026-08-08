@@ -83,19 +83,69 @@ GOWORK=off builder --config=ocb/builder-config.yaml
 
 ## Release gating
 
-Releases are cut by pushing a semver tag (e.g. `v0.1.0`), handled by a
-separate `release.yml` workflow — **not** a required PR check (so the
-drift-guard ignores it).
+Each Go module in this repo is released independently by pushing a semver tag.
+For a Go module the **tag *is* the release** — once pushed, `proxy.golang.org`
+serves that version on first request, fetching it directly from the repo. There
+is no separate publish step, upload, registry, or token.
 
-The release workflow must:
-1. Verify the tagged commit is an ancestor of `origin/main`.
+Tags follow Go's multi-module convention — the module's directory prefix plus
+the version:
+
+| Module | Tag form |
+|--------|----------|
+| root (`github.com/surpradhan/otel-agent-audit`) | `vX.Y.Z` |
+| exporter (`…/exporter/agentauditexporter`) | `exporter/agentauditexporter/vX.Y.Z` |
+| processor (`…/processor/agentauditselect`) | `processor/agentauditselect/vX.Y.Z` |
+
+### Maintainer pre-tag checklist
+
+Because a tag is instantly consumable, gating happens **before** tagging. Until a
+`release.yml` workflow exists (see below), *the human gate is the maintainer
+running this checklist by hand* before cutting the release:
+
+1. The commit being tagged is already **merged to `main`** (an ancestor of
+   `origin/main`) — never tag un-reviewed or un-merged code. Fetch first so the
+   check reads a current `origin/main`:
+   ```bash
+   git fetch origin
+   git merge-base --is-ancestor <commit> origin/main && echo "ancestor: ok"
+   ```
+2. CI was green on that commit (it ran as the `main` push build).
+3. The tag path matches the module directory (table above) and the version is a
+   clean, monotonic semver bump.
+
+Then tag and push, e.g.:
+```bash
+git tag exporter/agentauditexporter/v0.1.0 <commit>
+git push origin exporter/agentauditexporter/v0.1.0
+```
+
+> **Released tags are immutable.** Never move, delete, or re-push a released tag
+> — the module proxy and checksum database cache it permanently. To correct a
+> release, bump to the next version.
+
+### Deferred: automated release gating (`release.yml`)
+
+A token- and environment-scoped, SLSA-attested `release.yml` workflow does
+**not** exist yet, and is intentionally deferred. Its machinery only has
+something to protect once the project ships **built artifacts** (binary
+collector distros, container images, or OS packages). For tag-only Go-module
+releases there is no publish step or artifact for it to gate, so an
+environment-scoped publish token and SLSA provenance have no surface to apply to
+today.
+
+When binary/distro releases arrive, add `release.yml` to:
+1. Verify the tagged commit is an ancestor of `origin/main`, and refuse
+   otherwise.
 2. Require human approval via a GitHub deployment Environment with required
-   reviewers before publishing.
-3. Never publish code that has not been reviewed and merged to `main`.
-4. Keep the publish token (e.g. `GOMODULE_TOKEN`) as an *environment* secret
-   scoped to the release environment — not a repo-level secret accessible to
-   all jobs.
-5. Publish with SLSA provenance / GitHub artifact attestation where supported.
+   reviewers before publishing artifacts.
+3. Keep the publish token an *environment* secret scoped to that environment —
+   not a repo-level secret.
+4. Publish with SLSA provenance / GitHub artifact attestation where supported.
+
+`release.yml` is **not** a required PR status check, so the drift-guard
+(`Required checks in sync`) ignores it — adding it later does not touch the
+required-checks block.
 
 ## Branch-protection settings (apply in GitHub UI)
 
