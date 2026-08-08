@@ -1709,3 +1709,52 @@ func TestFsyncFailure_RollsBackLog(t *testing.T) {
 		t.Errorf("expected no verifier errors after rollback; got %v", report.Errors)
 	}
 }
+
+// TestEffectiveCheckpointInterval verifies that an unset interval falls back to
+// the documented default of 100, and that an explicit positive value overrides it.
+func TestEffectiveCheckpointInterval(t *testing.T) {
+	def := newAgentAuditExporter(&Config{}, nil)
+	if got := def.effectiveCheckpointInterval(); got != 100 {
+		t.Fatalf("default interval = %d, want 100", got)
+	}
+
+	set := newAgentAuditExporter(&Config{CheckpointInterval: 250}, nil)
+	if got := set.effectiveCheckpointInterval(); got != 250 {
+		t.Fatalf("configured interval = %d, want 250", got)
+	}
+}
+
+// TestReadLastCheckpoint exercises readLastCheckpoint's tolerance contract: an
+// absent file is not an error, blank and corrupt lines are skipped, and the last
+// valid checkpoint in the file wins.
+func TestReadLastCheckpoint(t *testing.T) {
+	dir := t.TempDir()
+
+	// Absent file: (found=false, err=nil).
+	if _, found, err := readLastCheckpoint(filepath.Join(dir, "nope.jsonl")); err != nil || found {
+		t.Fatalf("absent file: found=%v err=%v, want found=false err=nil", found, err)
+	}
+
+	// Blank line and corrupt line are skipped; the last valid checkpoint wins.
+	cp1, err := json.Marshal(chain.Checkpoint{CheckpointSeq: 1})
+	if err != nil {
+		t.Fatalf("marshal cp1: %v", err)
+	}
+	cp2, err := json.Marshal(chain.Checkpoint{CheckpointSeq: 2})
+	if err != nil {
+		t.Fatalf("marshal cp2: %v", err)
+	}
+	content := "\n" + string(cp1) + "\n{corrupt json\n" + string(cp2) + "\n"
+	path := filepath.Join(dir, "checkpoint.jsonl")
+	if err := os.WriteFile(path, []byte(content), 0o600); err != nil {
+		t.Fatalf("write checkpoint file: %v", err)
+	}
+
+	last, found, err := readLastCheckpoint(path)
+	if err != nil || !found {
+		t.Fatalf("valid file: found=%v err=%v, want found=true err=nil", found, err)
+	}
+	if last.CheckpointSeq != 2 {
+		t.Fatalf("last checkpoint seq = %d, want 2 (last valid line wins)", last.CheckpointSeq)
+	}
+}
