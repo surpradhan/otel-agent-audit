@@ -142,6 +142,30 @@ Status: OK
 
 ---
 
+## Add to an existing Collector
+
+Already building a custom Collector with the OpenTelemetry Collector Builder (OCB)?
+Add both components to your build manifest, no clone required:
+
+```yaml
+dist:
+  otelcol_version: 0.154.0   # 0.154.0 or newer; matches the components' Collector v1.60.0 pin
+
+processors:
+  - gomod: github.com/surpradhan/otel-agent-audit/processor/agentauditselect v0.1.0
+
+exporters:
+  - gomod: github.com/surpradhan/otel-agent-audit/exporter/agentauditexporter v0.1.0
+```
+
+Rebuild with `builder --config=<your-manifest>.yaml`, then wire the pipeline as
+shown in step 3 of the Quickstart above. Note the exporter's pipeline component
+type is `agentaudit` (not `agentauditexporter`) and the processor's is
+`agentauditselect`. Both modules are self-contained (no `replace` directives), so
+OCB resolves them straight from the Go module proxy.
+
+---
+
 ## Operational constraints (read before deploying)
 
 - **Single writer.** Run as **exactly one** Collector instance. Multiple writers
