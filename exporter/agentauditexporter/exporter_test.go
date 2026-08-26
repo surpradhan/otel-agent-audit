@@ -7,6 +7,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -1799,7 +1800,11 @@ func TestCheckpointWriteFailure_RetriesTipsAndKeepsChainContiguous(t *testing.T)
 	exp := startExporter(t, cfg)
 
 	// Make the next checkpoint write fail. Closing the file leaves e.checkFile
-	// non-nil, so writeCheckpoint runs its full path and fails on the write.
+	// non-nil, so writeCheckpoint still runs and fails — at the pre-write Seek,
+	// before any bytes are written. Nothing to roll back; the point here is that
+	// the tips survive an attempt that failed before it produced any output.
+	// TestCheckpointPartialWriteFailure_RollsBackAndRetriesTips covers the case
+	// where bytes DO reach the file.
 	exp.mu.Lock()
 	closeErr := exp.checkFile.Close()
 	exp.mu.Unlock()
@@ -1940,4 +1945,248 @@ func TestCheckpointSyncFailure_RollsBackAndRetriesTips(t *testing.T) {
 	if len(report.Errors) != 0 {
 		t.Errorf("expected no verifier errors; got %v", report.Errors)
 	}
+}
+
+// failWriteFile wraps a logSyncer and fails the first `count` Writes after
+// emitting a partial prefix of the payload, simulating a short write that hits
+// an IO error mid-line (ENOSPC, EIO). Seek/Truncate/Sync pass through, so the
+// rollback path runs for real. Not concurrency-safe: count is decremented
+// without a lock. Safe only for single-goroutine test use under e.mu.
+type failWriteFile struct {
+	logSyncer
+	writeErr error
+	count    int
+}
+
+func (f *failWriteFile) Write(p []byte) (int, error) {
+	if f.count > 0 {
+		f.count--
+		// Emit a partial line first so the rollback has something to truncate.
+		half := len(p) / 2
+		n, werr := f.logSyncer.Write(p[:half])
+		if werr != nil {
+			return n, werr
+		}
+		return n, f.writeErr
+	}
+	return f.logSyncer.Write(p)
+}
+
+// TestCheckpointPartialWriteFailure_RollsBackAndRetriesTips covers the branch
+// where the checkpoint write itself fails after partially writing the line. The
+// half-written line must be truncated away — a corrupt trailing line would be
+// skipped by readLastCheckpoint on restart, but it must not be left in a file
+// the verifier walks — and the tips must stay pending for the next checkpoint.
+//
+// This is the case TestCheckpointWriteFailure_RetriesTipsAndKeepsChainContiguous
+// does NOT reach: closing the file makes writeCheckpoint fail at the pre-write
+// Seek, before any bytes are produced.
+func TestCheckpointPartialWriteFailure_RollsBackAndRetriesTips(t *testing.T) {
+	env := newTestEnv(t)
+	cfg := env.cfg
+	cfg.CheckpointInterval = 1
+
+	exp := startExporter(t, cfg)
+
+	exp.mu.Lock()
+	exp.checkFile = &failWriteFile{
+		logSyncer: exp.checkFile,
+		writeErr:  fmt.Errorf("simulated ENOSPC"),
+		count:     1,
+	}
+	exp.mu.Unlock()
+
+	traceA := [16]byte{0xE1}
+	if err := exp.ConsumeTraces(context.Background(),
+		makeSpan(traceA, [8]byte{0x01}, zeroParentID, "op-a", 1_000_000, 2_000_000)); err != nil {
+		t.Fatalf("ConsumeTraces A: %v", err)
+	}
+
+	if got := exp.accumulator.PendingCount(); got != 1 {
+		t.Fatalf("pending tips after partial checkpoint write: got %d, want 1", got)
+	}
+	// The partial line must have been truncated away, leaving an empty file.
+	data, err := os.ReadFile(cfg.CheckpointPath)
+	if err != nil {
+		t.Fatalf("reading checkpoint: %v", err)
+	}
+	if len(data) != 0 {
+		t.Fatalf("expected checkpoint file truncated back to empty, got %d bytes: %q", len(data), data)
+	}
+
+	traceB := [16]byte{0xE2}
+	if err := exp.ConsumeTraces(context.Background(),
+		makeSpan(traceB, [8]byte{0x02}, zeroParentID, "op-b", 3_000_000, 4_000_000)); err != nil {
+		t.Fatalf("ConsumeTraces B: %v", err)
+	}
+	if err := exp.Shutdown(context.Background()); err != nil {
+		t.Fatalf("Shutdown: %v", err)
+	}
+
+	cps := readCheckpoints(t, cfg.CheckpointPath)
+	if len(cps) != 1 {
+		t.Fatalf("expected exactly 1 persisted checkpoint, got %d", len(cps))
+	}
+	if cps[0].CheckpointSeq != 1 {
+		t.Errorf("persisted checkpoint seq: got %d, want 1", cps[0].CheckpointSeq)
+	}
+	if cps[0].PrevCheckpointHash != chain.ZeroPrevCheckpointHash {
+		t.Errorf("persisted checkpoint prev_checkpoint_hash: got %s, want %s",
+			cps[0].PrevCheckpointHash, chain.ZeroPrevCheckpointHash)
+	}
+	if len(cps[0].TraceTips) != 2 {
+		t.Errorf("expected 2 trace tips in retried checkpoint, got %d", len(cps[0].TraceTips))
+	}
+
+	report, err := verify.VerifyLog(cfg.LogPath, cfg.CheckpointPath, env.pubKey)
+	if err != nil {
+		t.Fatalf("VerifyLog: %v", err)
+	}
+	if len(report.Errors) != 0 {
+		t.Errorf("expected no verifier errors; got %v", report.Errors)
+	}
+}
+
+// failTruncateFile wraps a logSyncer whose Truncate always fails, so the
+// rollback double-fault path can be exercised.
+type failTruncateFile struct {
+	logSyncer
+	truncErr error
+}
+
+func (f *failTruncateFile) Truncate(int64) error { return f.truncErr }
+
+// TestCheckpointRollbackFailure_PoisonsCheckpointFile verifies the double-fault
+// path: when the checkpoint write fails AND the rollback truncate also fails,
+// the file may retain a line the accumulator never committed to. Appending the
+// next checkpoint would reuse that seq and break prev_checkpoint_hash from there
+// on, so further checkpoint writes must be refused instead.
+func TestCheckpointRollbackFailure_PoisonsCheckpointFile(t *testing.T) {
+	env := newTestEnv(t)
+	cfg := env.cfg
+	cfg.CheckpointInterval = 1
+
+	exp := startExporter(t, cfg)
+
+	exp.mu.Lock()
+	exp.checkFile = &failTruncateFile{
+		logSyncer: &failSyncFile{
+			logSyncer: exp.checkFile,
+			syncErr:   fmt.Errorf("simulated EIO"),
+			count:     1,
+		},
+		truncErr: fmt.Errorf("simulated truncate EIO"),
+	}
+	exp.mu.Unlock()
+
+	traceA := [16]byte{0xF1}
+	if err := exp.ConsumeTraces(context.Background(),
+		makeSpan(traceA, [8]byte{0x01}, zeroParentID, "op-a", 1_000_000, 2_000_000)); err != nil {
+		t.Fatalf("ConsumeTraces A: %v", err)
+	}
+
+	exp.mu.Lock()
+	poisoned := exp.checkpointPoisoned
+	exp.mu.Unlock()
+	if !poisoned {
+		t.Fatal("expected checkpoint file to be marked poisoned after a failed rollback")
+	}
+
+	// Every later checkpoint write must be refused rather than appending a
+	// second line claiming the same seq.
+	exp.mu.Lock()
+	err := exp.writeCheckpoint()
+	exp.mu.Unlock()
+	if !errors.Is(err, errCheckpointPoisoned) {
+		t.Errorf("writeCheckpoint after poisoning: got %v, want errCheckpointPoisoned", err)
+	}
+
+	if err := exp.Shutdown(context.Background()); err != nil {
+		t.Fatalf("Shutdown: %v", err)
+	}
+
+	// The uncommitted line is still there (truncate failed), but nothing was
+	// appended after it, so there is exactly one checkpoint and it verifies.
+	cps := readCheckpoints(t, cfg.CheckpointPath)
+	if len(cps) != 1 {
+		t.Fatalf("expected the single uncommitted checkpoint and nothing appended, got %d", len(cps))
+	}
+	if cps[0].CheckpointSeq != 1 {
+		t.Errorf("checkpoint seq: got %d, want 1", cps[0].CheckpointSeq)
+	}
+	report, err := verify.VerifyLog(cfg.LogPath, cfg.CheckpointPath, env.pubKey)
+	if err != nil {
+		t.Fatalf("VerifyLog: %v", err)
+	}
+	if len(report.Errors) != 0 {
+		t.Errorf("what is persisted must still verify; got %v", report.Errors)
+	}
+}
+
+// TestCheckpointFailure_BacksOffInsteadOfRetryingEverySeal verifies the backoff
+// that keeps a persistently unwritable checkpoint file from re-signing an
+// ever-growing pending set on every sealed trace. With the file permanently
+// broken, attempts must thin out as the pending set grows rather than happening
+// once per seal.
+func TestCheckpointFailure_BacksOffInsteadOfRetryingEverySeal(t *testing.T) {
+	env := newTestEnv(t)
+	cfg := env.cfg
+	cfg.CheckpointInterval = 1
+
+	exp := startExporter(t, cfg)
+
+	// A permanently unwritable checkpoint file: every Sync fails, and the
+	// rollback truncate succeeds so the file stays clean (not poisoned).
+	counter := &countingSyncFile{logSyncer: exp.checkFile, syncErr: fmt.Errorf("simulated ENOSPC")}
+	exp.mu.Lock()
+	exp.checkFile = counter
+	exp.mu.Unlock()
+
+	const seals = 16
+	for i := 0; i < seals; i++ {
+		traceID := [16]byte{0x70, byte(i)}
+		if err := exp.ConsumeTraces(context.Background(),
+			makeSpan(traceID, [8]byte{byte(i + 1)}, zeroParentID, "op",
+				uint64(1_000_000*(i+1)), uint64(1_000_000*(i+2)))); err != nil {
+			t.Fatalf("ConsumeTraces %d: %v", i, err)
+		}
+	}
+
+	// No tips may be lost.
+	if got := exp.accumulator.PendingCount(); got != seals {
+		t.Errorf("pending tips after %d failed checkpoints: got %d, want %d", seals, got, seals)
+	}
+	// With doubling backoff, attempts happen at pending 1,2,4,8,16 — far fewer
+	// than one per seal.
+	if counter.attempts >= seals {
+		t.Errorf("expected checkpoint attempts to back off, got %d attempts over %d seals",
+			counter.attempts, seals)
+	}
+	if counter.attempts == 0 {
+		t.Error("expected at least one checkpoint attempt")
+	}
+
+	if err := exp.Shutdown(context.Background()); err != nil {
+		t.Fatalf("Shutdown: %v", err)
+	}
+}
+
+// countingSyncFile counts Sync calls that reach it as checkpoint attempts and
+// always fails the write-path Sync. The rollback's second Sync is allowed to
+// succeed so the file is left clean.
+type countingSyncFile struct {
+	logSyncer
+	syncErr    error
+	attempts   int
+	inRollback bool
+}
+
+func (f *countingSyncFile) Sync() error {
+	if f.inRollback {
+		f.inRollback = false
+		return f.logSyncer.Sync()
+	}
+	f.attempts++
+	f.inRollback = true
+	return f.syncErr
 }

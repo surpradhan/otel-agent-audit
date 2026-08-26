@@ -53,7 +53,11 @@ type Checkpoint struct {
 }
 
 // Accumulator collects sealed trace tips and produces signed checkpoints.
-// All methods are safe for concurrent use.
+//
+// Each method is individually safe for concurrent use, but Stage and Commit are
+// a pair that must be driven by a single caller: staging a second checkpoint
+// before the first is committed or dropped makes both claim the same sequence
+// number. See Stage.
 type Accumulator struct {
 	mu       sync.Mutex
 	signer   sign.Signer
@@ -126,9 +130,14 @@ type StagedCheckpoint struct {
 	// of this checkpoint's signing payload.
 	nextPrevHash string
 
-	// tipCount is how many pending tips this checkpoint covers. AddTip only
-	// appends, so the covered tips are exactly the pending prefix [:tipCount]
-	// and any tip added after staging survives Commit.
+	// tipCount is how many pending tips this checkpoint covers. Stage always
+	// covers every tip pending at stage time, so tipCount == len(pending) then;
+	// AddTip only appends, so at Commit time the covered tips are still exactly
+	// the prefix pending[:tipCount] and anything added since survives.
+	//
+	// Note that Checkpoint.TraceTips is sorted by trace_id and is therefore NOT
+	// index-aligned with the accumulator's pending slice — never match tips
+	// between the two by index.
 	tipCount int
 }
 
@@ -196,24 +205,36 @@ func (a *Accumulator) stageLocked(ts time.Time) (StagedCheckpoint, error) {
 // Commit applies st's state advance: it adopts st's sequence number and
 // prev-hash and drops the tips st covers. Call it only after st.Checkpoint has
 // been durably persisted.
-func (a *Accumulator) Commit(st StagedCheckpoint) {
+//
+// Commit returns an error and changes nothing if st does not directly succeed
+// the accumulator's current state — a zero-value StagedCheckpoint, a second
+// Commit of the same value, or one staged before an intervening Commit. Chain
+// state is load-bearing, so a mis-paired Commit is reported rather than
+// silently rewinding seq or discarding tips that no checkpoint covered.
+func (a *Accumulator) Commit(st StagedCheckpoint) error {
 	a.mu.Lock()
 	defer a.mu.Unlock()
-	a.commitLocked(st)
+	return a.commitLocked(st)
 }
 
 // commitLocked is Commit's body; callers must hold a.mu.
-func (a *Accumulator) commitLocked(st StagedCheckpoint) {
+func (a *Accumulator) commitLocked(st StagedCheckpoint) error {
+	if st.nextPrevHash == "" || st.Checkpoint.CheckpointSeq != a.seq+1 {
+		return fmt.Errorf(
+			"checkpoint: commit of a checkpoint that does not succeed seq %d (got seq %d): stale, duplicate, or zero-value staged checkpoint",
+			a.seq, st.Checkpoint.CheckpointSeq)
+	}
 	a.seq = st.Checkpoint.CheckpointSeq
 	a.prevHash = st.nextPrevHash
 	if st.tipCount >= len(a.pending) {
 		a.pending = nil
-		return
+		return nil
 	}
 	// Tips added after staging were not covered by st; keep them pending.
 	rest := make([]TraceTip, len(a.pending)-st.tipCount)
 	copy(rest, a.pending[st.tipCount:])
 	a.pending = rest
+	return nil
 }
 
 // Build creates and signs a checkpoint from all pending tips, advancing seq +
@@ -232,6 +253,10 @@ func (a *Accumulator) Build(ts time.Time) (Checkpoint, error) {
 	if err != nil {
 		return Checkpoint{}, err
 	}
-	a.commitLocked(st)
+	if err := a.commitLocked(st); err != nil {
+		// Unreachable: stageLocked always produces the direct successor of the
+		// current state, and a.mu is held across both halves.
+		return Checkpoint{}, err
+	}
 	return st.Checkpoint, nil
 }

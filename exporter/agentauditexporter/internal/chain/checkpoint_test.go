@@ -6,6 +6,7 @@ import (
 	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"os"
 	"strings"
 	"testing"
@@ -321,7 +322,9 @@ func TestAccumulator_StageDoesNotMutateUntilCommit(t *testing.T) {
 		t.Errorf("re-staged tips: got %d, want 1", len(restaged.Checkpoint.TraceTips))
 	}
 
-	acc.Commit(restaged)
+	if err := acc.Commit(restaged); err != nil {
+		t.Fatalf("Commit: %v", err)
+	}
 	if got := acc.PendingCount(); got != 0 {
 		t.Errorf("PendingCount after Commit: got %d, want 0", got)
 	}
@@ -351,7 +354,9 @@ func TestAccumulator_CommitKeepsTipsAddedAfterStage(t *testing.T) {
 		t.Fatalf("Stage: %v", err)
 	}
 	acc.AddTip("trace002", "hash002", 3)
-	acc.Commit(staged)
+	if err := acc.Commit(staged); err != nil {
+		t.Fatalf("Commit: %v", err)
+	}
 
 	if got := acc.PendingCount(); got != 1 {
 		t.Fatalf("PendingCount after Commit: got %d, want 1", got)
@@ -362,5 +367,92 @@ func TestAccumulator_CommitKeepsTipsAddedAfterStage(t *testing.T) {
 	}
 	if len(next.Checkpoint.TraceTips) != 1 || next.Checkpoint.TraceTips[0].TraceID != "trace002" {
 		t.Errorf("next checkpoint tips: got %+v, want only trace002", next.Checkpoint.TraceTips)
+	}
+}
+
+// errSigner fails every Sign call. KeyID still works so Stage reaches signing.
+type errSigner struct{ err error }
+
+func (s errSigner) Sign([]byte) ([]byte, error) { return nil, s.err }
+func (s errSigner) KeyID() string               { return "err-signer" }
+
+// TestAccumulator_SigningFailureDoesNotAdvanceSeq pins the guarantee that a
+// failed Stage/Build leaves the accumulator untouched: the sequence number is
+// not burned, so the next successful checkpoint is still seq 1 chained off the
+// zero prev-hash. The pre-Stage implementation incremented seq before signing
+// and lost this.
+func TestAccumulator_SigningFailureDoesNotAdvanceSeq(t *testing.T) {
+	failing := errSigner{err: errors.New("simulated HSM failure")}
+	acc := chain.NewAccumulator(failing, 0, chain.ZeroPrevCheckpointHash)
+	acc.AddTip("trace001", "hash001", 1)
+
+	if _, err := acc.Stage(time.Now()); err == nil {
+		t.Fatal("expected Stage to fail with a failing signer")
+	}
+	if _, err := acc.Build(time.Now()); err == nil {
+		t.Fatal("expected Build to fail with a failing signer")
+	}
+	// Tips must survive a signing failure too.
+	if got := acc.PendingCount(); got != 1 {
+		t.Errorf("PendingCount after signing failures: got %d, want 1", got)
+	}
+
+	// A working signer must still produce seq 1 off the zero prev-hash.
+	signer, _ := makeTestSignerFull(t)
+	acc2 := chain.NewAccumulator(signer, 0, chain.ZeroPrevCheckpointHash)
+	acc2.AddTip("trace001", "hash001", 1)
+	cp, err := acc2.Build(time.Now())
+	if err != nil {
+		t.Fatalf("Build with working signer: %v", err)
+	}
+	if cp.CheckpointSeq != 1 {
+		t.Errorf("first checkpoint seq: got %d, want 1", cp.CheckpointSeq)
+	}
+}
+
+// TestAccumulator_CommitRejectsMisPairedStage verifies Commit refuses a staged
+// checkpoint that does not directly succeed the current state, rather than
+// silently rewinding seq or dropping tips no checkpoint covers. The chain state
+// is load-bearing, so mis-pairing must be loud.
+func TestAccumulator_CommitRejectsMisPairedStage(t *testing.T) {
+	signer, _ := makeTestSignerFull(t)
+	acc := chain.NewAccumulator(signer, 0, chain.ZeroPrevCheckpointHash)
+	acc.AddTip("trace001", "hash001", 1)
+
+	// Zero value: must not rewind seq to 0 or blank the prev-hash.
+	if err := acc.Commit(chain.StagedCheckpoint{}); err == nil {
+		t.Error("expected Commit of a zero-value StagedCheckpoint to fail")
+	}
+	if got := acc.PendingCount(); got != 1 {
+		t.Errorf("PendingCount after rejected zero-value Commit: got %d, want 1", got)
+	}
+
+	staged, err := acc.Stage(time.Now())
+	if err != nil {
+		t.Fatalf("Stage: %v", err)
+	}
+	if err := acc.Commit(staged); err != nil {
+		t.Fatalf("first Commit: %v", err)
+	}
+
+	// Double-commit of the same staged checkpoint must be refused.
+	acc.AddTip("trace002", "hash002", 2)
+	if err := acc.Commit(staged); err == nil {
+		t.Error("expected a duplicate Commit to fail")
+	}
+	if got := acc.PendingCount(); got != 1 {
+		t.Errorf("PendingCount after rejected duplicate Commit: got %d, want 1", got)
+	}
+
+	// State must still be intact: next checkpoint is seq 2 covering trace002.
+	next, err := acc.Stage(time.Now())
+	if err != nil {
+		t.Fatalf("Stage after rejected commits: %v", err)
+	}
+	if next.Checkpoint.CheckpointSeq != 2 {
+		t.Errorf("next seq: got %d, want 2", next.Checkpoint.CheckpointSeq)
+	}
+	if len(next.Checkpoint.TraceTips) != 1 || next.Checkpoint.TraceTips[0].TraceID != "trace002" {
+		t.Errorf("next tips: got %+v, want only trace002", next.Checkpoint.TraceTips)
 	}
 }

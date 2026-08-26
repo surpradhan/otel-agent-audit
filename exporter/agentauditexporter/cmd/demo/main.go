@@ -151,17 +151,36 @@ func run() error {
 	checkpointPath := filepath.Join(dir, "checkpoint.jsonl")
 	acc := chain.NewAccumulator(signer, 0, chain.ZeroPrevCheckpointHash)
 	acc.AddTip(traceID, chain.TipHash(entries), len(entries))
-	cp, err := acc.Build(time.Now())
+	// Stage -> persist -> Commit: the accumulator's state only advances once the
+	// checkpoint is durably on disk. The demo writes a single checkpoint and then
+	// discards the accumulator, so Build would work here too, but this is the
+	// pattern exporters must follow and the demo is exemplar code.
+	staged, err := acc.Stage(time.Now())
 	if err != nil {
-		return fmt.Errorf("build checkpoint: %w", err)
+		return fmt.Errorf("stage checkpoint: %w", err)
 	}
 	cf, err := os.Create(checkpointPath)
 	if err != nil {
 		return fmt.Errorf("create checkpoint: %w", err)
 	}
-	cpLine, _ := json.Marshal(cp)
-	_, _ = cf.Write(append(cpLine, '\n'))
-	_ = cf.Close()
+	cpLine, err := json.Marshal(staged.Checkpoint)
+	if err != nil {
+		return fmt.Errorf("marshal checkpoint: %w", err)
+	}
+	if _, err := cf.Write(append(cpLine, '\n')); err != nil {
+		_ = cf.Close()
+		return fmt.Errorf("write checkpoint: %w", err)
+	}
+	if err := cf.Sync(); err != nil {
+		_ = cf.Close()
+		return fmt.Errorf("sync checkpoint: %w", err)
+	}
+	if err := cf.Close(); err != nil {
+		return fmt.Errorf("close checkpoint: %w", err)
+	}
+	if err := acc.Commit(staged); err != nil {
+		return fmt.Errorf("commit checkpoint: %w", err)
+	}
 	fmt.Printf("Wrote %s\n\n", checkpointPath)
 
 	// Step 4: verify.
