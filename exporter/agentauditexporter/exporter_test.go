@@ -1758,3 +1758,186 @@ func TestReadLastCheckpoint(t *testing.T) {
 		t.Fatalf("last checkpoint seq = %d, want 2 (last valid line wins)", last.CheckpointSeq)
 	}
 }
+
+// readCheckpoints reads all JSONL lines from a checkpoint file and returns
+// them in file order.
+func readCheckpoints(t *testing.T, path string) []chain.Checkpoint {
+	t.Helper()
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("reading checkpoint %q: %v", path, err)
+	}
+	var cps []chain.Checkpoint
+	sc := bufio.NewScanner(bytes.NewReader(data))
+	for sc.Scan() {
+		line := bytes.TrimSpace(sc.Bytes())
+		if len(line) == 0 {
+			continue
+		}
+		var cp chain.Checkpoint
+		if err := json.Unmarshal(line, &cp); err != nil {
+			t.Fatalf("unmarshal checkpoint: %v\nline: %s", err, line)
+		}
+		cps = append(cps, cp)
+	}
+	return cps
+}
+
+// TestCheckpointWriteFailure_RetriesTipsAndKeepsChainContiguous verifies that a
+// checkpoint whose durable write fails does not consume the pending tips and
+// does not advance the chain state. Before this fix, writeCheckpoint called
+// Accumulator.Build() first — which advanced seq, advanced prevHash and cleared
+// the pending tip set — and only then attempted the write. An ordinary IO error
+// therefore (a) permanently lost the sealed traces in that batch, and (b) left
+// the next successful checkpoint with a seq gap and a prev_checkpoint_hash
+// pointing at a checkpoint that was never persisted, breaking the chain.
+func TestCheckpointWriteFailure_RetriesTipsAndKeepsChainContiguous(t *testing.T) {
+	env := newTestEnv(t)
+	cfg := env.cfg
+	cfg.CheckpointInterval = 1 // checkpoint on every sealed trace
+
+	exp := startExporter(t, cfg)
+
+	// Make the next checkpoint write fail. Closing the file leaves e.checkFile
+	// non-nil, so writeCheckpoint runs its full path and fails on the write.
+	exp.mu.Lock()
+	closeErr := exp.checkFile.Close()
+	exp.mu.Unlock()
+	if closeErr != nil {
+		t.Fatalf("closing checkpoint file: %v", closeErr)
+	}
+
+	traceA := [16]byte{0xA1}
+	if err := exp.ConsumeTraces(context.Background(),
+		makeSpan(traceA, [8]byte{0x01}, zeroParentID, "op-a", 1_000_000, 2_000_000)); err != nil {
+		t.Fatalf("ConsumeTraces A: %v", err)
+	}
+
+	// The tip must still be pending: no checkpoint durably committed to it.
+	if got := exp.accumulator.PendingCount(); got != 1 {
+		t.Fatalf("pending tips after failed checkpoint write: got %d, want 1", got)
+	}
+
+	// Restore a working checkpoint file and seal a second trace.
+	f, err := os.OpenFile(cfg.CheckpointPath, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0600)
+	if err != nil {
+		t.Fatalf("reopening checkpoint file: %v", err)
+	}
+	exp.mu.Lock()
+	exp.checkFile = f
+	exp.mu.Unlock()
+
+	traceB := [16]byte{0xB2}
+	if err := exp.ConsumeTraces(context.Background(),
+		makeSpan(traceB, [8]byte{0x02}, zeroParentID, "op-b", 3_000_000, 4_000_000)); err != nil {
+		t.Fatalf("ConsumeTraces B: %v", err)
+	}
+
+	if err := exp.Shutdown(context.Background()); err != nil {
+		t.Fatalf("Shutdown: %v", err)
+	}
+
+	cps := readCheckpoints(t, cfg.CheckpointPath)
+	if len(cps) != 1 {
+		t.Fatalf("expected exactly 1 persisted checkpoint, got %d", len(cps))
+	}
+	cp := cps[0]
+
+	// The persisted chain must start at seq 1 off the zero prev-hash: the failed
+	// attempt must not have burned a sequence number or a prev-hash link.
+	if cp.CheckpointSeq != 1 {
+		t.Errorf("persisted checkpoint seq: got %d, want 1", cp.CheckpointSeq)
+	}
+	if cp.PrevCheckpointHash != chain.ZeroPrevCheckpointHash {
+		t.Errorf("persisted checkpoint prev_checkpoint_hash:\n  got  %s\n  want %s",
+			cp.PrevCheckpointHash, chain.ZeroPrevCheckpointHash)
+	}
+
+	// Both traces must be covered — trace A's tip was retried, not dropped.
+	covered := make(map[string]bool, len(cp.TraceTips))
+	for _, tip := range cp.TraceTips {
+		covered[tip.TraceID] = true
+	}
+	for _, want := range []string{hex.EncodeToString(traceA[:]), hex.EncodeToString(traceB[:])} {
+		if !covered[want] {
+			t.Errorf("trace %s not covered by any checkpoint (tips lost)", want)
+		}
+	}
+
+	report, err := verify.VerifyLog(cfg.LogPath, cfg.CheckpointPath, env.pubKey)
+	if err != nil {
+		t.Fatalf("VerifyLog: %v", err)
+	}
+	if len(report.Errors) != 0 {
+		t.Errorf("expected no verifier errors; got %v", report.Errors)
+	}
+}
+
+// TestCheckpointSyncFailure_RollsBackAndRetriesTips covers the other half of the
+// durable-commit contract: the checkpoint line is written but Sync fails. The
+// file must be truncated back to its pre-write size (an unsynced line must not
+// survive as a checkpoint the accumulator never committed to) and the tips must
+// still be pending so the next checkpoint carries them.
+func TestCheckpointSyncFailure_RollsBackAndRetriesTips(t *testing.T) {
+	env := newTestEnv(t)
+	cfg := env.cfg
+	cfg.CheckpointInterval = 1
+
+	exp := startExporter(t, cfg)
+
+	exp.mu.Lock()
+	exp.checkFile = &failSyncFile{
+		logSyncer: exp.checkFile,
+		syncErr:   fmt.Errorf("simulated EIO"),
+		count:     1,
+	}
+	exp.mu.Unlock()
+
+	traceA := [16]byte{0xC1}
+	if err := exp.ConsumeTraces(context.Background(),
+		makeSpan(traceA, [8]byte{0x01}, zeroParentID, "op-a", 1_000_000, 2_000_000)); err != nil {
+		t.Fatalf("ConsumeTraces A: %v", err)
+	}
+
+	if got := exp.accumulator.PendingCount(); got != 1 {
+		t.Fatalf("pending tips after failed checkpoint sync: got %d, want 1", got)
+	}
+	// The unsynced line must have been truncated away.
+	if cps := readCheckpoints(t, cfg.CheckpointPath); len(cps) != 0 {
+		t.Fatalf("expected checkpoint file rolled back to empty, got %d checkpoint(s)", len(cps))
+	}
+
+	// failSyncFile passes Sync through from here on; seal a second trace.
+	traceB := [16]byte{0xD2}
+	if err := exp.ConsumeTraces(context.Background(),
+		makeSpan(traceB, [8]byte{0x02}, zeroParentID, "op-b", 3_000_000, 4_000_000)); err != nil {
+		t.Fatalf("ConsumeTraces B: %v", err)
+	}
+
+	if err := exp.Shutdown(context.Background()); err != nil {
+		t.Fatalf("Shutdown: %v", err)
+	}
+
+	cps := readCheckpoints(t, cfg.CheckpointPath)
+	if len(cps) != 1 {
+		t.Fatalf("expected exactly 1 persisted checkpoint, got %d", len(cps))
+	}
+	if cps[0].CheckpointSeq != 1 {
+		t.Errorf("persisted checkpoint seq: got %d, want 1", cps[0].CheckpointSeq)
+	}
+	if cps[0].PrevCheckpointHash != chain.ZeroPrevCheckpointHash {
+		t.Errorf("persisted checkpoint prev_checkpoint_hash: got %s, want %s",
+			cps[0].PrevCheckpointHash, chain.ZeroPrevCheckpointHash)
+	}
+	if len(cps[0].TraceTips) != 2 {
+		t.Errorf("expected 2 trace tips in retried checkpoint, got %d", len(cps[0].TraceTips))
+	}
+
+	report, err := verify.VerifyLog(cfg.LogPath, cfg.CheckpointPath, env.pubKey)
+	if err != nil {
+		t.Fatalf("VerifyLog: %v", err)
+	}
+	if len(report.Errors) != 0 {
+		t.Errorf("expected no verifier errors; got %v", report.Errors)
+	}
+}

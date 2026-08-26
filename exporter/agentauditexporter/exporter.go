@@ -53,7 +53,8 @@ type traceBuffer struct {
 	hasRoot  bool
 }
 
-// logSyncer is the subset of *os.File behaviour used by the exporter's write path.
+// logSyncer is the subset of *os.File behaviour used by the exporter's append-
+// and-rollback write path, for both the audit log and the checkpoint file.
 // The interface exists so tests can inject a fake that simulates sync failures.
 type logSyncer interface {
 	io.Writer
@@ -64,14 +65,14 @@ type logSyncer interface {
 }
 
 type agentAuditExporter struct {
-	cfg          *Config
-	logger       *zap.Logger
-	signer       sign.Signer
-	logFile      logSyncer
-	checkFile    *os.File
-	wal          *wal.WAL
-	accumulator  *chain.Accumulator
-	buffers      map[string]*traceBuffer // guarded by mu
+	cfg         *Config
+	logger      *zap.Logger
+	signer      sign.Signer
+	logFile     logSyncer
+	checkFile   logSyncer
+	wal         *wal.WAL
+	accumulator *chain.Accumulator
+	buffers     map[string]*traceBuffer // guarded by mu
 	// sealedTraces prevents re-sealing a trace in the window between seal and the
 	// next WAL.Compact. Cleared after each successful Compact so it does not grow
 	// without bound. After eviction, a re-delivered root span for a compacted
@@ -595,23 +596,60 @@ func readLastCheckpoint(path string) (chain.Checkpoint, bool, error) {
 
 // writeCheckpoint builds and writes a checkpoint to the checkpoint file.
 // Called under e.mu.
+//
+// The accumulator's state advance (seq, prevHash, clearing the pending tips) is
+// committed only after the checkpoint is durably on disk. If the write or Sync
+// fails, the file is truncated back to its pre-write size and the accumulator is
+// left untouched, so the pending tips are retried by the next checkpoint and the
+// persisted chain stays contiguous — an ordinary IO error must not drop sealed
+// traces or leave a prev_checkpoint_hash pointing at a checkpoint that was never
+// persisted.
 func (e *agentAuditExporter) writeCheckpoint() error {
 	if e.checkFile == nil {
 		return fmt.Errorf("agentaudit: checkFile is nil")
 	}
-	cp, err := e.accumulator.Build(time.Now())
+	staged, err := e.accumulator.Stage(time.Now())
 	if err != nil {
 		return fmt.Errorf("agentaudit: build checkpoint: %w", err)
 	}
-	line, err := json.Marshal(cp)
+	line, err := json.Marshal(staged.Checkpoint)
 	if err != nil {
 		return fmt.Errorf("agentaudit: marshal checkpoint: %w", err)
 	}
+
+	// Snapshot the end offset so a partial write or a failed Sync can be rolled
+	// back, leaving the file byte-identical to before the attempt.
+	preWritePos, err := e.checkFile.Seek(0, io.SeekEnd)
+	if err != nil {
+		return fmt.Errorf("agentaudit: get checkpoint offset before write: %w", err)
+	}
+
 	if _, err := fmt.Fprintf(e.checkFile, "%s\n", line); err != nil {
+		e.rollbackCheckpoint(preWritePos, err)
 		return fmt.Errorf("agentaudit: write checkpoint: %w", err)
 	}
 	if err := e.checkFile.Sync(); err != nil {
+		e.rollbackCheckpoint(preWritePos, err)
 		return fmt.Errorf("agentaudit: sync checkpoint: %w", err)
 	}
+
+	// Durable: only now advance seq/prevHash and drop the tips this checkpoint
+	// covers.
+	e.accumulator.Commit(staged)
 	return nil
+}
+
+// rollbackCheckpoint truncates the checkpoint file back to preWritePos and
+// fsyncs the truncation, so a crash cannot resurrect a checkpoint line the
+// accumulator never committed to. Called under e.mu.
+func (e *agentAuditExporter) rollbackCheckpoint(preWritePos int64, cause error) {
+	if terr := e.checkFile.Truncate(preWritePos); terr != nil {
+		e.logger.Error("agentaudit: rollback checkpoint truncate failed — checkpoint file may contain an uncommitted checkpoint",
+			zap.Error(terr), zap.NamedError("cause", cause))
+		return
+	}
+	if serr := e.checkFile.Sync(); serr != nil {
+		e.logger.Error("agentaudit: rollback checkpoint sync failed — checkpoint file may contain an uncommitted checkpoint",
+			zap.Error(serr), zap.NamedError("cause", cause))
+	}
 }

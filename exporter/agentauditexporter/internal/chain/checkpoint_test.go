@@ -285,3 +285,82 @@ func TestCheckpointSigningPayloadFixture_V2(t *testing.T) {
 		t.Errorf("v2 checkpoint payload diverges from golden fixture.\ngot:  %s\nwant: %s", got, want)
 	}
 }
+
+// TestAccumulator_StageDoesNotMutateUntilCommit verifies that Stage leaves seq,
+// prevHash and the pending set untouched, so a caller whose durable write fails
+// can drop the staged checkpoint and have the next Stage produce the same
+// sequence number, the same prev-hash and the same tips.
+func TestAccumulator_StageDoesNotMutateUntilCommit(t *testing.T) {
+	signer, _ := makeTestSignerFull(t)
+	acc := chain.NewAccumulator(signer, 0, chain.ZeroPrevCheckpointHash)
+	acc.AddTip("trace001", "hash001", 1)
+
+	ts := time.Date(2026, 6, 22, 0, 0, 0, 0, time.UTC)
+	staged, err := acc.Stage(ts)
+	if err != nil {
+		t.Fatalf("Stage 1: %v", err)
+	}
+	if got := acc.PendingCount(); got != 1 {
+		t.Errorf("PendingCount after Stage: got %d, want 1", got)
+	}
+
+	// Drop the staged checkpoint (simulating a failed write) and re-stage.
+	restaged, err := acc.Stage(ts)
+	if err != nil {
+		t.Fatalf("Stage 2: %v", err)
+	}
+	if restaged.Checkpoint.CheckpointSeq != staged.Checkpoint.CheckpointSeq {
+		t.Errorf("re-staged seq: got %d, want %d",
+			restaged.Checkpoint.CheckpointSeq, staged.Checkpoint.CheckpointSeq)
+	}
+	if restaged.Checkpoint.PrevCheckpointHash != chain.ZeroPrevCheckpointHash {
+		t.Errorf("re-staged prev_checkpoint_hash: got %s, want %s",
+			restaged.Checkpoint.PrevCheckpointHash, chain.ZeroPrevCheckpointHash)
+	}
+	if len(restaged.Checkpoint.TraceTips) != 1 {
+		t.Errorf("re-staged tips: got %d, want 1", len(restaged.Checkpoint.TraceTips))
+	}
+
+	acc.Commit(restaged)
+	if got := acc.PendingCount(); got != 0 {
+		t.Errorf("PendingCount after Commit: got %d, want 0", got)
+	}
+
+	next, err := acc.Stage(ts)
+	if err != nil {
+		t.Fatalf("Stage 3: %v", err)
+	}
+	if next.Checkpoint.CheckpointSeq != 2 {
+		t.Errorf("seq after Commit: got %d, want 2", next.Checkpoint.CheckpointSeq)
+	}
+	if next.Checkpoint.PrevCheckpointHash == chain.ZeroPrevCheckpointHash {
+		t.Error("prev_checkpoint_hash did not advance after Commit")
+	}
+}
+
+// TestAccumulator_CommitKeepsTipsAddedAfterStage verifies Commit only drops the
+// tips its checkpoint actually covers: a tip added between Stage and Commit
+// stays pending for the next checkpoint rather than being silently discarded.
+func TestAccumulator_CommitKeepsTipsAddedAfterStage(t *testing.T) {
+	signer, _ := makeTestSignerFull(t)
+	acc := chain.NewAccumulator(signer, 0, chain.ZeroPrevCheckpointHash)
+	acc.AddTip("trace001", "hash001", 1)
+
+	staged, err := acc.Stage(time.Now())
+	if err != nil {
+		t.Fatalf("Stage: %v", err)
+	}
+	acc.AddTip("trace002", "hash002", 3)
+	acc.Commit(staged)
+
+	if got := acc.PendingCount(); got != 1 {
+		t.Fatalf("PendingCount after Commit: got %d, want 1", got)
+	}
+	next, err := acc.Stage(time.Now())
+	if err != nil {
+		t.Fatalf("Stage 2: %v", err)
+	}
+	if len(next.Checkpoint.TraceTips) != 1 || next.Checkpoint.TraceTips[0].TraceID != "trace002" {
+		t.Errorf("next checkpoint tips: got %+v, want only trace002", next.Checkpoint.TraceTips)
+	}
+}

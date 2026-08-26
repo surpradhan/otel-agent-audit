@@ -112,15 +112,41 @@ func CheckpointSigningPayload(cp Checkpoint) ([]byte, error) {
 	return b, nil
 }
 
-// Build creates and signs a checkpoint from all pending tips.
-// trace_tips are sorted by trace_id before signing to ensure deterministic
-// checkpointForSigning bytes across implementations.
-// Resets the pending set and advances seq + prevHash.
-func (a *Accumulator) Build(ts time.Time) (Checkpoint, error) {
+// StagedCheckpoint is a signed checkpoint whose state advance has not yet been
+// applied to the Accumulator. The caller must durably persist Checkpoint and
+// only then call Commit. If persisting fails, the caller simply drops the
+// StagedCheckpoint: the accumulator is untouched, so the tips are retried by
+// the next checkpoint and no sequence number or prev-hash link is burned on a
+// checkpoint that never reached disk.
+type StagedCheckpoint struct {
+	// Checkpoint is the signed checkpoint to persist.
+	Checkpoint Checkpoint
+
+	// nextPrevHash is the prevHash the accumulator adopts on Commit: the SHA256
+	// of this checkpoint's signing payload.
+	nextPrevHash string
+
+	// tipCount is how many pending tips this checkpoint covers. AddTip only
+	// appends, so the covered tips are exactly the pending prefix [:tipCount]
+	// and any tip added after staging survives Commit.
+	tipCount int
+}
+
+// Stage creates and signs a checkpoint from all pending tips WITHOUT mutating
+// accumulator state. trace_tips are sorted by trace_id before signing to ensure
+// deterministic checkpointForSigning bytes across implementations.
+//
+// Stage and Commit must be paired by a single caller: do not stage a second
+// checkpoint before the first has been committed or dropped, or the two will
+// claim the same sequence number.
+func (a *Accumulator) Stage(ts time.Time) (StagedCheckpoint, error) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
+	return a.stageLocked(ts)
+}
 
-	a.seq++
+// stageLocked is Stage's body; callers must hold a.mu.
+func (a *Accumulator) stageLocked(ts time.Time) (StagedCheckpoint, error) {
 	tips := make([]TraceTip, len(a.pending))
 	copy(tips, a.pending)
 
@@ -131,7 +157,7 @@ func (a *Accumulator) Build(ts time.Time) (Checkpoint, error) {
 
 	cfs := checkpointForSigning{
 		SchemaVersion:      record.SchemaVersion,
-		CheckpointSeq:      a.seq,
+		CheckpointSeq:      a.seq + 1,
 		Timestamp:          ts.UTC().Format(time.RFC3339),
 		PrevCheckpointHash: a.prevHash,
 		TraceTips:          tips,
@@ -141,27 +167,71 @@ func (a *Accumulator) Build(ts time.Time) (Checkpoint, error) {
 
 	payload, err := json.Marshal(cfs)
 	if err != nil {
-		return Checkpoint{}, fmt.Errorf("checkpoint: marshal for signing: %w", err)
+		return StagedCheckpoint{}, fmt.Errorf("checkpoint: marshal for signing: %w", err)
 	}
 
 	sig, err := a.signer.Sign(payload)
 	if err != nil {
-		return Checkpoint{}, fmt.Errorf("checkpoint: signing: %w", err)
+		return StagedCheckpoint{}, fmt.Errorf("checkpoint: signing: %w", err)
 	}
 
-	// Advance prevHash to SHA256 of this checkpoint's signing payload.
 	h := sha256.Sum256(payload)
-	a.prevHash = hex.EncodeToString(h[:])
-	a.pending = nil
 
-	return Checkpoint{
-		SchemaVersion:      cfs.SchemaVersion,
-		CheckpointSeq:      cfs.CheckpointSeq,
-		Timestamp:          cfs.Timestamp,
-		PrevCheckpointHash: cfs.PrevCheckpointHash,
-		TraceTips:          tips,
-		KeyID:              cfs.KeyID,
-		Algorithm:          cfs.Algorithm,
-		Signature:          base64.StdEncoding.EncodeToString(sig),
+	return StagedCheckpoint{
+		Checkpoint: Checkpoint{
+			SchemaVersion:      cfs.SchemaVersion,
+			CheckpointSeq:      cfs.CheckpointSeq,
+			Timestamp:          cfs.Timestamp,
+			PrevCheckpointHash: cfs.PrevCheckpointHash,
+			TraceTips:          tips,
+			KeyID:              cfs.KeyID,
+			Algorithm:          cfs.Algorithm,
+			Signature:          base64.StdEncoding.EncodeToString(sig),
+		},
+		nextPrevHash: hex.EncodeToString(h[:]),
+		tipCount:     len(tips),
 	}, nil
+}
+
+// Commit applies st's state advance: it adopts st's sequence number and
+// prev-hash and drops the tips st covers. Call it only after st.Checkpoint has
+// been durably persisted.
+func (a *Accumulator) Commit(st StagedCheckpoint) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	a.commitLocked(st)
+}
+
+// commitLocked is Commit's body; callers must hold a.mu.
+func (a *Accumulator) commitLocked(st StagedCheckpoint) {
+	a.seq = st.Checkpoint.CheckpointSeq
+	a.prevHash = st.nextPrevHash
+	if st.tipCount >= len(a.pending) {
+		a.pending = nil
+		return
+	}
+	// Tips added after staging were not covered by st; keep them pending.
+	rest := make([]TraceTip, len(a.pending)-st.tipCount)
+	copy(rest, a.pending[st.tipCount:])
+	a.pending = rest
+}
+
+// Build creates and signs a checkpoint from all pending tips, advancing seq +
+// prevHash and resetting the pending set immediately.
+//
+// Build is only appropriate when the checkpoint does not need to survive a
+// crash — demos and tests. Callers that persist the checkpoint must use
+// Stage + Commit so the state advance happens only after a successful durable
+// write; otherwise an IO error silently drops the pending tips and leaves the
+// persisted chain with a sequence gap and a dangling prev_checkpoint_hash.
+func (a *Accumulator) Build(ts time.Time) (Checkpoint, error) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+
+	st, err := a.stageLocked(ts)
+	if err != nil {
+		return Checkpoint{}, err
+	}
+	a.commitLocked(st)
+	return st.Checkpoint, nil
 }
