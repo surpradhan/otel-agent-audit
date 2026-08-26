@@ -801,10 +801,13 @@ func (e *agentAuditExporter) poisonCheckpoint(msg string, err, cause error) {
 	// traces sealed *after* poisoning would under-report by a whole checkpoint
 	// interval, and would report the least alarming number in the worst case.
 	//
-	// The one exception is the commit-failure path, where the checkpoint did
-	// reach disk and does cover its staged tips; that path is unreachable while
-	// e.mu serializes stage->commit, and over-reporting there is the safe
-	// direction anyway.
+	// Two paths can over-report, both deliberately. On the failed-truncate path
+	// the staged line did reach the file, so a verifier reading it will consider
+	// those traces covered; they are still counted as uncovered here because the
+	// write was never fsynced and its durability is therefore unknown. On the
+	// commit-failure path the checkpoint is durable and does cover its staged
+	// tips, but that path is unreachable while e.mu serializes stage->commit.
+	// Over-reporting is the safe direction for an audit component.
 	e.uncoveredAfterPoison += dropped
 	fields := []zap.Field{
 		zap.Error(err),
