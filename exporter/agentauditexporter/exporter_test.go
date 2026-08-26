@@ -7,9 +7,11 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
+	"reflect"
 	"sync"
 	"testing"
 	"time"
@@ -1756,5 +1758,827 @@ func TestReadLastCheckpoint(t *testing.T) {
 	}
 	if last.CheckpointSeq != 2 {
 		t.Fatalf("last checkpoint seq = %d, want 2 (last valid line wins)", last.CheckpointSeq)
+	}
+}
+
+// readCheckpoints reads all JSONL lines from a checkpoint file and returns
+// them in file order.
+func readCheckpoints(t *testing.T, path string) []chain.Checkpoint {
+	t.Helper()
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("reading checkpoint %q: %v", path, err)
+	}
+	var cps []chain.Checkpoint
+	sc := bufio.NewScanner(bytes.NewReader(data))
+	// A checkpoint line grows with the number of trace tips and can exceed the
+	// scanner's default 64KB token limit. Without this the helper would silently
+	// return FEWER checkpoints, making "expected no checkpoint yet" assertions
+	// pass vacuously. Mirrors readLastCheckpoint in exporter.go.
+	sc.Buffer(make([]byte, 64*1024), maxScanTokenSize)
+	for sc.Scan() {
+		line := bytes.TrimSpace(sc.Bytes())
+		if len(line) == 0 {
+			continue
+		}
+		var cp chain.Checkpoint
+		if err := json.Unmarshal(line, &cp); err != nil {
+			t.Fatalf("unmarshal checkpoint: %v\nline: %s", err, line)
+		}
+		cps = append(cps, cp)
+	}
+	if err := sc.Err(); err != nil {
+		t.Fatalf("scanning checkpoint %q: %v", path, err)
+	}
+	return cps
+}
+
+// TestCheckpointWriteFailure_RetriesTipsAndKeepsChainContiguous verifies that a
+// checkpoint whose durable write fails does not consume the pending tips and
+// does not advance the chain state. Before this fix, writeCheckpoint called
+// Accumulator.Build() first — which advanced seq, advanced prevHash and cleared
+// the pending tip set — and only then attempted the write. An ordinary IO error
+// therefore (a) permanently lost the sealed traces in that batch, and (b) left
+// the next successful checkpoint with a seq gap and a prev_checkpoint_hash
+// pointing at a checkpoint that was never persisted, breaking the chain.
+func TestCheckpointWriteFailure_RetriesTipsAndKeepsChainContiguous(t *testing.T) {
+	env := newTestEnv(t)
+	cfg := env.cfg
+	cfg.CheckpointInterval = 1 // checkpoint on every sealed trace
+
+	exp := startExporter(t, cfg)
+
+	// Make the next checkpoint write fail. Closing the file leaves e.checkFile
+	// non-nil, so writeCheckpoint still runs and fails — at the pre-write Seek,
+	// before any bytes are written. Nothing to roll back; the point here is that
+	// the tips survive an attempt that failed before it produced any output.
+	// TestCheckpointPartialWriteFailure_RollsBackAndRetriesTips covers the case
+	// where bytes DO reach the file.
+	exp.mu.Lock()
+	closeErr := exp.checkFile.Close()
+	exp.mu.Unlock()
+	if closeErr != nil {
+		t.Fatalf("closing checkpoint file: %v", closeErr)
+	}
+
+	traceA := [16]byte{0xA1}
+	if err := exp.ConsumeTraces(context.Background(),
+		makeSpan(traceA, [8]byte{0x01}, zeroParentID, "op-a", 1_000_000, 2_000_000)); err != nil {
+		t.Fatalf("ConsumeTraces A: %v", err)
+	}
+
+	// The tip must still be pending: no checkpoint durably committed to it.
+	if got := exp.accumulator.PendingCount(); got != 1 {
+		t.Fatalf("pending tips after failed checkpoint write: got %d, want 1", got)
+	}
+
+	// Restore a working checkpoint file and seal a second trace.
+	f, err := os.OpenFile(cfg.CheckpointPath, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0600)
+	if err != nil {
+		t.Fatalf("reopening checkpoint file: %v", err)
+	}
+	exp.mu.Lock()
+	exp.checkFile = f
+	exp.mu.Unlock()
+
+	traceB := [16]byte{0xB2}
+	if err := exp.ConsumeTraces(context.Background(),
+		makeSpan(traceB, [8]byte{0x02}, zeroParentID, "op-b", 3_000_000, 4_000_000)); err != nil {
+		t.Fatalf("ConsumeTraces B: %v", err)
+	}
+
+	if err := exp.Shutdown(context.Background()); err != nil {
+		t.Fatalf("Shutdown: %v", err)
+	}
+
+	cps := readCheckpoints(t, cfg.CheckpointPath)
+	if len(cps) != 1 {
+		t.Fatalf("expected exactly 1 persisted checkpoint, got %d", len(cps))
+	}
+	cp := cps[0]
+
+	// The persisted chain must start at seq 1 off the zero prev-hash: the failed
+	// attempt must not have burned a sequence number or a prev-hash link.
+	if cp.CheckpointSeq != 1 {
+		t.Errorf("persisted checkpoint seq: got %d, want 1", cp.CheckpointSeq)
+	}
+	if cp.PrevCheckpointHash != chain.ZeroPrevCheckpointHash {
+		t.Errorf("persisted checkpoint prev_checkpoint_hash:\n  got  %s\n  want %s",
+			cp.PrevCheckpointHash, chain.ZeroPrevCheckpointHash)
+	}
+
+	// Both traces must be covered — trace A's tip was retried, not dropped.
+	covered := make(map[string]bool, len(cp.TraceTips))
+	for _, tip := range cp.TraceTips {
+		covered[tip.TraceID] = true
+	}
+	for _, want := range []string{hex.EncodeToString(traceA[:]), hex.EncodeToString(traceB[:])} {
+		if !covered[want] {
+			t.Errorf("trace %s not covered by any checkpoint (tips lost)", want)
+		}
+	}
+
+	report, err := verify.VerifyLog(cfg.LogPath, cfg.CheckpointPath, env.pubKey)
+	if err != nil {
+		t.Fatalf("VerifyLog: %v", err)
+	}
+	if len(report.Errors) != 0 {
+		t.Errorf("expected no verifier errors; got %v", report.Errors)
+	}
+}
+
+// TestCheckpointSyncFailure_RollsBackAndRetriesTips covers the other half of the
+// durable-commit contract: the checkpoint line is written but Sync fails. The
+// file must be truncated back to its pre-write size (an unsynced line must not
+// survive as a checkpoint the accumulator never committed to) and the tips must
+// still be pending so the next checkpoint carries them.
+func TestCheckpointSyncFailure_RollsBackAndRetriesTips(t *testing.T) {
+	env := newTestEnv(t)
+	cfg := env.cfg
+	cfg.CheckpointInterval = 1
+
+	exp := startExporter(t, cfg)
+
+	exp.mu.Lock()
+	exp.checkFile = &failSyncFile{
+		logSyncer: exp.checkFile,
+		syncErr:   fmt.Errorf("simulated EIO"),
+		count:     1,
+	}
+	exp.mu.Unlock()
+
+	traceA := [16]byte{0xC1}
+	if err := exp.ConsumeTraces(context.Background(),
+		makeSpan(traceA, [8]byte{0x01}, zeroParentID, "op-a", 1_000_000, 2_000_000)); err != nil {
+		t.Fatalf("ConsumeTraces A: %v", err)
+	}
+
+	if got := exp.accumulator.PendingCount(); got != 1 {
+		t.Fatalf("pending tips after failed checkpoint sync: got %d, want 1", got)
+	}
+	// The unsynced line must have been truncated away.
+	if cps := readCheckpoints(t, cfg.CheckpointPath); len(cps) != 0 {
+		t.Fatalf("expected checkpoint file rolled back to empty, got %d checkpoint(s)", len(cps))
+	}
+
+	// failSyncFile passes Sync through from here on; seal a second trace.
+	traceB := [16]byte{0xD2}
+	if err := exp.ConsumeTraces(context.Background(),
+		makeSpan(traceB, [8]byte{0x02}, zeroParentID, "op-b", 3_000_000, 4_000_000)); err != nil {
+		t.Fatalf("ConsumeTraces B: %v", err)
+	}
+
+	if err := exp.Shutdown(context.Background()); err != nil {
+		t.Fatalf("Shutdown: %v", err)
+	}
+
+	cps := readCheckpoints(t, cfg.CheckpointPath)
+	if len(cps) != 1 {
+		t.Fatalf("expected exactly 1 persisted checkpoint, got %d", len(cps))
+	}
+	if cps[0].CheckpointSeq != 1 {
+		t.Errorf("persisted checkpoint seq: got %d, want 1", cps[0].CheckpointSeq)
+	}
+	if cps[0].PrevCheckpointHash != chain.ZeroPrevCheckpointHash {
+		t.Errorf("persisted checkpoint prev_checkpoint_hash: got %s, want %s",
+			cps[0].PrevCheckpointHash, chain.ZeroPrevCheckpointHash)
+	}
+	if len(cps[0].TraceTips) != 2 {
+		t.Errorf("expected 2 trace tips in retried checkpoint, got %d", len(cps[0].TraceTips))
+	}
+
+	report, err := verify.VerifyLog(cfg.LogPath, cfg.CheckpointPath, env.pubKey)
+	if err != nil {
+		t.Fatalf("VerifyLog: %v", err)
+	}
+	if len(report.Errors) != 0 {
+		t.Errorf("expected no verifier errors; got %v", report.Errors)
+	}
+}
+
+// failWriteFile wraps a logSyncer and fails the first `count` Writes after
+// emitting a partial prefix of the payload, simulating a short write that hits
+// an IO error mid-line (ENOSPC, EIO). Seek/Truncate/Sync pass through, so the
+// rollback path runs for real. Not concurrency-safe: count is decremented
+// without a lock. Safe only for single-goroutine test use under e.mu.
+type failWriteFile struct {
+	logSyncer
+	writeErr error
+	count    int
+	wrote    int // bytes emitted by the failing writes, for the test to assert on
+}
+
+func (f *failWriteFile) Write(p []byte) (int, error) {
+	if f.count > 0 {
+		f.count--
+		// Emit a partial line first so the rollback has something to truncate.
+		half := len(p) / 2
+		n, werr := f.logSyncer.Write(p[:half])
+		f.wrote += n
+		if werr != nil {
+			return n, werr
+		}
+		return n, f.writeErr
+	}
+	return f.logSyncer.Write(p)
+}
+
+// TestCheckpointPartialWriteFailure_RollsBackAndRetriesTips covers the branch
+// where the checkpoint write itself fails after partially writing the line. The
+// half-written line must be truncated away — a corrupt trailing line would be
+// skipped by readLastCheckpoint on restart, but it must not be left in a file
+// the verifier walks — and the tips must stay pending for the next checkpoint.
+//
+// This is the case TestCheckpointWriteFailure_RetriesTipsAndKeepsChainContiguous
+// does NOT reach: closing the file makes writeCheckpoint fail at the pre-write
+// Seek, before any bytes are produced.
+func TestCheckpointPartialWriteFailure_RollsBackAndRetriesTips(t *testing.T) {
+	env := newTestEnv(t)
+	cfg := env.cfg
+	cfg.CheckpointInterval = 1
+
+	exp := startExporter(t, cfg)
+
+	failing := &failWriteFile{
+		logSyncer: exp.checkFile,
+		writeErr:  fmt.Errorf("simulated ENOSPC"),
+		count:     1,
+	}
+	exp.mu.Lock()
+	exp.checkFile = failing
+	exp.mu.Unlock()
+
+	traceA := [16]byte{0xE1}
+	if err := exp.ConsumeTraces(context.Background(),
+		makeSpan(traceA, [8]byte{0x01}, zeroParentID, "op-a", 1_000_000, 2_000_000)); err != nil {
+		t.Fatalf("ConsumeTraces A: %v", err)
+	}
+
+	if got := exp.accumulator.PendingCount(); got != 1 {
+		t.Fatalf("pending tips after partial checkpoint write: got %d, want 1", got)
+	}
+	// Bytes must actually have reached the file, or "the file is empty" below
+	// would pass vacuously and stop pinning the rollback.
+	if failing.wrote == 0 {
+		t.Fatal("fake wrote no bytes: the rollback assertion below would be vacuous")
+	}
+	// The partial line must have been truncated away, leaving an empty file.
+	data, err := os.ReadFile(cfg.CheckpointPath)
+	if err != nil {
+		t.Fatalf("reading checkpoint: %v", err)
+	}
+	if len(data) != 0 {
+		t.Fatalf("expected checkpoint file truncated back to empty, got %d bytes: %q", len(data), data)
+	}
+
+	traceB := [16]byte{0xE2}
+	if err := exp.ConsumeTraces(context.Background(),
+		makeSpan(traceB, [8]byte{0x02}, zeroParentID, "op-b", 3_000_000, 4_000_000)); err != nil {
+		t.Fatalf("ConsumeTraces B: %v", err)
+	}
+	if err := exp.Shutdown(context.Background()); err != nil {
+		t.Fatalf("Shutdown: %v", err)
+	}
+
+	cps := readCheckpoints(t, cfg.CheckpointPath)
+	if len(cps) != 1 {
+		t.Fatalf("expected exactly 1 persisted checkpoint, got %d", len(cps))
+	}
+	if cps[0].CheckpointSeq != 1 {
+		t.Errorf("persisted checkpoint seq: got %d, want 1", cps[0].CheckpointSeq)
+	}
+	if cps[0].PrevCheckpointHash != chain.ZeroPrevCheckpointHash {
+		t.Errorf("persisted checkpoint prev_checkpoint_hash: got %s, want %s",
+			cps[0].PrevCheckpointHash, chain.ZeroPrevCheckpointHash)
+	}
+	if len(cps[0].TraceTips) != 2 {
+		t.Errorf("expected 2 trace tips in retried checkpoint, got %d", len(cps[0].TraceTips))
+	}
+
+	report, err := verify.VerifyLog(cfg.LogPath, cfg.CheckpointPath, env.pubKey)
+	if err != nil {
+		t.Fatalf("VerifyLog: %v", err)
+	}
+	if len(report.Errors) != 0 {
+		t.Errorf("expected no verifier errors; got %v", report.Errors)
+	}
+}
+
+// failTruncateFile wraps a logSyncer whose Truncate always fails, so the
+// rollback double-fault path can be exercised.
+type failTruncateFile struct {
+	logSyncer
+	truncErr error
+}
+
+func (f *failTruncateFile) Truncate(int64) error { return f.truncErr }
+
+// TestCheckpointRollbackFailure_PoisonsCheckpointFile verifies the double-fault
+// path: when the checkpoint write fails AND the rollback truncate also fails,
+// the file may retain a line the accumulator never committed to. Appending the
+// next checkpoint would reuse that seq and break prev_checkpoint_hash from there
+// on, so further checkpoint writes must be refused instead.
+func TestCheckpointRollbackFailure_PoisonsCheckpointFile(t *testing.T) {
+	env := newTestEnv(t)
+	cfg := env.cfg
+	cfg.CheckpointInterval = 1
+
+	exp := startExporter(t, cfg)
+
+	exp.mu.Lock()
+	exp.checkFile = &failTruncateFile{
+		logSyncer: &failSyncFile{
+			logSyncer: exp.checkFile,
+			syncErr:   fmt.Errorf("simulated EIO"),
+			count:     1,
+		},
+		truncErr: fmt.Errorf("simulated truncate EIO"),
+	}
+	exp.mu.Unlock()
+
+	traceA := [16]byte{0xF1}
+	if err := exp.ConsumeTraces(context.Background(),
+		makeSpan(traceA, [8]byte{0x01}, zeroParentID, "op-a", 1_000_000, 2_000_000)); err != nil {
+		t.Fatalf("ConsumeTraces A: %v", err)
+	}
+
+	exp.mu.Lock()
+	poisoned := exp.checkpointPoisoned
+	exp.mu.Unlock()
+	if !poisoned {
+		t.Fatal("expected checkpoint file to be marked poisoned after a failed rollback")
+	}
+
+	// Every later checkpoint write must be refused rather than appending a
+	// second line claiming the same seq.
+	exp.mu.Lock()
+	err := exp.writeCheckpoint()
+	exp.mu.Unlock()
+	if !errors.Is(err, errCheckpointPoisoned) {
+		t.Errorf("writeCheckpoint after poisoning: got %v, want errCheckpointPoisoned", err)
+	}
+
+	// Shutdown must report the poisoning rather than exiting cleanly: for an
+	// audit component, "checkpointing died" is the operator-visible event.
+	shutdownErr := exp.Shutdown(context.Background())
+	if !errors.Is(shutdownErr, errCheckpointPoisoned) {
+		t.Errorf("Shutdown error: got %v, want it to wrap errCheckpointPoisoned", shutdownErr)
+	}
+
+	// The uncommitted line is still there (truncate failed), but nothing was
+	// appended after it, so there is exactly one checkpoint and it verifies.
+	cps := readCheckpoints(t, cfg.CheckpointPath)
+	if len(cps) != 1 {
+		t.Fatalf("expected the single uncommitted checkpoint and nothing appended, got %d", len(cps))
+	}
+	if cps[0].CheckpointSeq != 1 {
+		t.Errorf("checkpoint seq: got %d, want 1", cps[0].CheckpointSeq)
+	}
+	report, err := verify.VerifyLog(cfg.LogPath, cfg.CheckpointPath, env.pubKey)
+	if err != nil {
+		t.Fatalf("VerifyLog: %v", err)
+	}
+	if len(report.Errors) != 0 {
+		t.Errorf("what is persisted must still verify; got %v", report.Errors)
+	}
+}
+
+// TestCheckpointFailure_BacksOffInsteadOfRetryingEverySeal verifies the backoff
+// that keeps a persistently unwritable checkpoint file from re-signing an
+// ever-growing pending set on every sealed trace. With the file permanently
+// broken, attempts must thin out as the pending set grows rather than happening
+// once per seal.
+func TestCheckpointFailure_BacksOffInsteadOfRetryingEverySeal(t *testing.T) {
+	env := newTestEnv(t)
+	cfg := env.cfg
+	cfg.CheckpointInterval = 1
+
+	exp := startExporter(t, cfg)
+
+	// A permanently unwritable checkpoint file: every write-path Sync fails, and
+	// the rollback truncate+sync succeed so the file stays clean (not poisoned).
+	counter := &countingWriteFile{
+		logSyncer: exp.checkFile,
+		syncErr:   fmt.Errorf("simulated ENOSPC"),
+		pending:   exp.accumulator.PendingCount,
+	}
+	exp.mu.Lock()
+	exp.checkFile = counter
+	exp.mu.Unlock()
+
+	const seals = 16
+	for i := 0; i < seals; i++ {
+		traceID := [16]byte{0x70, byte(i)}
+		if err := exp.ConsumeTraces(context.Background(),
+			makeSpan(traceID, [8]byte{byte(i + 1)}, zeroParentID, "op",
+				uint64(1_000_000*(i+1)), uint64(1_000_000*(i+2)))); err != nil {
+			t.Fatalf("ConsumeTraces %d: %v", i, err)
+		}
+	}
+
+	// No tips may be lost: a transient-looking failure must keep retrying them.
+	if got := exp.accumulator.PendingCount(); got != seals {
+		t.Errorf("pending tips after %d failed checkpoints: got %d, want %d", seals, got, seals)
+	}
+	// The schedule is deterministic: the first failure retries promptly (pending
+	// 1 then 2), and the doubling starts from the second consecutive failure —
+	// so attempts land at pending 1, 2, 4, 8, 16. Assert the exact count rather
+	// than a loose bound, so a regression to "retry every seal" cannot slip past.
+	// Assert the schedule itself, not just the count: a count alone is
+	// coincidental — starting the doubling one failure later gives 1,2,3,6,12,
+	// also five attempts.
+	wantSchedule := []int{1, 2, 4, 8, 16}
+	if !reflect.DeepEqual(counter.pendingAt, wantSchedule) {
+		t.Errorf("checkpoint attempts happened at pending %v, want %v",
+			counter.pendingAt, wantSchedule)
+	}
+	// Nothing may have been committed to the file either.
+	if data, err := os.ReadFile(cfg.CheckpointPath); err != nil {
+		t.Fatalf("reading checkpoint: %v", err)
+	} else if len(data) != 0 {
+		t.Errorf("expected an empty checkpoint file after only failed attempts, got %d bytes", len(data))
+	}
+	// A merely-failing file must NOT be poisoned — poisoning is for double faults.
+	exp.mu.Lock()
+	poisoned := exp.checkpointPoisoned
+	exp.mu.Unlock()
+	if poisoned {
+		t.Error("a repeatedly failing (but rollback-able) checkpoint file must not be poisoned")
+	}
+
+	// Shutdown attempts one final checkpoint, which also fails and is reported.
+	if err := exp.Shutdown(context.Background()); err == nil {
+		t.Error("expected Shutdown to report the failed final checkpoint")
+	}
+}
+
+// countingWriteFile counts checkpoint attempts on Write — exactly one per
+// attempt, unambiguously — and fails the write-path Sync so every attempt
+// fails. The rollback's truncate and its fsync pass through, so the file is
+// left clean and never poisoned.
+type countingWriteFile struct {
+	logSyncer
+	syncErr error
+	// pending reports the accumulator's pending count; recording it per attempt
+	// pins the actual retry SCHEDULE, not just the attempt count. Safe to call:
+	// Write runs under e.mu and the accumulator has its own lock.
+	pending   func() int
+	attempts  int
+	pendingAt []int
+	inWrite   bool
+}
+
+func (f *countingWriteFile) Write(p []byte) (int, error) {
+	f.attempts++
+	if f.pending != nil {
+		f.pendingAt = append(f.pendingAt, f.pending())
+	}
+	f.inWrite = true
+	return f.logSyncer.Write(p)
+}
+
+func (f *countingWriteFile) Sync() error {
+	if f.inWrite {
+		// The write-path Sync for this attempt: fail it.
+		f.inWrite = false
+		return f.syncErr
+	}
+	// The rollback's fsync-of-truncation: let it succeed.
+	return f.logSyncer.Sync()
+}
+
+// alwaysFailSyncFile fails every Sync, including the rollback's fsync of the
+// truncation. Truncate passes through, so the file is left clean but the
+// truncation is not durable.
+type alwaysFailSyncFile struct {
+	logSyncer
+	syncErr error
+}
+
+func (f *alwaysFailSyncFile) Sync() error { return f.syncErr }
+
+// TestCheckpointRollbackSyncFailure_PoisonsCheckpointFile covers the second
+// poison branch: the rollback truncate succeeds but the fsync OF that truncation
+// fails, so the removed line is not durably gone and a crash could resurrect it
+// as a checkpoint the accumulator never committed to. That must poison the file
+// exactly like a failed truncate.
+func TestCheckpointRollbackSyncFailure_PoisonsCheckpointFile(t *testing.T) {
+	env := newTestEnv(t)
+	cfg := env.cfg
+	cfg.CheckpointInterval = 1
+
+	exp := startExporter(t, cfg)
+	exp.mu.Lock()
+	exp.checkFile = &alwaysFailSyncFile{
+		logSyncer: exp.checkFile,
+		syncErr:   fmt.Errorf("simulated EIO"),
+	}
+	exp.mu.Unlock()
+
+	traceA := [16]byte{0xC7}
+	if err := exp.ConsumeTraces(context.Background(),
+		makeSpan(traceA, [8]byte{0x01}, zeroParentID, "op-a", 1_000_000, 2_000_000)); err != nil {
+		t.Fatalf("ConsumeTraces A: %v", err)
+	}
+
+	exp.mu.Lock()
+	poisoned := exp.checkpointPoisoned
+	pending := exp.accumulator.PendingCount()
+	exp.mu.Unlock()
+	if !poisoned {
+		t.Fatal("a failed fsync of the rollback truncation must poison the checkpoint file")
+	}
+	// Poisoning must also drop the now-undrainable tips rather than leaking them.
+	if pending != 0 {
+		t.Errorf("pending tips after poisoning: got %d, want 0 (they can never be written)", pending)
+	}
+
+	shutdownErr := exp.Shutdown(context.Background())
+	if !errors.Is(shutdownErr, errCheckpointPoisoned) {
+		t.Errorf("Shutdown error: got %v, want it to wrap errCheckpointPoisoned", shutdownErr)
+	}
+}
+
+// TestPoisonedCheckpoint_DoesNotAccumulateTips is the regression guard for the
+// leak that poisoning would otherwise introduce. Once checkpointing is
+// permanently disabled, no checkpoint can ever be written again, so retaining
+// tips grows the pending set without bound for no possible benefit. Sealed
+// traces must still reach the audit log, and the count of uncovered traces must
+// be reported at Shutdown.
+func TestPoisonedCheckpoint_DoesNotAccumulateTips(t *testing.T) {
+	env := newTestEnv(t)
+	cfg := env.cfg
+	cfg.CheckpointInterval = 1
+
+	exp := startExporter(t, cfg)
+	exp.mu.Lock()
+	exp.checkFile = &alwaysFailSyncFile{
+		logSyncer: exp.checkFile,
+		syncErr:   fmt.Errorf("simulated EIO"),
+	}
+	exp.mu.Unlock()
+
+	const seals = 30
+	for i := 0; i < seals; i++ {
+		traceID := [16]byte{0x90, byte(i)}
+		if err := exp.ConsumeTraces(context.Background(),
+			makeSpan(traceID, [8]byte{byte(i + 1)}, zeroParentID, "op",
+				uint64(1_000_000*(i+1)), uint64(1_000_000*(i+2)))); err != nil {
+			t.Fatalf("ConsumeTraces %d: %v", i, err)
+		}
+	}
+
+	exp.mu.Lock()
+	pending := exp.accumulator.PendingCount()
+	uncovered := exp.uncoveredAfterPoison
+	exp.mu.Unlock()
+
+	if pending != 0 {
+		t.Errorf("pending tips after %d seals on a poisoned file: got %d, want 0 — "+
+			"these can never be checkpointed, so retaining them is an unbounded leak", seals, pending)
+	}
+	// ALL seals are uncovered, including the one whose checkpoint attempt did the
+	// poisoning: its tip was pending and got dropped, so it is counted too.
+	// Counting only the traces sealed after poisoning would under-report by a
+	// whole checkpoint interval.
+	if uncovered != seals {
+		t.Errorf("uncovered traces counted: got %d, want %d", uncovered, seals)
+	}
+
+	// The audit log must still have every trace's entries — poisoning stops
+	// checkpointing, not logging.
+	entries := readLogEntries(t, cfg.LogPath)
+	if len(entries) != seals {
+		t.Errorf("audit log entries: got %d, want %d", len(entries), seals)
+	}
+
+	shutdownErr := exp.Shutdown(context.Background())
+	if !errors.Is(shutdownErr, errCheckpointPoisoned) {
+		t.Errorf("Shutdown error: got %v, want it to wrap errCheckpointPoisoned", shutdownErr)
+	}
+}
+
+// TestCheckpointWriteFailure_ZeroBytesDoesNotPoison verifies that a write which
+// fails having emitted nothing does not poison the file. The file is already
+// byte-identical to its pre-write state, so there is nothing to roll back —
+// and calling Truncate anyway would risk poisoning over a fault that changed
+// nothing, which matters because a failing write and a failing Truncate are
+// usually the same underlying fault.
+func TestCheckpointWriteFailure_ZeroBytesDoesNotPoison(t *testing.T) {
+	env := newTestEnv(t)
+	cfg := env.cfg
+	cfg.CheckpointInterval = 1
+
+	exp := startExporter(t, cfg)
+	exp.mu.Lock()
+	exp.checkFile = &zeroWriteFailFile{
+		logSyncer: exp.checkFile,
+		writeErr:  fmt.Errorf("simulated EIO"),
+		truncErr:  fmt.Errorf("simulated truncate EIO"),
+		count:     1,
+	}
+	exp.mu.Unlock()
+
+	traceA := [16]byte{0xA7}
+	if err := exp.ConsumeTraces(context.Background(),
+		makeSpan(traceA, [8]byte{0x01}, zeroParentID, "op-a", 1_000_000, 2_000_000)); err != nil {
+		t.Fatalf("ConsumeTraces A: %v", err)
+	}
+
+	exp.mu.Lock()
+	poisoned := exp.checkpointPoisoned
+	pending := exp.accumulator.PendingCount()
+	exp.mu.Unlock()
+	if poisoned {
+		t.Error("a write that emitted no bytes must not poison the file: there was nothing to roll back")
+	}
+	if pending != 1 {
+		t.Errorf("pending tips after a zero-byte write failure: got %d, want 1", pending)
+	}
+
+	// The next checkpoint must succeed normally and cover the retried tip.
+	traceB := [16]byte{0xA8}
+	if err := exp.ConsumeTraces(context.Background(),
+		makeSpan(traceB, [8]byte{0x02}, zeroParentID, "op-b", 3_000_000, 4_000_000)); err != nil {
+		t.Fatalf("ConsumeTraces B: %v", err)
+	}
+	if err := exp.Shutdown(context.Background()); err != nil {
+		t.Fatalf("Shutdown: %v", err)
+	}
+
+	cps := readCheckpoints(t, cfg.CheckpointPath)
+	if len(cps) != 1 || len(cps[0].TraceTips) != 2 {
+		t.Fatalf("expected 1 checkpoint covering both traces, got %d checkpoint(s)", len(cps))
+	}
+	report, err := verify.VerifyLog(cfg.LogPath, cfg.CheckpointPath, env.pubKey)
+	if err != nil {
+		t.Fatalf("VerifyLog: %v", err)
+	}
+	if len(report.Errors) != 0 {
+		t.Errorf("expected no verifier errors; got %v", report.Errors)
+	}
+}
+
+// zeroWriteFailFile fails the first `count` Writes without emitting any bytes,
+// and fails every Truncate — so if the code rolled back unnecessarily it would
+// poison the file, which is exactly what the test asserts must not happen.
+type zeroWriteFailFile struct {
+	logSyncer
+	writeErr error
+	truncErr error
+	count    int
+}
+
+func (f *zeroWriteFailFile) Write(p []byte) (int, error) {
+	if f.count > 0 {
+		f.count--
+		return 0, f.writeErr
+	}
+	return f.logSyncer.Write(p)
+}
+
+func (f *zeroWriteFailFile) Truncate(int64) error { return f.truncErr }
+
+// TestTransientCheckpointFailure_RetriesOnNextSeal pins the prompt-retry half of
+// the backoff: a SINGLE failed checkpoint must be retried on the very next seal,
+// not deferred until the pending set doubles. With the default interval of 100,
+// charging the doubling to the first failure would mean one transient EIO at
+// pending=100 leaves everything un-checkpointed until pending=200.
+//
+// The doubling still applies from the second consecutive failure — that is what
+// TestCheckpointFailure_BacksOffInsteadOfRetryingEverySeal covers.
+func TestTransientCheckpointFailure_RetriesOnNextSeal(t *testing.T) {
+	env := newTestEnv(t)
+	cfg := env.cfg
+	cfg.CheckpointInterval = 10
+
+	exp := startExporter(t, cfg)
+
+	// Fail exactly one checkpoint Sync, then behave normally.
+	exp.mu.Lock()
+	exp.checkFile = &failSyncFile{
+		logSyncer: exp.checkFile,
+		syncErr:   fmt.Errorf("simulated transient EIO"),
+		count:     1,
+	}
+	exp.mu.Unlock()
+
+	// Seal exactly interval traces: the checkpoint fires and fails.
+	for i := 0; i < 10; i++ {
+		traceID := [16]byte{0xB0, byte(i)}
+		if err := exp.ConsumeTraces(context.Background(),
+			makeSpan(traceID, [8]byte{byte(i + 1)}, zeroParentID, "op",
+				uint64(1_000_000*(i+1)), uint64(1_000_000*(i+2)))); err != nil {
+			t.Fatalf("ConsumeTraces %d: %v", i, err)
+		}
+	}
+	if got := exp.accumulator.PendingCount(); got != 10 {
+		t.Fatalf("pending after the failed checkpoint: got %d, want 10", got)
+	}
+	if cps := readCheckpoints(t, cfg.CheckpointPath); len(cps) != 0 {
+		t.Fatalf("expected no checkpoint yet, got %d", len(cps))
+	}
+
+	// One more seal. The retry must happen NOW (pending 11), not at pending 20.
+	if err := exp.ConsumeTraces(context.Background(),
+		makeSpan([16]byte{0xB0, 0xFF}, [8]byte{0xFF}, zeroParentID, "op-retry",
+			90_000_000, 91_000_000)); err != nil {
+		t.Fatalf("ConsumeTraces retry: %v", err)
+	}
+
+	cps := readCheckpoints(t, cfg.CheckpointPath)
+	if len(cps) != 1 {
+		t.Fatalf("expected the checkpoint to be retried on the next seal, got %d checkpoint(s) "+
+			"(pending=%d) — a single transient failure must not defer the retry until the "+
+			"pending set doubles", len(cps), exp.accumulator.PendingCount())
+	}
+	if len(cps[0].TraceTips) != 11 {
+		t.Errorf("retried checkpoint tips: got %d, want 11", len(cps[0].TraceTips))
+	}
+	if got := exp.accumulator.PendingCount(); got != 0 {
+		t.Errorf("pending after the successful retry: got %d, want 0", got)
+	}
+
+	// Second cycle: the consecutive-failure counter must have been reset by the
+	// success above, so another isolated blip is again retried promptly rather
+	// than being treated as the second consecutive failure and doubled.
+	exp.mu.Lock()
+	exp.checkFile = &failSyncFile{
+		logSyncer: exp.checkFile,
+		syncErr:   fmt.Errorf("simulated second transient EIO"),
+		count:     1,
+	}
+	exp.mu.Unlock()
+
+	for i := 0; i < 10; i++ {
+		traceID := [16]byte{0xB1, byte(i)}
+		if err := exp.ConsumeTraces(context.Background(),
+			makeSpan(traceID, [8]byte{byte(i + 1)}, zeroParentID, "op2",
+				uint64(100_000_000+1_000_000*(i+1)), uint64(100_000_000+1_000_000*(i+2)))); err != nil {
+			t.Fatalf("ConsumeTraces cycle2 %d: %v", i, err)
+		}
+	}
+	if cps := readCheckpoints(t, cfg.CheckpointPath); len(cps) != 1 {
+		t.Fatalf("expected the second cycle's checkpoint to have failed, got %d", len(cps))
+	}
+	if err := exp.ConsumeTraces(context.Background(),
+		makeSpan([16]byte{0xB1, 0xFF}, [8]byte{0xFE}, zeroParentID, "op2-retry",
+			190_000_000, 191_000_000)); err != nil {
+		t.Fatalf("ConsumeTraces cycle2 retry: %v", err)
+	}
+	if cps := readCheckpoints(t, cfg.CheckpointPath); len(cps) != 2 {
+		t.Errorf("second transient failure was not retried promptly: got %d checkpoint(s), want 2 — "+
+			"the consecutive-failure counter was not reset by the earlier success", len(cps))
+	}
+
+	if err := exp.Shutdown(context.Background()); err != nil {
+		t.Fatalf("Shutdown: %v", err)
+	}
+	report, err := verify.VerifyLog(cfg.LogPath, cfg.CheckpointPath, env.pubKey)
+	if err != nil {
+		t.Fatalf("VerifyLog: %v", err)
+	}
+	if len(report.Errors) != 0 {
+		t.Errorf("expected no verifier errors; got %v", report.Errors)
+	}
+}
+
+// TestNextCheckpointRetryAt covers the retry schedule directly, including the
+// cap. Without a cap, recovery latency after a healed outage grows with the
+// length of the outage: a file that becomes writable again at pending=600 would
+// not be retried until pending=1024, and a long outage is far worse.
+func TestNextCheckpointRetryAt(t *testing.T) {
+	e := newAgentAuditExporter(&Config{}, nil)
+
+	tests := []struct {
+		name     string
+		failures int
+		pending  int
+		want     int
+	}{
+		{"first failure retries promptly", 1, 10, 11},
+		{"first failure at scale still prompt", 1, 5000, 5001},
+		{"second failure doubles", 2, 10, 20},
+		{"later failure doubles", 5, 64, 128},
+		{"doubling applies up to the cap", 5, maxCheckpointRetryGap, 2 * maxCheckpointRetryGap},
+		{"beyond the cap the gap is capped", 5, maxCheckpointRetryGap + 1, maxCheckpointRetryGap*2 + 1},
+		{"long outage stays capped", 50, 200000, 200000 + maxCheckpointRetryGap},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			e.checkpointFailures = tt.failures
+			if got := e.nextCheckpointRetryAt(tt.pending); got != tt.want {
+				t.Errorf("nextCheckpointRetryAt(%d) with %d failures: got %d, want %d",
+					tt.pending, tt.failures, got, tt.want)
+			}
+		})
+	}
+
+	// The gap must never exceed the cap, at any scale.
+	e.checkpointFailures = 99
+	for _, pending := range []int{1, 100, 1023, 1024, 1025, 10000, 1 << 20} {
+		if gap := e.nextCheckpointRetryAt(pending) - pending; gap > maxCheckpointRetryGap {
+			t.Errorf("retry gap at pending=%d: got %d, want <= %d", pending, gap, maxCheckpointRetryGap)
+		}
 	}
 }

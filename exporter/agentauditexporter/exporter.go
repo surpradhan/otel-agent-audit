@@ -53,7 +53,8 @@ type traceBuffer struct {
 	hasRoot  bool
 }
 
-// logSyncer is the subset of *os.File behaviour used by the exporter's write path.
+// logSyncer is the subset of *os.File behaviour used by the exporter's append-
+// and-rollback write path, for both the audit log and the checkpoint file.
 // The interface exists so tests can inject a fake that simulates sync failures.
 type logSyncer interface {
 	io.Writer
@@ -64,24 +65,48 @@ type logSyncer interface {
 }
 
 type agentAuditExporter struct {
-	cfg          *Config
-	logger       *zap.Logger
-	signer       sign.Signer
-	logFile      logSyncer
-	checkFile    *os.File
-	wal          *wal.WAL
-	accumulator  *chain.Accumulator
-	buffers      map[string]*traceBuffer // guarded by mu
+	cfg         *Config
+	logger      *zap.Logger
+	signer      sign.Signer
+	logFile     logSyncer
+	checkFile   logSyncer
+	wal         *wal.WAL
+	accumulator *chain.Accumulator
+	buffers     map[string]*traceBuffer // guarded by mu
 	// sealedTraces prevents re-sealing a trace in the window between seal and the
 	// next WAL.Compact. Cleared after each successful Compact so it does not grow
 	// without bound. After eviction, a re-delivered root span for a compacted
 	// traceID will be buffered and sealed again as a new chain — this is an accepted
 	// at-least-once pipeline trade-off, addressed in B3 by the agentauditselect processor.
 	sealedTraces map[string]struct{} // guarded by mu
-	mu           sync.Mutex
-	compactWG    sync.WaitGroup // tracks background Compact goroutines
-	stopCh       chan struct{}
-	doneCh       chan struct{}
+
+	// checkpointPoisoned is set when a failed checkpoint write could not be
+	// rolled back, so the file may still hold an uncommitted checkpoint line.
+	// Further checkpoint writes are refused: the next checkpoint would reuse the
+	// same seq, and the verifier walks checkpoints in file order, so appending
+	// would break prev_checkpoint_hash from that line onward. Better to stop
+	// extending the chain than to extend it unverifiably.
+	checkpointPoisoned bool // guarded by mu
+
+	// checkpointRetryAt is the pending-tip count at which a checkpoint write is
+	// retried after a failure; 0 means "no backoff". See shouldCheckpoint.
+	checkpointRetryAt int // guarded by mu
+
+	// checkpointFailures counts consecutive failed checkpoint writes. The first
+	// failure is retried promptly; the backoff only kicks in from the second, so
+	// a transient blip does not widen the un-checkpointed window. Reset on
+	// success. See shouldCheckpoint.
+	checkpointFailures int // guarded by mu
+
+	// uncoveredAfterPoison counts traces sealed after checkpointing was disabled.
+	// Their entries are still durably in the audit log; they are simply covered
+	// by no checkpoint. Reported once at Shutdown rather than per trace.
+	uncoveredAfterPoison int // guarded by mu
+
+	mu        sync.Mutex
+	compactWG sync.WaitGroup // tracks background Compact goroutines
+	stopCh    chan struct{}
+	doneCh    chan struct{}
 }
 
 // effectiveCheckpointInterval returns the configured interval with a default
@@ -269,10 +294,24 @@ func (e *agentAuditExporter) Shutdown(ctx context.Context) error {
 	}
 
 	// Step 5: write final checkpoint if there are pending tips.
+	//
+	// A checkpoint failure here is collected rather than only logged: for an
+	// audit-integrity component, "the final checkpoint never landed" is exactly
+	// the outcome the operator must not miss. Poisoning is reported the same way
+	// even though there are no pending tips left to write — see poisonCheckpoint.
+	var shutdownErrs []error
 	if e.accumulator.PendingCount() > 0 {
 		if err := e.writeCheckpoint(); err != nil {
 			e.logger.Error("agentaudit: writing final checkpoint", zap.Error(err))
+			shutdownErrs = append(shutdownErrs, fmt.Errorf("writing final checkpoint: %w", err))
 		}
+	}
+	if e.checkpointPoisoned {
+		e.logger.Error("agentaudit: shutting down with checkpointing disabled",
+			zap.Int("traces_sealed_but_uncovered", e.uncoveredAfterPoison))
+		shutdownErrs = append(shutdownErrs, fmt.Errorf(
+			"%w (%d trace(s) sealed to the audit log but covered by no checkpoint)",
+			errCheckpointPoisoned, e.uncoveredAfterPoison))
 	}
 
 	// Step 6.
@@ -288,7 +327,7 @@ func (e *agentAuditExporter) Shutdown(ctx context.Context) error {
 	}
 
 	// Step 8: close files and compact WAL one final time.
-	var errs []error
+	errs := shutdownErrs
 	if e.logFile != nil {
 		if err := e.logFile.Close(); err != nil {
 			errs = append(errs, fmt.Errorf("closing log file: %w", err))
@@ -504,11 +543,21 @@ func (e *agentAuditExporter) sealTrace(traceID string, buf *traceBuffer, checkpo
 	}
 
 	// Step 5: update accumulator.
-	tipHash := chain.TipHash(entries)
-	e.accumulator.AddTip(traceID, tipHash, len(entries))
+	//
+	// Once checkpointing is permanently disabled there is nothing a tip can ever
+	// be written into, so accumulating it would grow the pending set without
+	// bound for no benefit. The entries above are already durably in the audit
+	// log; the trace is simply left uncovered, counted, and reported at Shutdown.
+	if e.checkpointPoisoned {
+		e.uncoveredAfterPoison++
+	} else {
+		tipHash := chain.TipHash(entries)
+		e.accumulator.AddTip(traceID, tipHash, len(entries))
+	}
 
-	// Step 6: checkpoint if interval reached.
-	if e.accumulator.PendingCount() >= checkpointInterval {
+	// Step 6: checkpoint if interval reached (and not backing off after a
+	// failed attempt).
+	if e.shouldCheckpoint(checkpointInterval) {
 		if err := e.writeCheckpoint(); err != nil {
 			e.logger.Error("agentaudit: write checkpoint", zap.Error(err))
 		}
@@ -593,25 +642,197 @@ func readLastCheckpoint(path string) (chain.Checkpoint, bool, error) {
 	return last, found, nil
 }
 
+// errCheckpointPoisoned is returned once a failed checkpoint write could not be
+// rolled back. See agentAuditExporter.checkpointPoisoned.
+var errCheckpointPoisoned = errors.New(
+	"agentaudit: checkpoint file may contain an uncommitted checkpoint after a failed rollback; " +
+		"refusing to append a checkpoint the verifier could never validate")
+
+// maxCheckpointRetryGap caps how many additional pending tips the backoff will
+// wait for before retrying. Without a cap, recovery latency after a healed
+// outage grows with the length of the outage — a file that becomes writable
+// again at pending=600 would not be retried until pending=1024 — and the error
+// log thins out exactly as the pending set grows largest.
+const maxCheckpointRetryGap = 1024
+
+// shouldCheckpoint reports whether a checkpoint write should be attempted now.
+// Called under e.mu.
+//
+// Beyond the configured interval it applies a backoff after repeated failures.
+// A failed checkpoint keeps its tips pending (that is the point — see
+// writeCheckpoint), so without a backoff a persistently unwritable checkpoint
+// file would re-copy, re-sort, re-marshal and re-sign the whole, ever-growing
+// pending set on every subsequently sealed trace: quadratic work on the
+// synchronous ConsumeTraces path. Requiring the pending set to grow before each
+// retry keeps the total work near O(n log n) and the error log proportionate.
+//
+// The first failure is retried promptly — a single transient blip should not
+// widen the un-checkpointed window — and the doubling only starts from the
+// second consecutive failure.
+//
+// Note this bounds the wasted *work*, not the *memory*: for a merely transient
+// failure tips are still retained, so a checkpoint file that stays unwritable
+// grows the pending set. Retaining them is the deliberate trade — the
+// alternative is dropping sealed traces — and bounding that growth is tracked
+// in the follow-up issue. (Once checkpointing is *permanently* disabled the
+// tips are dropped instead; see poisonCheckpoint.)
+func (e *agentAuditExporter) shouldCheckpoint(checkpointInterval int) bool {
+	pending := e.accumulator.PendingCount()
+	return pending >= checkpointInterval && pending >= e.checkpointRetryAt
+}
+
+// nextCheckpointRetryAt returns the pending count at which the next retry is
+// allowed after a failed attempt at the given pending count. Called under e.mu.
+func (e *agentAuditExporter) nextCheckpointRetryAt(pending int) int {
+	if e.checkpointFailures <= 1 {
+		// Retry the very next seal: one transient failure should not delay it.
+		return pending + 1
+	}
+	if pending > maxCheckpointRetryGap {
+		return pending + maxCheckpointRetryGap
+	}
+	return pending * 2
+}
+
 // writeCheckpoint builds and writes a checkpoint to the checkpoint file.
 // Called under e.mu.
-func (e *agentAuditExporter) writeCheckpoint() error {
+//
+// The accumulator's state advance (seq, prevHash, clearing the pending tips) is
+// committed only after the checkpoint is durably on disk. If the write or Sync
+// fails, the file is truncated back to its pre-write size and the accumulator is
+// left untouched, so the pending tips are retried by the next checkpoint and the
+// persisted chain stays contiguous — an ordinary IO error must not drop sealed
+// traces or leave a prev_checkpoint_hash pointing at a checkpoint that was never
+// persisted.
+//
+// The one case where contiguity cannot be preserved is a double fault: if the
+// rollback itself fails, the file may retain a checkpoint line the accumulator
+// never committed to. Appending the next checkpoint would then reuse that seq
+// and break prev_checkpoint_hash from there on, so instead the file is marked
+// poisoned and every later checkpoint write fails with errCheckpointPoisoned.
+// The chain stops growing, but what is already persisted still verifies.
+func (e *agentAuditExporter) writeCheckpoint() (err error) {
+	// Back off before retrying a failed checkpoint; clear the backoff on success.
+	defer func() {
+		if err != nil {
+			e.checkpointFailures++
+			e.checkpointRetryAt = e.nextCheckpointRetryAt(e.accumulator.PendingCount())
+			return
+		}
+		e.checkpointFailures = 0
+		e.checkpointRetryAt = 0
+	}()
+
 	if e.checkFile == nil {
 		return fmt.Errorf("agentaudit: checkFile is nil")
 	}
-	cp, err := e.accumulator.Build(time.Now())
-	if err != nil {
-		return fmt.Errorf("agentaudit: build checkpoint: %w", err)
+	if e.checkpointPoisoned {
+		return errCheckpointPoisoned
 	}
-	line, err := json.Marshal(cp)
+	staged, err := e.accumulator.Stage(time.Now())
+	if err != nil {
+		return fmt.Errorf("agentaudit: stage checkpoint: %w", err)
+	}
+	line, err := json.Marshal(staged.Checkpoint)
 	if err != nil {
 		return fmt.Errorf("agentaudit: marshal checkpoint: %w", err)
 	}
-	if _, err := fmt.Fprintf(e.checkFile, "%s\n", line); err != nil {
-		return fmt.Errorf("agentaudit: write checkpoint: %w", err)
+
+	// Snapshot the end offset so a partial write or a failed Sync can be rolled
+	// back, leaving the file byte-identical to before the attempt.
+	preWritePos, err := e.checkFile.Seek(0, io.SeekEnd)
+	if err != nil {
+		return fmt.Errorf("agentaudit: get checkpoint offset before write: %w", err)
+	}
+
+	// Only roll back if bytes actually reached the file. A write that emitted
+	// nothing leaves the file already byte-identical to preWritePos, and calling
+	// Truncate anyway risks poisoning it over a fault that changed nothing —
+	// which matters because a failing write and a failing Truncate are usually
+	// the same underlying fault (bad fd, device EIO).
+	if n, werr := fmt.Fprintf(e.checkFile, "%s\n", line); werr != nil {
+		if n > 0 {
+			e.rollbackCheckpoint(preWritePos, werr)
+		}
+		return fmt.Errorf("agentaudit: write checkpoint: %w", werr)
 	}
 	if err := e.checkFile.Sync(); err != nil {
+		e.rollbackCheckpoint(preWritePos, err)
 		return fmt.Errorf("agentaudit: sync checkpoint: %w", err)
 	}
+
+	// Durable: only now advance seq/prevHash and drop the tips this checkpoint
+	// covers.
+	if cerr := e.accumulator.Commit(staged); cerr != nil {
+		// The checkpoint is already on disk, so the accumulator and the file have
+		// diverged and the next checkpoint would reuse this seq. e.mu serializes
+		// stage->commit, so this should be unreachable; treat it like a failed
+		// rollback rather than extending a chain that cannot verify.
+		e.poisonCheckpoint("agentaudit: checkpoint committed to disk but the accumulator rejected it", cerr, nil)
+		return fmt.Errorf("agentaudit: commit checkpoint: %w", cerr)
+	}
 	return nil
+}
+
+// poisonCheckpoint permanently disables checkpoint writing for this process and
+// discards the pending tips. Called under e.mu.
+//
+// Once the checkpoint file may hold a line the accumulator never committed to,
+// appending to it would reuse that seq and break prev_checkpoint_hash for every
+// later checkpoint, so no further checkpoint can ever be written. That makes the
+// pending tips undrainable: retaining them would grow the set without bound for
+// no possible benefit, so they are dropped here with a single loud log rather
+// than leaking.
+//
+// What is already persisted still verifies for the lifetime of this process,
+// and a restart resumes the chain correctly — readLastCheckpoint picks the last
+// *valid* line. But a torn line left behind by the failed truncate still needs
+// manual attention: the file is opened O_APPEND, so the next checkpoint written
+// after a restart fuses onto it, and the verifier only tolerates an unparseable
+// line when it is the final one. See the follow-up issue on a newline guard.
+func (e *agentAuditExporter) poisonCheckpoint(msg string, err, cause error) {
+	if e.checkpointPoisoned {
+		return
+	}
+	e.checkpointPoisoned = true
+	dropped := e.accumulator.DropPending()
+	// The dropped tips are uncovered too — they were sealed since the last
+	// successful checkpoint and can now never be written. Counting only the
+	// traces sealed *after* poisoning would under-report by a whole checkpoint
+	// interval, and would report the least alarming number in the worst case.
+	//
+	// Two paths can over-report, both deliberately. On the failed-truncate path
+	// the staged line did reach the file, so a verifier reading it will consider
+	// those traces covered; they are still counted as uncovered here because the
+	// write was never fsynced and its durability is therefore unknown. On the
+	// commit-failure path the checkpoint is durable and does cover its staged
+	// tips, but that path is unreachable while e.mu serializes stage->commit.
+	// Over-reporting is the safe direction for an audit component.
+	e.uncoveredAfterPoison += dropped
+	fields := []zap.Field{
+		zap.Error(err),
+		zap.Int("uncovered_tips_discarded", dropped),
+	}
+	if cause != nil {
+		fields = append(fields, zap.NamedError("cause", cause))
+	}
+	e.logger.Error(msg+" — checkpointing is now permanently disabled for this process; "+
+		"sealed traces are still written to the audit log but will not be covered by any checkpoint",
+		fields...)
+}
+
+// rollbackCheckpoint truncates the checkpoint file back to preWritePos and
+// fsyncs the truncation, so a crash cannot resurrect a checkpoint line the
+// accumulator never committed to. If either step fails the file is marked
+// poisoned — see agentAuditExporter.checkpointPoisoned. Called under e.mu.
+func (e *agentAuditExporter) rollbackCheckpoint(preWritePos int64, cause error) {
+	if terr := e.checkFile.Truncate(preWritePos); terr != nil {
+		e.poisonCheckpoint("agentaudit: rollback checkpoint truncate failed — checkpoint file may contain an uncommitted checkpoint", terr, cause)
+		return
+	}
+	// Fsync the truncation: until it lands, a crash could resurrect the removed
+	// line as a checkpoint the accumulator never committed to.
+	if serr := e.checkFile.Sync(); serr != nil {
+		e.poisonCheckpoint("agentaudit: rollback checkpoint sync failed — checkpoint file may contain an uncommitted checkpoint", serr, cause)
+	}
 }
