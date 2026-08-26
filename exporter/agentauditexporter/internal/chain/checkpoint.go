@@ -95,6 +95,24 @@ func (a *Accumulator) PendingCount() int {
 	return len(a.pending)
 }
 
+// DropPending discards every pending tip and returns how many were dropped.
+// seq and prevHash are left untouched, so the persisted chain is unaffected and
+// remains verifiable; only the coverage of those traces is given up.
+//
+// This exists for the one case where retaining tips is provably pointless: the
+// caller has determined it can never write another checkpoint (see the
+// checkpointPoisoned path in the exporter). Retaining tips that no checkpoint
+// can ever cover would grow without bound for no benefit. Do NOT use it for a
+// merely transient write failure — there, retention is the entire point of the
+// Stage/Commit split.
+func (a *Accumulator) DropPending() int {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	n := len(a.pending)
+	a.pending = nil
+	return n
+}
+
 // CheckpointSigningPayload returns the compact JSON bytes that were signed to
 // produce cp. It reconstructs the checkpointForSigning struct used by Build,
 // allowing callers to re-derive SHA256(payload) for chaining prevHash across
@@ -241,10 +259,11 @@ func (a *Accumulator) commitLocked(st StagedCheckpoint) error {
 // prevHash and resetting the pending set immediately.
 //
 // Build is only appropriate when the checkpoint does not need to survive a
-// crash — demos and tests. Callers that persist the checkpoint must use
+// crash — i.e. tests. Anything that persists the checkpoint must use
 // Stage + Commit so the state advance happens only after a successful durable
 // write; otherwise an IO error silently drops the pending tips and leaves the
 // persisted chain with a sequence gap and a dangling prev_checkpoint_hash.
+// See cmd/demo for the pattern to copy.
 func (a *Accumulator) Build(ts time.Time) (Checkpoint, error) {
 	a.mu.Lock()
 	defer a.mu.Unlock()

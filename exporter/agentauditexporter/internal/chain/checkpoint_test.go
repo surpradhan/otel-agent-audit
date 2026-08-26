@@ -370,43 +370,61 @@ func TestAccumulator_CommitKeepsTipsAddedAfterStage(t *testing.T) {
 	}
 }
 
-// errSigner fails every Sign call. KeyID still works so Stage reaches signing.
-type errSigner struct{ err error }
+// flakySigner fails the first `failures` Sign calls, then recovers. Recovery is
+// the point: it lets the SAME accumulator be observed across a failure and a
+// later success, which is what proves the failure burned nothing.
+type flakySigner struct {
+	inner    sign.Signer
+	failures int
+}
 
-func (s errSigner) Sign([]byte) ([]byte, error) { return nil, s.err }
-func (s errSigner) KeyID() string               { return "err-signer" }
+func (s *flakySigner) Sign(p []byte) ([]byte, error) {
+	if s.failures > 0 {
+		s.failures--
+		return nil, errors.New("simulated HSM failure")
+	}
+	return s.inner.Sign(p)
+}
+
+func (s *flakySigner) KeyID() string { return s.inner.KeyID() }
 
 // TestAccumulator_SigningFailureDoesNotAdvanceSeq pins the guarantee that a
 // failed Stage/Build leaves the accumulator untouched: the sequence number is
-// not burned, so the next successful checkpoint is still seq 1 chained off the
-// zero prev-hash. The pre-Stage implementation incremented seq before signing
-// and lost this.
+// not burned, so the next SUCCESSFUL checkpoint on that same accumulator is
+// still seq 1 chained off the zero prev-hash, and the tips are still pending.
+// The pre-Stage implementation incremented seq before signing and lost this.
 func TestAccumulator_SigningFailureDoesNotAdvanceSeq(t *testing.T) {
-	failing := errSigner{err: errors.New("simulated HSM failure")}
-	acc := chain.NewAccumulator(failing, 0, chain.ZeroPrevCheckpointHash)
+	inner, _ := makeTestSignerFull(t)
+	signer := &flakySigner{inner: inner, failures: 2}
+	acc := chain.NewAccumulator(signer, 0, chain.ZeroPrevCheckpointHash)
 	acc.AddTip("trace001", "hash001", 1)
 
 	if _, err := acc.Stage(time.Now()); err == nil {
-		t.Fatal("expected Stage to fail with a failing signer")
+		t.Fatal("expected Stage to fail while the signer is failing")
 	}
 	if _, err := acc.Build(time.Now()); err == nil {
-		t.Fatal("expected Build to fail with a failing signer")
+		t.Fatal("expected Build to fail while the signer is failing")
 	}
 	// Tips must survive a signing failure too.
 	if got := acc.PendingCount(); got != 1 {
 		t.Errorf("PendingCount after signing failures: got %d, want 1", got)
 	}
 
-	// A working signer must still produce seq 1 off the zero prev-hash.
-	signer, _ := makeTestSignerFull(t)
-	acc2 := chain.NewAccumulator(signer, 0, chain.ZeroPrevCheckpointHash)
-	acc2.AddTip("trace001", "hash001", 1)
-	cp, err := acc2.Build(time.Now())
+	// The signer has recovered. The same accumulator must still produce seq 1
+	// off the zero prev-hash — the two failures burned nothing.
+	cp, err := acc.Build(time.Now())
 	if err != nil {
-		t.Fatalf("Build with working signer: %v", err)
+		t.Fatalf("Build after signer recovery: %v", err)
 	}
 	if cp.CheckpointSeq != 1 {
-		t.Errorf("first checkpoint seq: got %d, want 1", cp.CheckpointSeq)
+		t.Errorf("seq after 2 signing failures: got %d, want 1", cp.CheckpointSeq)
+	}
+	if cp.PrevCheckpointHash != chain.ZeroPrevCheckpointHash {
+		t.Errorf("prev_checkpoint_hash after signing failures: got %s, want %s",
+			cp.PrevCheckpointHash, chain.ZeroPrevCheckpointHash)
+	}
+	if len(cp.TraceTips) != 1 {
+		t.Errorf("tips in recovered checkpoint: got %d, want 1", len(cp.TraceTips))
 	}
 }
 
