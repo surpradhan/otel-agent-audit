@@ -105,6 +105,12 @@ func (a *Accumulator) PendingCount() int {
 // can ever cover would grow without bound for no benefit. Do NOT use it for a
 // merely transient write failure — there, retention is the entire point of the
 // Stage/Commit split.
+//
+// Do NOT call this between Stage and Commit. It is the only mutator besides
+// AddTip, and it is the only one that does not preserve the prefix invariant
+// StagedCheckpoint.tipCount relies on: the staged checkpoint's tip count would
+// then refer to a prefix that no longer exists, and committing it afterwards
+// could discard tips that no checkpoint covers.
 func (a *Accumulator) DropPending() int {
 	a.mu.Lock()
 	defer a.mu.Unlock()
@@ -150,8 +156,9 @@ type StagedCheckpoint struct {
 
 	// tipCount is how many pending tips this checkpoint covers. Stage always
 	// covers every tip pending at stage time, so tipCount == len(pending) then;
-	// AddTip only appends, so at Commit time the covered tips are still exactly
-	// the prefix pending[:tipCount] and anything added since survives.
+	// AddTip only appends and DropPending must not be called between Stage and
+	// Commit, so at Commit time the covered tips are still exactly the prefix
+	// pending[:tipCount] and anything added since survives.
 	//
 	// Note that Checkpoint.TraceTips is sorted by trace_id and is therefore NOT
 	// index-aligned with the accumulator's pending slice — never match tips

@@ -11,6 +11,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"reflect"
 	"sync"
 	"testing"
 	"time"
@@ -1770,6 +1771,11 @@ func readCheckpoints(t *testing.T, path string) []chain.Checkpoint {
 	}
 	var cps []chain.Checkpoint
 	sc := bufio.NewScanner(bytes.NewReader(data))
+	// A checkpoint line grows with the number of trace tips and can exceed the
+	// scanner's default 64KB token limit. Without this the helper would silently
+	// return FEWER checkpoints, making "expected no checkpoint yet" assertions
+	// pass vacuously. Mirrors readLastCheckpoint in exporter.go.
+	sc.Buffer(make([]byte, 64*1024), maxScanTokenSize)
 	for sc.Scan() {
 		line := bytes.TrimSpace(sc.Bytes())
 		if len(line) == 0 {
@@ -1780,6 +1786,9 @@ func readCheckpoints(t *testing.T, path string) []chain.Checkpoint {
 			t.Fatalf("unmarshal checkpoint: %v\nline: %s", err, line)
 		}
 		cps = append(cps, cp)
+	}
+	if err := sc.Err(); err != nil {
+		t.Fatalf("scanning checkpoint %q: %v", path, err)
 	}
 	return cps
 }
@@ -2148,7 +2157,11 @@ func TestCheckpointFailure_BacksOffInsteadOfRetryingEverySeal(t *testing.T) {
 
 	// A permanently unwritable checkpoint file: every write-path Sync fails, and
 	// the rollback truncate+sync succeed so the file stays clean (not poisoned).
-	counter := &countingWriteFile{logSyncer: exp.checkFile, syncErr: fmt.Errorf("simulated ENOSPC")}
+	counter := &countingWriteFile{
+		logSyncer: exp.checkFile,
+		syncErr:   fmt.Errorf("simulated ENOSPC"),
+		pending:   exp.accumulator.PendingCount,
+	}
 	exp.mu.Lock()
 	exp.checkFile = counter
 	exp.mu.Unlock()
@@ -2171,10 +2184,13 @@ func TestCheckpointFailure_BacksOffInsteadOfRetryingEverySeal(t *testing.T) {
 	// 1 then 2), and the doubling starts from the second consecutive failure —
 	// so attempts land at pending 1, 2, 4, 8, 16. Assert the exact count rather
 	// than a loose bound, so a regression to "retry every seal" cannot slip past.
-	const wantAttempts = 5
-	if counter.attempts != wantAttempts {
-		t.Errorf("checkpoint attempts over %d seals: got %d, want %d (pending 1,2,4,8,16)",
-			seals, counter.attempts, wantAttempts)
+	// Assert the schedule itself, not just the count: a count alone is
+	// coincidental — starting the doubling one failure later gives 1,2,3,6,12,
+	// also five attempts.
+	wantSchedule := []int{1, 2, 4, 8, 16}
+	if !reflect.DeepEqual(counter.pendingAt, wantSchedule) {
+		t.Errorf("checkpoint attempts happened at pending %v, want %v",
+			counter.pendingAt, wantSchedule)
 	}
 	// Nothing may have been committed to the file either.
 	if data, err := os.ReadFile(cfg.CheckpointPath); err != nil {
@@ -2202,13 +2218,21 @@ func TestCheckpointFailure_BacksOffInsteadOfRetryingEverySeal(t *testing.T) {
 // left clean and never poisoned.
 type countingWriteFile struct {
 	logSyncer
-	syncErr  error
-	attempts int
-	inWrite  bool
+	syncErr error
+	// pending reports the accumulator's pending count; recording it per attempt
+	// pins the actual retry SCHEDULE, not just the attempt count. Safe to call:
+	// Write runs under e.mu and the accumulator has its own lock.
+	pending   func() int
+	attempts  int
+	pendingAt []int
+	inWrite   bool
 }
 
 func (f *countingWriteFile) Write(p []byte) (int, error) {
 	f.attempts++
+	if f.pending != nil {
+		f.pendingAt = append(f.pendingAt, f.pending())
+	}
 	f.inWrite = true
 	return f.logSyncer.Write(p)
 }
@@ -2313,9 +2337,12 @@ func TestPoisonedCheckpoint_DoesNotAccumulateTips(t *testing.T) {
 		t.Errorf("pending tips after %d seals on a poisoned file: got %d, want 0 — "+
 			"these can never be checkpointed, so retaining them is an unbounded leak", seals, pending)
 	}
-	// The first seal is the one that poisoned the file; the rest are counted.
-	if uncovered != seals-1 {
-		t.Errorf("uncovered traces counted: got %d, want %d", uncovered, seals-1)
+	// ALL seals are uncovered, including the one whose checkpoint attempt did the
+	// poisoning: its tip was pending and got dropped, so it is counted too.
+	// Counting only the traces sealed after poisoning would under-report by a
+	// whole checkpoint interval.
+	if uncovered != seals {
+		t.Errorf("uncovered traces counted: got %d, want %d", uncovered, seals)
 	}
 
 	// The audit log must still have every trace's entries — poisoning stops
@@ -2472,6 +2499,38 @@ func TestTransientCheckpointFailure_RetriesOnNextSeal(t *testing.T) {
 		t.Errorf("pending after the successful retry: got %d, want 0", got)
 	}
 
+	// Second cycle: the consecutive-failure counter must have been reset by the
+	// success above, so another isolated blip is again retried promptly rather
+	// than being treated as the second consecutive failure and doubled.
+	exp.mu.Lock()
+	exp.checkFile = &failSyncFile{
+		logSyncer: exp.checkFile,
+		syncErr:   fmt.Errorf("simulated second transient EIO"),
+		count:     1,
+	}
+	exp.mu.Unlock()
+
+	for i := 0; i < 10; i++ {
+		traceID := [16]byte{0xB1, byte(i)}
+		if err := exp.ConsumeTraces(context.Background(),
+			makeSpan(traceID, [8]byte{byte(i + 1)}, zeroParentID, "op2",
+				uint64(100_000_000+1_000_000*(i+1)), uint64(100_000_000+1_000_000*(i+2)))); err != nil {
+			t.Fatalf("ConsumeTraces cycle2 %d: %v", i, err)
+		}
+	}
+	if cps := readCheckpoints(t, cfg.CheckpointPath); len(cps) != 1 {
+		t.Fatalf("expected the second cycle's checkpoint to have failed, got %d", len(cps))
+	}
+	if err := exp.ConsumeTraces(context.Background(),
+		makeSpan([16]byte{0xB1, 0xFF}, [8]byte{0xFE}, zeroParentID, "op2-retry",
+			190_000_000, 191_000_000)); err != nil {
+		t.Fatalf("ConsumeTraces cycle2 retry: %v", err)
+	}
+	if cps := readCheckpoints(t, cfg.CheckpointPath); len(cps) != 2 {
+		t.Errorf("second transient failure was not retried promptly: got %d checkpoint(s), want 2 — "+
+			"the consecutive-failure counter was not reset by the earlier success", len(cps))
+	}
+
 	if err := exp.Shutdown(context.Background()); err != nil {
 		t.Fatalf("Shutdown: %v", err)
 	}
@@ -2481,5 +2540,45 @@ func TestTransientCheckpointFailure_RetriesOnNextSeal(t *testing.T) {
 	}
 	if len(report.Errors) != 0 {
 		t.Errorf("expected no verifier errors; got %v", report.Errors)
+	}
+}
+
+// TestNextCheckpointRetryAt covers the retry schedule directly, including the
+// cap. Without a cap, recovery latency after a healed outage grows with the
+// length of the outage: a file that becomes writable again at pending=600 would
+// not be retried until pending=1024, and a long outage is far worse.
+func TestNextCheckpointRetryAt(t *testing.T) {
+	e := newAgentAuditExporter(&Config{}, nil)
+
+	tests := []struct {
+		name     string
+		failures int
+		pending  int
+		want     int
+	}{
+		{"first failure retries promptly", 1, 10, 11},
+		{"first failure at scale still prompt", 1, 5000, 5001},
+		{"second failure doubles", 2, 10, 20},
+		{"later failure doubles", 5, 64, 128},
+		{"doubling applies up to the cap", 5, maxCheckpointRetryGap, 2 * maxCheckpointRetryGap},
+		{"beyond the cap the gap is capped", 5, maxCheckpointRetryGap + 1, maxCheckpointRetryGap*2 + 1},
+		{"long outage stays capped", 50, 200000, 200000 + maxCheckpointRetryGap},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			e.checkpointFailures = tt.failures
+			if got := e.nextCheckpointRetryAt(tt.pending); got != tt.want {
+				t.Errorf("nextCheckpointRetryAt(%d) with %d failures: got %d, want %d",
+					tt.pending, tt.failures, got, tt.want)
+			}
+		})
+	}
+
+	// The gap must never exceed the cap, at any scale.
+	e.checkpointFailures = 99
+	for _, pending := range []int{1, 100, 1023, 1024, 1025, 10000, 1 << 20} {
+		if gap := e.nextCheckpointRetryAt(pending) - pending; gap > maxCheckpointRetryGap {
+			t.Errorf("retry gap at pending=%d: got %d, want <= %d", pending, gap, maxCheckpointRetryGap)
+		}
 	}
 }

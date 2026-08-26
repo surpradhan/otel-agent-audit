@@ -782,20 +782,36 @@ func (e *agentAuditExporter) writeCheckpoint() (err error) {
 // later checkpoint, so no further checkpoint can ever be written. That makes the
 // pending tips undrainable: retaining them would grow the set without bound for
 // no possible benefit, so they are dropped here with a single loud log rather
-// than leaking. What is already persisted still verifies, and a restart clears
-// the condition — readLastCheckpoint resumes from the last valid line.
-func (e *agentAuditExporter) poisonCheckpoint(msg string, cause, underlying error) {
+// than leaking.
+//
+// What is already persisted still verifies for the lifetime of this process,
+// and a restart resumes the chain correctly — readLastCheckpoint picks the last
+// *valid* line. But a torn line left behind by the failed truncate still needs
+// manual attention: the file is opened O_APPEND, so the next checkpoint written
+// after a restart fuses onto it, and the verifier only tolerates an unparseable
+// line when it is the final one. See the follow-up issue on a newline guard.
+func (e *agentAuditExporter) poisonCheckpoint(msg string, err, cause error) {
 	if e.checkpointPoisoned {
 		return
 	}
 	e.checkpointPoisoned = true
 	dropped := e.accumulator.DropPending()
+	// The dropped tips are uncovered too — they were sealed since the last
+	// successful checkpoint and can now never be written. Counting only the
+	// traces sealed *after* poisoning would under-report by a whole checkpoint
+	// interval, and would report the least alarming number in the worst case.
+	//
+	// The one exception is the commit-failure path, where the checkpoint did
+	// reach disk and does cover its staged tips; that path is unreachable while
+	// e.mu serializes stage->commit, and over-reporting there is the safe
+	// direction anyway.
+	e.uncoveredAfterPoison += dropped
 	fields := []zap.Field{
-		zap.Error(cause),
+		zap.Error(err),
 		zap.Int("uncovered_tips_discarded", dropped),
 	}
-	if underlying != nil {
-		fields = append(fields, zap.NamedError("cause", underlying))
+	if cause != nil {
+		fields = append(fields, zap.NamedError("cause", cause))
 	}
 	e.logger.Error(msg+" — checkpointing is now permanently disabled for this process; "+
 		"sealed traces are still written to the audit log but will not be covered by any checkpoint",
