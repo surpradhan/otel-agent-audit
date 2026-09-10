@@ -3315,6 +3315,7 @@ func TestStart_TraceSpanningSchemaVersionsIsDropped(t *testing.T) {
 		{record.SchemaVersion, "v1"},
 		{"v2", "v99"},
 	} {
+		versions := versions
 		t.Run(versions[0]+"+"+versions[1], func(t *testing.T) {
 			env := newTestEnv(t)
 			const traceID = "01010101010101010101010101010101"
@@ -3325,9 +3326,6 @@ func TestStart_TraceSpanningSchemaVersionsIsDropped(t *testing.T) {
 			}
 
 			exp := startExporter(t, env.cfg)
-			if err := exp.Shutdown(context.Background()); err != nil {
-				t.Fatalf("Shutdown: %v", err)
-			}
 
 			entries := readLogEntries(t, env.cfg.LogPath)
 			if len(entries) != 0 {
@@ -3338,14 +3336,42 @@ func TestStart_TraceSpanningSchemaVersionsIsDropped(t *testing.T) {
 				t.Fatalf("a trace spanning schema versions must not be sealed; got %d entries at %v", len(entries), got)
 			}
 
-			// It must not replay forever either: the WAL is marked sealed, so a
-			// restart does not re-process it.
-			exp2 := startExporter(t, env.cfg)
-			if err := exp2.Shutdown(context.Background()); err != nil {
-				t.Fatalf("Shutdown 2: %v", err)
+			// It must not replay forever. Asserting "the log is still empty after
+			// a restart" would be vacuous — a still-present mixed trace is simply
+			// re-dropped, silently, every time. The durable property is that the
+			// records are gone from the WAL, so assert that directly.
+			walAfter, err := os.ReadFile(env.cfg.WalPath)
+			if err != nil && !os.IsNotExist(err) {
+				t.Fatalf("reading WAL: %v", err)
 			}
+			for _, name := range []string{"first", "second"} {
+				if bytes.Contains(walAfter, []byte(`"span_name":"`+name+`"`)) {
+					t.Errorf("dropped record %q still in the WAL; it will replay on every restart:\n%s", name, walAfter)
+				}
+			}
+
+			// And the records must have been set aside, not destroyed.
+			quarantined, err := os.ReadFile(env.cfg.WalPath + ".quarantine.jsonl")
+			if err != nil {
+				t.Fatalf("reading quarantine sidecar: %v", err)
+			}
+			for _, name := range []string{"first", "second"} {
+				if !bytes.Contains(quarantined, []byte(`"span_name":"`+name+`"`)) {
+					t.Errorf("dropped record %q is not in quarantine; it was destroyed:\n%s", name, quarantined)
+				}
+			}
+
+			// A later span must not re-open the dropped trace_id and write a
+			// silently truncated chain under it that verifies cleanly.
+			traceIDBytes := [16]byte{1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1}
+			rootID := [8]byte{0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff, 0x00, 0x11}
+			_ = exp.ConsumeTraces(context.Background(),
+				makeSpan(traceIDBytes, rootID, zeroParentID, "post-drop.root", 1764547200000000000, 1764547201000000000))
 			if entries := readLogEntries(t, env.cfg.LogPath); len(entries) != 0 {
-				t.Errorf("dropped trace replayed on restart: %d entries", len(entries))
+				t.Errorf("a span after the drop re-opened the trace and wrote %d entries; the trace must stay closed", len(entries))
+			}
+			if err := exp.Shutdown(context.Background()); err != nil {
+				t.Fatalf("Shutdown: %v", err)
 			}
 		})
 	}
@@ -3426,5 +3452,116 @@ func TestStart_SealedAtOwnVersionSurvivesCompaction(t *testing.T) {
 	}
 	if got := entries[0].Record.SchemaVersion; got != "v1" {
 		t.Errorf("sealed at %q, want v1", got)
+	}
+}
+
+// TestStart_TraceSpanningRestampableVersionsIsKept is the counterpart to the
+// drop test, and covers the pair the ordinary upgrade path actually produces.
+//
+// Re-stamping is in-memory only — wal.Compact deliberately rewrites each record
+// at its stored version — so one upgrade plus a second crash leaves a WAL trace
+// holding {previous, current}. Every version present is restampable to current,
+// so they collapse onto it exactly as a single one would; dropping the trace
+// because the SET has more than one member destroys audit data on a common path.
+func TestStart_TraceSpanningRestampableVersionsIsKept(t *testing.T) {
+	env := newTestEnv(t)
+	const traceIDHex = "01010101010101010101010101010101"
+	walLines := legacyWALLine("v2", traceIDHex, "0102030405060708", "aabbccddeeff0011", "pre-upgrade.child") +
+		legacyWALLine(record.SchemaVersion, traceIDHex, "0203040506070809", "aabbccddeeff0011", "post-upgrade.child")
+	if err := os.WriteFile(env.cfg.WalPath, []byte(walLines), 0600); err != nil {
+		t.Fatalf("writing WAL: %v", err)
+	}
+
+	exp := startExporter(t, env.cfg)
+	if err := exp.Shutdown(context.Background()); err != nil {
+		t.Fatalf("Shutdown: %v", err)
+	}
+
+	entries := readLogEntries(t, env.cfg.LogPath)
+	if len(entries) != 2 {
+		t.Fatalf("both records must survive; got %d entries", len(entries))
+	}
+	for i, e := range entries {
+		if e.Record.SchemaVersion != record.SchemaVersion {
+			t.Errorf("entry %d: schema_version %q, want %q", i, e.Record.SchemaVersion, record.SchemaVersion)
+		}
+	}
+	if err := verify.VerifyChain(entries, env.pubKey); err != nil {
+		t.Errorf("verifying the re-stamped chain: %v", err)
+	}
+	if _, err := os.Stat(env.cfg.WalPath + ".quarantine.jsonl"); !os.IsNotExist(err) {
+		t.Errorf("nothing should have been quarantined; sidecar exists (stat err: %v)", err)
+	}
+}
+
+// TestStart_SameSpanRedeliveredAcrossRestartIsNotDropped covers the other false
+// drop. wal.Replay returns every appended span line with no dedup, so a span
+// written under v2 and re-delivered post-upgrade as v3 appears twice under one
+// span_id. The buffer dedups it last-write-wins into a single current-version
+// record, so the trace is unanimous — but a version set computed over the raw
+// replayed slice sees two versions and destroys it.
+func TestStart_SameSpanRedeliveredAcrossRestartIsNotDropped(t *testing.T) {
+	env := newTestEnv(t)
+	const traceIDHex = "01010101010101010101010101010101"
+	const spanIDHex = "0102030405060708"
+	// The same span_id twice: the original v1 entry and its v3 re-delivery. v1 is
+	// chosen deliberately — it is NOT restampable, so if the version set is taken
+	// over the raw replayed slice the trace looks irreconcilable and is destroyed.
+	// After dedup only the v3 record survives, and the trace is unanimous.
+	walLines := legacyWALLine("v1", traceIDHex, spanIDHex, "", "original") +
+		legacyWALLine(record.SchemaVersion, traceIDHex, spanIDHex, "", "redelivered")
+	if err := os.WriteFile(env.cfg.WalPath, []byte(walLines), 0600); err != nil {
+		t.Fatalf("writing WAL: %v", err)
+	}
+
+	exp := startExporter(t, env.cfg)
+	if err := exp.Shutdown(context.Background()); err != nil {
+		t.Fatalf("Shutdown: %v", err)
+	}
+
+	entries := readLogEntries(t, env.cfg.LogPath)
+	if len(entries) != 1 {
+		t.Fatalf("a re-delivered span must dedup to one record, not be dropped; got %d entries", len(entries))
+	}
+	if got := entries[0].Record.SpanName; got != "redelivered" {
+		t.Errorf("span name %q, want the last write to win with %q", got, "redelivered")
+	}
+	if got := entries[0].Record.SchemaVersion; got != record.SchemaVersion {
+		t.Errorf("schema_version %q, want %q", got, record.SchemaVersion)
+	}
+	if err := verify.VerifyChain(entries, env.pubKey); err != nil {
+		t.Errorf("verifying the deduped chain: %v", err)
+	}
+}
+
+// TestSealTrace_UnsealableRecordsAreQuarantined pins that sealTrace's
+// cannot-seal path sets the records aside rather than erasing them. The audit
+// log has no way to record its own gap, so a drop with only a counter in a log
+// line leaves an operator unable to tell what was lost.
+func TestSealTrace_UnsealableRecordsAreQuarantined(t *testing.T) {
+	env := newTestEnv(t)
+	const traceID = "01010101010101010101010101010101"
+	if err := os.WriteFile(env.cfg.WalPath,
+		[]byte(legacyWALLine("", traceID, "0102030405060708", "", "corrupt.root")), 0600); err != nil {
+		t.Fatalf("writing WAL: %v", err)
+	}
+
+	exp := startExporter(t, env.cfg)
+	if err := exp.Shutdown(context.Background()); err != nil {
+		t.Fatalf("Shutdown: %v", err)
+	}
+
+	quarantined, err := os.ReadFile(env.cfg.WalPath + ".quarantine.jsonl")
+	if err != nil {
+		t.Fatalf("reading quarantine sidecar: %v", err)
+	}
+	if !bytes.Contains(quarantined, []byte(`"span_name":"corrupt.root"`)) {
+		t.Errorf("unsealable record was destroyed rather than quarantined:\n%s", quarantined)
+	}
+	// The sidecar must carry enough context to act on.
+	for _, want := range []string{`"trace_id"`, `"reason"`, `"current_schema_version"`, `"quarantined_at"`} {
+		if !bytes.Contains(quarantined, []byte(want)) {
+			t.Errorf("quarantine entry missing %s:\n%s", want, quarantined)
+		}
 	}
 }

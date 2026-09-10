@@ -440,17 +440,38 @@ A trace held at its stored version is sealed immediately rather than left open,
 and stays closed for the life of the process, so a span stamped with the current
 version cannot join it or start a second chain under the same `trace_id`.
 
-**A replayed trace spanning more than one stored version is dropped**, loudly, at
-Error, naming the `trace_id` and the versions found. Two crash-and-upgrade cycles
-on one in-flight trace can produce this. A chain carries exactly one
-`schema_version`, so no single-version chain can represent such a trace, and
-emitting a mixed one would produce an audit log that fails its own verification —
-a logged gap is the better failure. Its WAL entries are marked sealed so it does
-not replay on every subsequent restart.
+A replayed trace can hold **more than one** stored version. Re-stamping is
+in-memory only — `wal.Compact` deliberately rewrites each record at the version
+it was stored with — so one upgrade plus a second crash is enough to produce
+this, which is an ordinary upgrade path rather than an exotic one. The test is
+over the whole *set* of versions present, not its size:
 
-The same applies to a record whose `schema_version` cannot seed a chain at all
-(empty, as a corrupt WAL line decodes to): it is dropped with an Error rather
-than retried forever.
+- **Every version restampable** (e.g. `{v2, v3}`) → all of them are re-stamped to
+  the current version and the trace continues normally. Several restampable
+  versions collapse onto the current one exactly as safely as one does.
+- **Any version not restampable, mixed with others** (e.g. `{v1, v3}`) → the trace
+  is dropped, because no single-version chain can represent it and emitting a
+  mixed one would produce an audit log that fails its own verification.
+
+The version set is computed **after** de-duplicating by `span_id`. WAL entries
+are appended, not replaced, so a span re-delivered across an upgrade appears
+twice — once at each version — while only the deduplicated records are ever
+sealed. Deciding on the raw entries would destroy a trace whose surviving records
+are perfectly consistent.
+
+**Dropped records are quarantined, not erased.** They are appended to
+`<wal_path>.quarantine.jsonl` (mode 0600), one JSON object per line, each
+carrying the record plus the `trace_id`, the reason, the versions found and the
+current version; the Error log names that path and every `span_id` involved. The
+audit log has no way to record its own gap, so erasing evidence with a counter in
+a log line to show for it is not an option — an operator has to be able to see
+what was set aside and why. The dropped `trace_id` is then closed for the life of
+the process, so a later span cannot open a fresh chain under it and present a
+silently truncated trace that verifies cleanly.
+
+The same handling applies to a record whose `schema_version` cannot seed a chain
+at all (empty, as a corrupt WAL line decodes to): quarantined, dropped, and its
+WAL entries marked sealed rather than retried on every restart.
 
 Already-sealed logs are a different matter: never hand-edit a v2 log into v3
 form. Those records have been hashed and signed, so changing their canonical
