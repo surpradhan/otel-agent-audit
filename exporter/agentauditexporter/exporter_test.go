@@ -2582,3 +2582,174 @@ func TestNextCheckpointRetryAt(t *testing.T) {
 		}
 	}
 }
+
+// TestRestart_TornCheckpointLine_Fusion reproduces issue #24: a torn checkpoint
+// line (a partial write with no trailing newline) left behind by a crash must not
+// fuse onto the next checkpoint appended after a restart.
+//
+// This differs from TestRestart_CheckpointContinuity_PartialLine, whose truncated
+// line ends in '\n' and so never fuses. Here the line ends mid-token, which is what
+// an interrupted write actually leaves, and the assertion is end-to-end: after two
+// further checkpoints the whole file must still verify.
+func TestRestart_TornCheckpointLine_Fusion(t *testing.T) {
+	env := newTestEnv(t)
+	env.cfg.CheckpointInterval = 1
+
+	// Phase 1: one clean checkpoint.
+	exp1 := startExporter(t, env.cfg)
+	_ = exp1.ConsumeTraces(context.Background(), makeSpan([16]byte{0xE5}, [8]byte{0x01}, zeroParentID, "t1", 1000, 2000))
+	if err := exp1.Shutdown(context.Background()); err != nil {
+		t.Fatalf("Shutdown phase 1: %v", err)
+	}
+
+	// Simulate a crash mid-write: a partial JSON line with NO trailing newline.
+	f, err := os.OpenFile(env.cfg.CheckpointPath, os.O_APPEND|os.O_WRONLY, 0600)
+	if err != nil {
+		t.Fatalf("open checkpoint for torn append: %v", err)
+	}
+	if _, err := f.Write([]byte(`{"schema_version":"v1","checkpoint_seq":2,"timestamp":"`)); err != nil {
+		t.Fatalf("write torn line: %v", err)
+	}
+	_ = f.Close()
+
+	// Phase 2: restart and write two further checkpoints, so the fused line is
+	// no longer the final line of the file.
+	exp2 := startExporter(t, env.cfg)
+	_ = exp2.ConsumeTraces(context.Background(), makeSpan([16]byte{0xE6}, [8]byte{0x02}, zeroParentID, "t2", 3000, 4000))
+	_ = exp2.ConsumeTraces(context.Background(), makeSpan([16]byte{0xE7}, [8]byte{0x03}, zeroParentID, "t3", 5000, 6000))
+	if err := exp2.Shutdown(context.Background()); err != nil {
+		t.Fatalf("Shutdown phase 2: %v", err)
+	}
+
+	report, err := verify.VerifyLog(env.cfg.LogPath, env.cfg.CheckpointPath, env.pubKey)
+	if err != nil {
+		t.Fatalf("VerifyLog hard error: %v", err)
+	}
+	if len(report.Errors) != 0 {
+		t.Errorf("VerifyLog reported %d error(s): %v", len(report.Errors), report.Errors)
+	}
+}
+
+// TestRepairTrailingPartialLine covers repairTrailingPartialLine directly: it must
+// drop only an unterminated tail, and must never touch a complete line — including
+// a complete line that fails to parse, which is evidence the verifier has to see.
+func TestRepairTrailingPartialLine(t *testing.T) {
+	tests := []struct {
+		name        string
+		content     string
+		wantContent string
+		wantDropped int64
+	}{
+		{
+			name:        "torn tail is dropped",
+			content:     "{\"a\":1}\n{\"b\":2}\n{\"c\":",
+			wantContent: "{\"a\":1}\n{\"b\":2}\n",
+			wantDropped: 5,
+		},
+		{
+			name:        "file ending in newline is untouched",
+			content:     "{\"a\":1}\n{\"b\":2}\n",
+			wantContent: "{\"a\":1}\n{\"b\":2}\n",
+			wantDropped: 0,
+		},
+		{
+			name:        "complete but unparseable line is preserved",
+			content:     "{\"a\":1}\n{\"torn\":\n",
+			wantContent: "{\"a\":1}\n{\"torn\":\n",
+			wantDropped: 0,
+		},
+		{
+			name:        "single unterminated line truncates to empty",
+			content:     "{\"a\":",
+			wantContent: "",
+			wantDropped: 5,
+		},
+		{
+			name:        "empty file is untouched",
+			content:     "",
+			wantContent: "",
+			wantDropped: 0,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "f.jsonl")
+			if err := os.WriteFile(path, []byte(tc.content), 0600); err != nil {
+				t.Fatalf("WriteFile: %v", err)
+			}
+			dropped, err := repairTrailingPartialLine(path)
+			if err != nil {
+				t.Fatalf("repairTrailingPartialLine: %v", err)
+			}
+			if dropped != tc.wantDropped {
+				t.Errorf("dropped: got %d, want %d", dropped, tc.wantDropped)
+			}
+			got, err := os.ReadFile(path)
+			if err != nil {
+				t.Fatalf("ReadFile: %v", err)
+			}
+			if string(got) != tc.wantContent {
+				t.Errorf("content:\n  got  %q\n  want %q", got, tc.wantContent)
+			}
+			// Repair must be idempotent: a second pass changes nothing.
+			again, err := repairTrailingPartialLine(path)
+			if err != nil {
+				t.Fatalf("repairTrailingPartialLine (second pass): %v", err)
+			}
+			if again != 0 {
+				t.Errorf("second pass dropped %d bytes, want 0", again)
+			}
+		})
+	}
+}
+
+// TestRepairTrailingPartialLine_MissingFile confirms a not-yet-created file is a
+// no-op rather than an error, since Start runs the repair before O_CREATE.
+func TestRepairTrailingPartialLine_MissingFile(t *testing.T) {
+	dropped, err := repairTrailingPartialLine(filepath.Join(t.TempDir(), "absent.jsonl"))
+	if err != nil {
+		t.Fatalf("repairTrailingPartialLine on missing file: %v", err)
+	}
+	if dropped != 0 {
+		t.Errorf("dropped: got %d, want 0", dropped)
+	}
+}
+
+// TestRestart_TornAuditLogLine_Fusion is the audit-log counterpart of
+// TestRestart_TornCheckpointLine_Fusion. The log file is opened O_APPEND too, so a
+// torn entry left by a crash would otherwise fuse onto the next entry written after
+// a restart, and readLogEntries rejects any unparseable line at all.
+func TestRestart_TornAuditLogLine_Fusion(t *testing.T) {
+	env := newTestEnv(t)
+	env.cfg.CheckpointInterval = 1
+
+	exp1 := startExporter(t, env.cfg)
+	_ = exp1.ConsumeTraces(context.Background(), makeSpan([16]byte{0xE8}, [8]byte{0x01}, zeroParentID, "t1", 1000, 2000))
+	if err := exp1.Shutdown(context.Background()); err != nil {
+		t.Fatalf("Shutdown phase 1: %v", err)
+	}
+
+	f, err := os.OpenFile(env.cfg.LogPath, os.O_APPEND|os.O_WRONLY, 0600)
+	if err != nil {
+		t.Fatalf("open log for torn append: %v", err)
+	}
+	if _, err := f.Write([]byte(`{"record":{"schema_version":"v2","trace_id":"`)); err != nil {
+		t.Fatalf("write torn line: %v", err)
+	}
+	_ = f.Close()
+
+	exp2 := startExporter(t, env.cfg)
+	_ = exp2.ConsumeTraces(context.Background(), makeSpan([16]byte{0xE9}, [8]byte{0x02}, zeroParentID, "t2", 3000, 4000))
+	if err := exp2.Shutdown(context.Background()); err != nil {
+		t.Fatalf("Shutdown phase 2: %v", err)
+	}
+
+	report, err := verify.VerifyLog(env.cfg.LogPath, env.cfg.CheckpointPath, env.pubKey)
+	if err != nil {
+		t.Fatalf("VerifyLog hard error: %v", err)
+	}
+	if len(report.Errors) != 0 {
+		t.Errorf("VerifyLog reported %d error(s): %v", len(report.Errors), report.Errors)
+	}
+}

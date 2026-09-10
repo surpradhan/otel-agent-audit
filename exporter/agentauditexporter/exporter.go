@@ -20,6 +20,7 @@ package agentauditexporter
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
@@ -146,6 +147,26 @@ func (e *agentAuditExporter) Start(_ context.Context, _ component.Host) error {
 		return fmt.Errorf("agentaudit: loading signing key: %w", err)
 	}
 	e.signer = sign.NewEd25519Signer(priv)
+
+	// Repair a torn trailing line left by an interrupted append before reopening
+	// either file O_APPEND, so the next record starts on a fresh line instead of
+	// fusing onto the fragment. See repairTrailingPartialLine and issue #24.
+	for _, f := range []struct {
+		name string
+		path string
+	}{
+		{"audit log", e.cfg.LogPath},
+		{"checkpoint file", e.cfg.CheckpointPath},
+	} {
+		dropped, repairErr := repairTrailingPartialLine(f.path)
+		if repairErr != nil {
+			return fmt.Errorf("agentaudit: repairing %s %q: %w", f.name, f.path, repairErr)
+		}
+		if dropped > 0 {
+			e.logger.Warn("agentaudit: dropped torn trailing line",
+				zap.String("file", f.path), zap.Int64("bytes", dropped))
+		}
+	}
 
 	// Open audit log.
 	logF, err := os.OpenFile(e.cfg.LogPath, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0600)
@@ -605,6 +626,84 @@ func (e *agentAuditExporter) writeLogEntry(le chain.LogEntry) error {
 		return fmt.Errorf("agentaudit: write log entry: %w", err)
 	}
 	return nil
+}
+
+// repairTrailingPartialLine removes a trailing partial line from path — a line
+// with no terminating newline, which is what an append interrupted by a crash
+// leaves behind.
+//
+// Both the audit log and the checkpoint file are reopened O_APPEND on Start, so
+// without this the next record fuses onto the torn fragment and becomes one
+// corrupt line in the middle of the file. The verifier tolerates an unparseable
+// checkpoint line only as the final line, so a single further append turns a
+// tolerable tail into a hard failure that validates nothing — not even the good
+// prefix before it. See issue #24.
+//
+// Only an unterminated tail is removed. A complete line that fails to parse is
+// left in place: that is evidence of corruption or tampering the verifier must
+// still see, not an interrupted write. Dropping the tail is safe because a torn
+// line is by definition unparseable and uncommitted — writeCheckpoint advances
+// the accumulator only after a durable write (#20), so nothing references it.
+//
+// Returns the number of bytes dropped.
+func repairTrailingPartialLine(path string) (int64, error) {
+	f, err := os.OpenFile(path, os.O_RDWR, 0600)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return 0, nil
+		}
+		return 0, fmt.Errorf("agentaudit: opening %q for repair: %w", path, err)
+	}
+	defer func() { _ = f.Close() }()
+
+	st, err := f.Stat()
+	if err != nil {
+		return 0, fmt.Errorf("agentaudit: stat %q: %w", path, err)
+	}
+	size := st.Size()
+	if size == 0 {
+		return 0, nil
+	}
+
+	// A file already ending in a newline has no torn tail.
+	var last [1]byte
+	if _, err := f.ReadAt(last[:], size-1); err != nil {
+		return 0, fmt.Errorf("agentaudit: reading last byte of %q: %w", path, err)
+	}
+	if last[0] == '\n' {
+		return 0, nil
+	}
+
+	// Scan back for the newline that ends the last complete line. The scan is
+	// bounded: a tail longer than one maximum-size line is not a partial write,
+	// and truncating on that assumption could discard complete records.
+	start := size - maxScanTokenSize
+	if start < 0 {
+		start = 0
+	}
+	buf := make([]byte, size-start)
+	if _, err := f.ReadAt(buf, start); err != nil && !errors.Is(err, io.EOF) {
+		return 0, fmt.Errorf("agentaudit: reading tail of %q: %w", path, err)
+	}
+
+	cut := int64(0)
+	if idx := bytes.LastIndexByte(buf, '\n'); idx >= 0 {
+		cut = start + int64(idx) + 1
+	} else if start > 0 {
+		return 0, fmt.Errorf(
+			"agentaudit: %q has no line terminator in its last %d bytes; refusing to truncate",
+			path, maxScanTokenSize)
+	}
+
+	if err := f.Truncate(cut); err != nil {
+		return 0, fmt.Errorf("agentaudit: truncating torn tail of %q: %w", path, err)
+	}
+	// Persist the repair, so a crash before the next write does not resurrect
+	// the torn tail and leave the same fusion hazard for the following start.
+	if err := f.Sync(); err != nil {
+		return 0, fmt.Errorf("agentaudit: syncing repair of %q: %w", path, err)
+	}
+	return size - cut, nil
 }
 
 // readLastCheckpoint opens path for reading and returns the last valid Checkpoint
