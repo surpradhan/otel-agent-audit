@@ -12,6 +12,7 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"slices"
 	"sync"
 	"testing"
 	"time"
@@ -2725,6 +2726,16 @@ func TestStart_ReplayedTraceCanStillBeCompleted(t *testing.T) {
 	if len(entries) != 2 {
 		t.Fatalf("expected the replayed span and the post-restart root in one chain, got %d entries", len(entries))
 	}
+	// Naming both spans guards against a pass where replay silently dropped the
+	// child and some other entry took its place.
+	var names []string
+	for _, e := range entries {
+		names = append(names, e.Record.SpanName)
+	}
+	slices.Sort(names)
+	if !slices.Equal(names, []string{"post-upgrade.root", "pre-upgrade.child"}) {
+		t.Errorf("chain span names: got %v, want the replayed child and the post-restart root", names)
+	}
 	// Both entries must carry the same schema version — that is the whole point.
 	if entries[0].Record.SchemaVersion != entries[1].Record.SchemaVersion {
 		t.Errorf("chain mixes schema versions: %q and %q",
@@ -2735,5 +2746,148 @@ func TestStart_ReplayedTraceCanStillBeCompleted(t *testing.T) {
 	}
 	if err := verify.VerifyChain(entries, env.pubKey); err != nil {
 		t.Errorf("verifying a completed post-upgrade chain: %v", err)
+	}
+}
+
+// legacyWALLine builds a WAL span line stamped with an arbitrary schema version
+// and numeric (v1/v2-shaped) timestamps, as an earlier binary would have written it.
+func legacyWALLine(schemaVersion, traceID, spanID, parentSpanID, name string) string {
+	return `{"type":"span","trace_id":"` + traceID + `","record":` +
+		`{"schema_version":"` + schemaVersion + `","trace_id":"` + traceID + `","span_id":"` + spanID + `",` +
+		`"parent_span_id":"` + parentSpanID + `","seq_in_trace":0,"start_time_unix_nano":1764547200123456789,` +
+		`"end_time_unix_nano":1764547200987654321,"span_name":"` + name + `","otel_kind":"Client",` +
+		`"gen_ai_operation":"","audit_kind":"task","selected_attributes":null,"status":"Ok"}}` + "\n"
+}
+
+// TestStart_DoesNotRestampDataIncompatibleOrUnknownVersions pins the limit of
+// re-stamping. Adopting the current schema version is only safe where the two
+// versions agree on what a record's fields MEAN:
+//
+//   - v1 predates v2's widening of attributeAllowlist, so a v1 record's
+//     selected_attributes was computed under a narrower allowlist. Re-stamping
+//     would assert that a v1 binary looked for guardrail attributes and found
+//     none, when it never looked — misrepresented evidence that verifies cleanly.
+//   - A version this binary does not implement (here "v99", as a rollback would
+//     leave behind) cannot be vouched for at all.
+//
+// Either way the record keeps its stored version, and the trace is sealed at
+// that version rather than left open to accept current-version spans.
+func TestStart_DoesNotRestampDataIncompatibleOrUnknownVersions(t *testing.T) {
+	for _, storedVersion := range []string{"v1", "v99"} {
+		t.Run(storedVersion, func(t *testing.T) {
+			env := newTestEnv(t)
+			const traceID = "01010101010101010101010101010101"
+			if err := os.WriteFile(env.cfg.WalPath,
+				[]byte(legacyWALLine(storedVersion, traceID, "0102030405060708", "", "pre-upgrade.root")), 0600); err != nil {
+				t.Fatalf("writing legacy WAL: %v", err)
+			}
+
+			exp := startExporter(t, env.cfg)
+			if err := exp.Shutdown(context.Background()); err != nil {
+				t.Fatalf("Shutdown: %v", err)
+			}
+
+			entries := readLogEntries(t, env.cfg.LogPath)
+			if len(entries) != 1 {
+				t.Fatalf("expected 1 sealed entry, got %d", len(entries))
+			}
+			if got := entries[0].Record.SchemaVersion; got != storedVersion {
+				t.Errorf("schema_version: got %q, want %q — this version must not be re-stamped", got, storedVersion)
+			}
+			if err := verify.VerifyChain(entries, env.pubKey); err != nil {
+				t.Errorf("verifying a chain sealed at its stored version %q: %v", storedVersion, err)
+			}
+		})
+	}
+}
+
+// TestStart_UnrestampableTraceIsSealedNotLeftOpen is the other half: a trace
+// held at its stored version must not stay open, or a span stamped with the
+// current version would join it and the chain would mix versions.
+func TestStart_UnrestampableTraceIsSealedNotLeftOpen(t *testing.T) {
+	env := newTestEnv(t)
+	const traceIDHex = "01010101010101010101010101010101"
+	if err := os.WriteFile(env.cfg.WalPath,
+		[]byte(legacyWALLine("v1", traceIDHex, "0102030405060708", "aabbccddeeff0011", "pre-upgrade.child")), 0600); err != nil {
+		t.Fatalf("writing legacy WAL: %v", err)
+	}
+
+	exp := startExporter(t, env.cfg)
+
+	// A current-version span for the same trace arrives after the restart. The
+	// replayed trace is already sealed, so it is dropped rather than joining it.
+	traceID := [16]byte{1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1}
+	rootID := [8]byte{0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff, 0x00, 0x11}
+	_ = exp.ConsumeTraces(context.Background(),
+		makeSpan(traceID, rootID, zeroParentID, "post-upgrade.root", 1764547200000000000, 1764547201000000000))
+	if err := exp.Shutdown(context.Background()); err != nil {
+		t.Fatalf("Shutdown: %v", err)
+	}
+
+	entries := readLogEntries(t, env.cfg.LogPath)
+	for i, e := range entries {
+		if e.Record.SchemaVersion != entries[0].Record.SchemaVersion {
+			t.Fatalf("chain mixes schema versions at seq %d: %q vs %q",
+				i, e.Record.SchemaVersion, entries[0].Record.SchemaVersion)
+		}
+	}
+	if len(entries) != 1 || entries[0].Record.SchemaVersion != "v1" {
+		t.Errorf("expected the v1 trace sealed alone at v1, got %d entries at %q",
+			len(entries), entries[0].Record.SchemaVersion)
+	}
+	if err := verify.VerifyChain(entries, env.pubKey); err != nil {
+		t.Errorf("verifying the sealed v1 chain: %v", err)
+	}
+}
+
+// TestStart_RestampSurvivesSameSpanRedelivery covers the scenario the re-stamp
+// exists for, which no earlier test exercised: the SAME span_id is re-delivered
+// after the restart, replacing its replayed record last-write-wins with one
+// stamped at the current version. Without the re-stamp the buffer would hold
+// one v2 record and one v3 record and seal a chain mixing both.
+func TestStart_RestampSurvivesSameSpanRedelivery(t *testing.T) {
+	env := newTestEnv(t)
+	const traceIDHex = "01010101010101010101010101010101"
+	const childSpanHex = "0102030405060708"
+	if err := os.WriteFile(env.cfg.WalPath,
+		[]byte(legacyWALLine("v2", traceIDHex, childSpanHex, "aabbccddeeff0011", "pre-upgrade.child")), 0600); err != nil {
+		t.Fatalf("writing legacy WAL: %v", err)
+	}
+
+	exp := startExporter(t, env.cfg)
+
+	traceID := [16]byte{1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1}
+	childID := [8]byte{1, 2, 3, 4, 5, 6, 7, 8}
+	rootID := [8]byte{0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff, 0x00, 0x11}
+
+	// The upstream exporter re-delivers the same span after the restart.
+	_ = exp.ConsumeTraces(context.Background(),
+		makeSpan(traceID, childID, rootID, "redelivered.child", 1764547200123456789, 1764547200987654321))
+	// Then the root arrives and seals the trace.
+	_ = exp.ConsumeTraces(context.Background(),
+		makeSpan(traceID, rootID, zeroParentID, "post-upgrade.root", 1764547200000000000, 1764547201000000000))
+	if err := exp.Shutdown(context.Background()); err != nil {
+		t.Fatalf("Shutdown: %v", err)
+	}
+
+	entries := readLogEntries(t, env.cfg.LogPath)
+	if len(entries) != 2 {
+		t.Fatalf("expected the re-delivered child and the root in one chain, got %d entries", len(entries))
+	}
+	for i, e := range entries {
+		if e.Record.SchemaVersion != record.SchemaVersion {
+			t.Errorf("entry %d schema_version: got %q, want %q", i, e.Record.SchemaVersion, record.SchemaVersion)
+		}
+	}
+	// Last write wins: the re-delivered span replaced the replayed record.
+	var names []string
+	for _, e := range entries {
+		names = append(names, e.Record.SpanName)
+	}
+	if !slices.Contains(names, "redelivered.child") {
+		t.Errorf("re-delivered span did not replace the replayed record; span names: %v", names)
+	}
+	if err := verify.VerifyChain(entries, env.pubKey); err != nil {
+		t.Errorf("verifying the chain after a same-span re-delivery: %v", err)
 	}
 }

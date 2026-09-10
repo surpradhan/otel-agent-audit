@@ -6,6 +6,7 @@ import (
 	"encoding/base64"
 	"encoding/hex"
 	"os"
+	"regexp"
 	"strings"
 	"testing"
 
@@ -14,6 +15,10 @@ import (
 	"github.com/surpradhan/otel-agent-audit/exporter/agentauditexporter/internal/record"
 	"github.com/surpradhan/otel-agent-audit/exporter/agentauditexporter/internal/sign"
 )
+
+// numericTimestamp matches a timestamp field encoded as a JSON number rather
+// than a decimal string — the regression the v3 fixtures must never take.
+var numericTimestamp = regexp.MustCompile(`_unix_nano":[0-9]`)
 
 // knownTraceID is a fixed trace ID used for reproducible genesis-seed tests.
 const knownTraceID = "01010101010101010101010101010101"
@@ -666,7 +671,9 @@ func TestV3ChainFixture_TimestampsAreStrings(t *testing.T) {
 			t.Errorf("v3 chain fixture does not contain %s", want)
 		}
 	}
-	if strings.Contains(string(raw), `_unix_nano":1`) {
-		t.Error("v3 chain fixture contains a numerically encoded timestamp")
+	// Match any digit, not just the leading digit of today's fixture values: a
+	// re-mint with different timestamps must fail this too.
+	if numericTimestamp.Match(raw) {
+		t.Errorf("v3 chain fixture contains a numerically encoded timestamp: %s", numericTimestamp.Find(raw))
 	}
 }

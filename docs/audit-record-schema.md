@@ -218,14 +218,18 @@ The log entry JSON (one JSONL line per entry):
 A verifier MUST:
 1. Group log entries by `trace_id`; sort by `seq_in_trace`.
 2. Re-derive `genesisSeed` from `record.trace_id` as above.
-3. For each entry `i`: reconstruct `canonicalBytes[i]` by re-marshaling
+3. Check that every entry in the chain carries the same `schema_version`, and
+   reject the chain otherwise. Because each entry is re-marshaled in its own
+   shape (next step), a mixed chain would otherwise reproduce every hash and
+   verify — leaving this rule enforced only by whoever wrote the log.
+4. For each entry `i`: reconstruct `canonicalBytes[i]` by re-marshaling
    `record` (this includes `seq_in_trace = i`). Re-marshal in the wire shape of
    that record's own `schema_version` — in particular the timestamp encoding of
    §2.1 — not in the verifier's newest shape.
-4. Reconstruct `prev[i]` (genesisSeed for i=0; entryHash[i-1] for i>0).
-5. Reconstruct `sigPayload[i] = append(canonicalBytes[i][:len:len], prev[i]...)`.
-6. Verify the Ed25519 signature: `ed25519.Verify(pubKey, sigPayload[i], base64Decode(signed.signature))`.
-7. Cross-check `entryHash[i] = hex(SHA256(sigPayload[i]))` against `signed.entry_hash`.
+5. Reconstruct `prev[i]` (genesisSeed for i=0; entryHash[i-1] for i>0).
+6. Reconstruct `sigPayload[i] = append(canonicalBytes[i][:len:len], prev[i]...)`.
+7. Verify the Ed25519 signature: `ed25519.Verify(pubKey, sigPayload[i], base64Decode(signed.signature))`.
+8. Cross-check `entryHash[i] = hex(SHA256(sigPayload[i]))` against `signed.entry_hash`.
 
 The verifier MUST NOT derive `sigPayload` from the stored `entry_hash` — only
 from a fresh re-serialization of `record`. This ensures a tampered record
@@ -407,13 +411,24 @@ both automatically from the record's own `schema_version`; a third-party verifie
 must implement the same dispatch. `otel-agent-audit-verify` reads the schema
 version from the first log entry and selects the correct seed and encoding.
 
-**Upgrading a running collector:** a WAL left by a v2 binary replays cleanly into
-a v3 binary. WAL entries are unsealed drafts — nothing has hashed them — so on
-replay the exporter re-stamps each one to the current `schema_version` and it
-seals as part of a v3 chain. The recorded instants are unchanged; only their
-encoding is. This keeps every chain single-version even when a trace is
-completed after the upgrade by a span that arrives, or is re-delivered, stamped
-v3.
+**Upgrading a running collector:** a WAL left by an earlier binary replays
+cleanly. WAL entries are unsealed drafts — nothing has hashed them — so the
+exporter may adopt the current `schema_version` for one on replay, which keeps a
+crash-interrupted trace completable after the upgrade without its chain mixing
+versions (a span re-delivered afterwards replaces its record last-write-wins and
+arrives stamped with the current version).
+
+Re-stamping is allowed **only between versions that agree on what a record's
+fields mean** — it changes how a record is written, never what it asserts:
+
+| Stored version | On replay |
+|---|---|
+| v2 | Re-stamped to v3. The two differ only in timestamp encoding, so the recorded instants are unchanged and nothing else is reinterpreted. |
+| v1 | **Not** re-stamped. v2 widened the `selected_attributes` allowlist, so a v1 record's attributes were captured under narrower rules; re-stamping would assert that a v1 binary looked for guardrail attributes and found none, when it never looked. The trace is sealed as a v1 chain instead. |
+| Anything else, including a version newer than the binary | **Not** re-stamped — this binary cannot vouch for a format it does not implement, which is what a rollback leaves behind. Sealed at its stored version, and logged at Error. |
+
+A trace held at its stored version is sealed immediately rather than left open,
+so a span stamped with the current version cannot join it.
 
 Already-sealed logs are a different matter: never hand-edit a v2 log into v3
 form. Those records have been hashed and signed, so changing their canonical

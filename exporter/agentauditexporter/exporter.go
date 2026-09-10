@@ -28,6 +28,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"slices"
 	"sync"
 	"time"
 
@@ -183,27 +184,51 @@ func (e *agentAuditExporter) Start(_ context.Context, _ component.Host) error {
 	now := time.Now()
 	e.buffers = make(map[string]*traceBuffer, len(replayed))
 	e.sealedTraces = make(map[string]struct{})
+	// sealAtOwnVersion collects traces replayed at a schema version this binary
+	// must not re-stamp. They are sealed as soon as the accumulator exists,
+	// below, rather than left open: an open buffer would go on to accept spans
+	// stamped with the current version and seal one chain mixing two versions.
+	var sealAtOwnVersion []string
+
 	for traceID, recs := range replayed {
 		buf := &traceBuffer{
 			records:  make(map[string]record.AuditRecord, len(recs)),
 			lastSeen: now,
 		}
+		// A WAL entry is an unsealed draft: nothing has hashed it, so adopting
+		// the current schema version costs no stored hash or signature. That is
+		// only safe where the two versions agree on what the record's fields
+		// MEAN — record.RestampableToCurrent is the authority, and it excludes
+		// v1 (whose attributeAllowlist was narrower) and every version this
+		// binary does not implement, including a newer one left by a rollback.
+		//
+		// Re-stamping what we can keeps a crash-interrupted trace completable
+		// after an upgrade without mixing versions in its chain, since a
+		// re-delivered span replaces its record last-write-wins and arrives
+		// stamped with the current version.
+		restamped := 0
+		var storedVersion string
 		for _, rec := range recs {
-			// Re-stamp to the current schema version. A WAL entry written by an
-			// earlier binary carries that binary's schema_version, but it is an
-			// unsealed draft: nothing has hashed it, so no stored hash or
-			// signature depends on its encoding, and schema_version describes
-			// the record's format rather than its data. Leaving it alone would
-			// let one sealed chain mix versions, because a re-delivered span
-			// for the same trace replaces its record last-write-wins and would
-			// arrive stamped with the current version. Re-stamping keeps every
-			// chain single-version by construction while still allowing a
-			// crash-interrupted trace to be completed by later spans.
-			rec.SchemaVersion = record.SchemaVersion
+			if rec.SchemaVersion != record.SchemaVersion {
+				storedVersion = rec.SchemaVersion
+				if record.RestampableToCurrent(rec.SchemaVersion) {
+					rec.SchemaVersion = record.SchemaVersion
+					restamped++
+				} else if !slices.Contains(sealAtOwnVersion, traceID) {
+					sealAtOwnVersion = append(sealAtOwnVersion, traceID)
+				}
+			}
 			buf.records[rec.SpanID] = rec
 			if rec.ParentSpanID == "" {
 				buf.hasRoot = true
 			}
+		}
+		if restamped > 0 {
+			e.logger.Info("agentaudit: re-stamped replayed WAL records to the current schema version",
+				zap.String("trace_id", traceID),
+				zap.String("from", storedVersion),
+				zap.String("to", record.SchemaVersion),
+				zap.Int("records", restamped))
 		}
 		e.buffers[traceID] = buf
 	}
@@ -235,6 +260,21 @@ func (e *agentAuditExporter) Start(_ context.Context, _ component.Host) error {
 		e.logger.Warn("agentaudit: could not read last checkpoint on restart", zap.Error(cpErr))
 	}
 	e.accumulator = chain.NewAccumulator(e.signer, initialSeq, prevHash)
+
+	// Seal the traces that must keep their stored schema version, now that the
+	// accumulator sealTrace adds tips to exists. Sealing here costs them the
+	// trace_timeout grace window; leaving them open would cost the chain its
+	// single-version guarantee, which is the more expensive of the two.
+	for _, traceID := range sealAtOwnVersion {
+		buf := e.buffers[traceID]
+		if buf == nil {
+			continue
+		}
+		e.logger.Error("agentaudit: replayed trace holds records this binary must not re-stamp; sealing at its own schema version",
+			zap.String("trace_id", traceID),
+			zap.String("current_schema_version", record.SchemaVersion))
+		e.sealTrace(traceID, buf, e.effectiveCheckpointInterval())
+	}
 
 	traceTimeout := e.cfg.TraceTimeout
 	if traceTimeout <= 0 {

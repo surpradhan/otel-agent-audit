@@ -3,6 +3,7 @@ package wal_test
 import (
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"testing"
 
@@ -313,5 +314,47 @@ func TestWAL_ReplayAcceptsLegacyNumericTimestamps(t *testing.T) {
 	}
 	if got := uint64(recs[0].EndTimeUnixNano); got != 1764547200987654321 {
 		t.Errorf("EndTimeUnixNano: got %d, want 1764547200987654321", got)
+	}
+}
+
+// TestWAL_CompactPreservesStoredSchemaVersion pins that compaction re-encodes a
+// record in the shape of its OWN schema_version rather than the current one.
+// The exporter may re-stamp a replayed record in memory, but the WAL copy must
+// keep what was written: replay is then idempotent across repeated crashes, and
+// a record the current binary must not re-stamp stays recoverable by one that
+// can read it.
+func TestWAL_CompactPreservesStoredSchemaVersion(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "legacy.wal")
+	const legacyLine = `{"type":"span","trace_id":"trace001","record":` +
+		`{"schema_version":"v2","trace_id":"trace001","span_id":"span001","parent_span_id":"",` +
+		`"seq_in_trace":0,"start_time_unix_nano":1764547200123456789,` +
+		`"end_time_unix_nano":1764547200987654321,"span_name":"test.span","otel_kind":"Client",` +
+		`"gen_ai_operation":"","audit_kind":"task","selected_attributes":null,"status":"Ok"}}` + "\n"
+	if err := os.WriteFile(path, []byte(legacyLine), 0o644); err != nil {
+		t.Fatalf("write legacy wal: %v", err)
+	}
+
+	w, err := wal.Open(path)
+	if err != nil {
+		t.Fatalf("wal.Open: %v", err)
+	}
+	defer func() { _ = w.Close() }()
+
+	if _, err := w.Replay(); err != nil {
+		t.Fatalf("Replay: %v", err)
+	}
+	if err := w.Compact(); err != nil {
+		t.Fatalf("Compact: %v", err)
+	}
+
+	after, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read wal after compact: %v", err)
+	}
+	if !strings.Contains(string(after), `"schema_version":"v2"`) {
+		t.Errorf("compaction changed the stored schema_version: %s", after)
+	}
+	if !strings.Contains(string(after), `"start_time_unix_nano":1764547200123456789`) {
+		t.Errorf("compaction re-encoded a v2 timestamp out of its numeric form: %s", after)
 	}
 }

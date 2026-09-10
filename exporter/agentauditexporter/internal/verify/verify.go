@@ -72,9 +72,21 @@ func verifyChainReturnTip(entries []chain.LogEntry, pubKey ed25519.PublicKey) (s
 		return "", err
 	}
 
+	// The genesis seed comes from entries[0], and every entry is re-marshaled in
+	// the shape of its own schema_version, so a chain whose entries disagree on
+	// that field would otherwise reproduce every hash and pass. The format
+	// forbids it — one chain, one schema version — and an invariant upheld only
+	// by the writer is one a verifier cannot attest to, so check it here.
+	chainSchemaVersion := entries[0].Record.SchemaVersion
+
 	prev := genesisSeed
 	var lastHash [32]byte
 	for i, e := range entries {
+		if e.Record.SchemaVersion != chainSchemaVersion {
+			return "", fmt.Errorf("seq %d: schema_version %q does not match the chain's %q: entries of different schema versions must not share a chain",
+				i, e.Record.SchemaVersion, chainSchemaVersion)
+		}
+
 		canonicalBytes, err := canonical.Marshal(e.Record)
 		if err != nil {
 			return "", fmt.Errorf("seq %d: canonical marshal: %w", i, err)

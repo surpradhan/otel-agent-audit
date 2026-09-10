@@ -478,3 +478,20 @@ func TestLegacyRecordMirrorsAuditRecord(t *testing.T) {
 		}
 	}
 }
+
+// TestUnixNano_MarshalJSONAllocatesOnce pins the single-allocation encoding.
+// Nothing else would catch a regression here: the obvious implementation
+// (quoting a freshly formatted string) allocates twice and passes every other
+// test in this package. Marshal runs twice per record on the seal path, so the
+// difference is per-span in a telemetry pipeline.
+func TestUnixNano_MarshalJSONAllocatesOnce(t *testing.T) {
+	ts := UnixNano(v3FixtureStartNano)
+	got := testing.AllocsPerRun(1000, func() {
+		if _, err := ts.MarshalJSON(); err != nil {
+			t.Fatalf("MarshalJSON: %v", err)
+		}
+	})
+	if got > 1 {
+		t.Errorf("MarshalJSON allocations per call: got %v, want at most 1", got)
+	}
+}

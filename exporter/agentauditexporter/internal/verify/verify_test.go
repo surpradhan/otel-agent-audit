@@ -562,3 +562,67 @@ func TestVerifyLog_HappyPath_LegacySchemaLog(t *testing.T) {
 		})
 	}
 }
+
+// TestVerifyChain_RejectsMixedSchemaVersions pins the invariant the exporter
+// upholds by construction: one chain, one schema version. The seed comes from
+// entries[0] and every entry is re-marshaled in the shape of its own
+// schema_version, so before this check a mixed chain reproduced every hash and
+// verified cleanly — leaving the documented MUST enforced by nothing a verifier
+// could attest to.
+func TestVerifyChain_RejectsMixedSchemaVersions(t *testing.T) {
+	priv, pubKey, err := sign.GenerateEd25519Key()
+	if err != nil {
+		t.Fatalf("GenerateEd25519Key: %v", err)
+	}
+	signer := sign.NewEd25519Signer(priv)
+
+	mk := func(schemaVersion, spanID string, seq int, startNano record.UnixNano) record.AuditRecord {
+		return record.AuditRecord{
+			SchemaVersion:     schemaVersion,
+			TraceID:           fixtureTraceID,
+			SpanID:            spanID,
+			ParentSpanID:      "",
+			SeqInTrace:        seq,
+			StartTimeUnixNano: startNano,
+			EndTimeUnixNano:   startNano + 1000,
+			SpanName:          "mixed",
+			OtelKind:          "Internal",
+			AuditKind:         record.AuditKindTask,
+			Status:            "Ok",
+		}
+	}
+
+	// Build a genuinely well-formed chain whose second entry disagrees on
+	// schema_version — every hash and signature in it is correct.
+	recs := []record.AuditRecord{
+		mk(record.SchemaVersion, "aaaaaaaaaaaaaaaa", 0, 1764547200123456789),
+		mk("v2", "bbbbbbbbbbbbbbbb", 1, 1764547200987654321),
+	}
+	genesisSeed, err := chain.GenesisSeedForSchema(fixtureTraceID, recs[0].SchemaVersion)
+	if err != nil {
+		t.Fatalf("GenesisSeedForSchema: %v", err)
+	}
+	entries, err := chain.BuildChain(recs, genesisSeed, signer)
+	if err != nil {
+		t.Fatalf("BuildChain: %v", err)
+	}
+
+	err = verify.VerifyChain(chain.ToLogEntries(entries), pubKey)
+	if err == nil {
+		t.Fatal("a chain mixing schema versions verified; it must be rejected")
+	}
+	if !strings.Contains(err.Error(), "schema_version") {
+		t.Errorf("error should name the mismatched field, got: %v", err)
+	}
+
+	// The same chain, single-version, must still verify — the check must reject
+	// mixing, not chains in general.
+	recs[1].SchemaVersion = record.SchemaVersion
+	entries, err = chain.BuildChain(recs, genesisSeed, signer)
+	if err != nil {
+		t.Fatalf("BuildChain: %v", err)
+	}
+	if err := verify.VerifyChain(chain.ToLogEntries(entries), pubKey); err != nil {
+		t.Errorf("single-version chain must still verify: %v", err)
+	}
+}

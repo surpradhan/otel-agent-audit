@@ -117,7 +117,7 @@ verifier derives each trace's genesis seed and timestamp encoding from that
 trace's own entries, so a file spanning a collector upgrade verifies as-is. What
 must not happen is entries of different schema versions inside **one trace's
 chain**; the exporter seals each trace against the schema version of its own
-seq-0 record.
+seq-0 record, and the verifier rejects a chain whose entries disagree.
 
 ## Key-id verification
 

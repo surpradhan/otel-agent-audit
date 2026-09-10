@@ -44,6 +44,35 @@ func UsesNumericTimestamps(schemaVersion string) bool {
 	return legacy
 }
 
+// restampableToCurrent is the set of schema versions whose records a current
+// binary may safely re-stamp to SchemaVersion. Membership is a claim about
+// DATA, not encoding: every field of such a record means exactly what the same
+// field means under SchemaVersion, so adopting the current version changes only
+// how the record is written, never what it asserts.
+//
+// v1 is deliberately absent. v2 widened attributeAllowlist with the
+// gen_ai.guardrail.* keys, so a v1 record's selected_attributes was computed
+// under a narrower allowlist: re-stamping it would assert that a v1 binary
+// looked for guardrail attributes and found none, when in fact it never looked.
+// In an audit log that is misrepresented evidence, and it would verify cleanly.
+//
+// A version absent from this set — v1, or anything this binary does not know,
+// including one written by a NEWER binary after a rollback — must keep its own
+// schema_version. This binary cannot vouch for a format it does not implement.
+var restampableToCurrent = map[string]struct{}{
+	"v2": {},
+	"v3": {},
+}
+
+// RestampableToCurrent reports whether a stored record of schemaVersion may be
+// re-stamped to SchemaVersion without changing what it asserts. Callers holding
+// an unsealed record — WAL replay is the only one — use it to decide whether to
+// adopt the current version or preserve the stored one.
+func RestampableToCurrent(schemaVersion string) bool {
+	_, ok := restampableToCurrent[schemaVersion]
+	return ok
+}
+
 // UnixNano is a Unix-epoch nanosecond timestamp.
 //
 // It marshals as a JSON decimal string ("1764547200123456789"), not as a JSON
