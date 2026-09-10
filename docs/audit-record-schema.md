@@ -408,10 +408,16 @@ must implement the same dispatch. `otel-agent-audit-verify` reads the schema
 version from the first log entry and selects the correct seed and encoding.
 
 **Upgrading a running collector:** a WAL left by a v2 binary replays cleanly into
-a v3 binary. Replayed records keep their own `schema_version`, so an in-flight
-trace seals as a v2 chain and stays verifiable; traces that start after the
-upgrade seal as v3. Do not hand-edit a v2 log into v3 form — that changes the
-canonical bytes and invalidates every stored hash and signature in it.
+a v3 binary. WAL entries are unsealed drafts — nothing has hashed them — so on
+replay the exporter re-stamps each one to the current `schema_version` and it
+seals as part of a v3 chain. The recorded instants are unchanged; only their
+encoding is. This keeps every chain single-version even when a trace is
+completed after the upgrade by a span that arrives, or is re-delivered, stamped
+v3.
+
+Already-sealed logs are a different matter: never hand-edit a v2 log into v3
+form. Those records have been hashed and signed, so changing their canonical
+bytes invalidates every stored hash and signature in the file.
 
 ### v1-to-v2 changelog
 

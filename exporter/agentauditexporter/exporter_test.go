@@ -2583,17 +2583,73 @@ func TestNextCheckpointRetryAt(t *testing.T) {
 	}
 }
 
-// TestSealTrace_ReplayedLegacyRecordVerifies is the regression lock for the
-// upgrade path: a record replayed from a WAL written by an earlier binary keeps
-// its own schema_version, and sealTrace must derive the genesis seed from that
-// version rather than from the current package constant. When it doesn't, the
-// sealed chain fails verification on a log nobody tampered with — the worst
-// failure mode this component has.
-func TestSealTrace_ReplayedLegacyRecordVerifies(t *testing.T) {
+// TestSealTrace_UsesRecordSchemaVersionForGenesisSeed is the regression lock for
+// the genesis-seed derivation. sealTrace must seed the chain from the schema
+// version of the records it is sealing, not from the record.SchemaVersion
+// package constant: a verifier derives the seed from each entry's stored
+// schema_version, so a chain seeded from anything else fails verification on a
+// log nobody tampered with — the worst failure mode this component has.
+//
+// The buffer is populated directly rather than through WAL replay, because
+// replay now re-stamps records to the current version (see
+// TestStart_ReplayedRecordsAreRestampedToCurrentSchema). That makes this the
+// only test holding the seed derivation honest, which is the point: the
+// derivation must be correct for whatever version reaches it.
+func TestSealTrace_UsesRecordSchemaVersionForGenesisSeed(t *testing.T) {
+	env := newTestEnv(t)
+	exp := startExporter(t, env.cfg)
+
+	const legacyTraceID = "01010101010101010101010101010101"
+	exp.mu.Lock()
+	exp.buffers[legacyTraceID] = &traceBuffer{
+		records: map[string]record.AuditRecord{
+			"0102030405060708": {
+				SchemaVersion:     "v2",
+				TraceID:           legacyTraceID,
+				SpanID:            "0102030405060708",
+				ParentSpanID:      "",
+				StartTimeUnixNano: 1764547200123456789,
+				EndTimeUnixNano:   1764547200987654321,
+				SpanName:          "legacy.root",
+				OtelKind:          "Client",
+				AuditKind:         record.AuditKindTask,
+				Status:            "Ok",
+			},
+		},
+		lastSeen: time.Now(),
+		hasRoot:  true,
+	}
+	exp.mu.Unlock()
+
+	if err := exp.Shutdown(context.Background()); err != nil {
+		t.Fatalf("Shutdown: %v", err)
+	}
+
+	entries := readLogEntries(t, env.cfg.LogPath)
+	if len(entries) != 1 {
+		t.Fatalf("expected 1 sealed entry, got %d", len(entries))
+	}
+	if got := entries[0].Record.SchemaVersion; got != "v2" {
+		t.Errorf("sealed record schema_version: got %q, want %q", got, "v2")
+	}
+	if err := verify.VerifyChain(entries, env.pubKey); err != nil {
+		t.Errorf("verifying a chain sealed from a v2 record: %v\n"+
+			"sealTrace must use chain.GenesisSeedForSchema(traceID, recs[0].SchemaVersion)", err)
+	}
+}
+
+// TestStart_ReplayedRecordsAreRestampedToCurrentSchema pins the upgrade path: a
+// WAL left by an earlier binary carries that binary's schema_version, but its
+// entries are unsealed drafts — nothing has hashed them. Replay re-stamps them
+// to the current version so a trace completed after the upgrade seals into a
+// single-version chain, rather than one silently mixing encodings because a
+// re-delivered span replaced its record last-write-wins.
+//
+// The timestamp values must survive the re-stamp exactly: only the encoding
+// changes (JSON number to decimal string), never the instant recorded.
+func TestStart_ReplayedRecordsAreRestampedToCurrentSchema(t *testing.T) {
 	env := newTestEnv(t)
 
-	// A WAL line as a v2-era binary would have written it: numeric timestamps,
-	// schema_version "v2", never sealed because the process crashed first.
 	const legacyTraceID = "01010101010101010101010101010101"
 	legacyWAL := `{"type":"span","trace_id":"` + legacyTraceID + `","record":` +
 		`{"schema_version":"v2","trace_id":"` + legacyTraceID + `","span_id":"0102030405060708",` +
@@ -2604,7 +2660,6 @@ func TestSealTrace_ReplayedLegacyRecordVerifies(t *testing.T) {
 		t.Fatalf("writing legacy WAL: %v", err)
 	}
 
-	// Start replays it; Shutdown force-seals it.
 	exp := startExporter(t, env.cfg)
 	if err := exp.Shutdown(context.Background()); err != nil {
 		t.Fatalf("Shutdown: %v", err)
@@ -2614,17 +2669,71 @@ func TestSealTrace_ReplayedLegacyRecordVerifies(t *testing.T) {
 	if len(entries) != 1 {
 		t.Fatalf("expected 1 sealed entry, got %d", len(entries))
 	}
-	if got := entries[0].Record.SchemaVersion; got != "v2" {
-		t.Errorf("sealed record schema_version: got %q, want %q — a replayed record keeps its own version", got, "v2")
+	if got := entries[0].Record.SchemaVersion; got != record.SchemaVersion {
+		t.Errorf("replayed record schema_version: got %q, want %q", got, record.SchemaVersion)
 	}
 	if got := uint64(entries[0].Record.StartTimeUnixNano); got != 1764547200123456789 {
-		t.Errorf("StartTimeUnixNano: got %d, want 1764547200123456789", got)
+		t.Errorf("StartTimeUnixNano changed across the re-stamp: got %d, want 1764547200123456789", got)
+	}
+	if got := uint64(entries[0].Record.EndTimeUnixNano); got != 1764547200987654321 {
+		t.Errorf("EndTimeUnixNano changed across the re-stamp: got %d, want 1764547200987654321", got)
 	}
 
-	// The whole point: the verifier, which derives the seed from the stored
-	// schema_version, must accept this chain.
+	// The re-stamped record must be written in the current encoding.
+	raw, err := os.ReadFile(env.cfg.LogPath)
+	if err != nil {
+		t.Fatalf("reading log: %v", err)
+	}
+	if !bytes.Contains(raw, []byte(`"start_time_unix_nano":"1764547200123456789"`)) {
+		t.Errorf("re-stamped record not written with v3 string encoding: %s", raw)
+	}
+
 	if err := verify.VerifyChain(entries, env.pubKey); err != nil {
-		t.Errorf("verifying a sealed replayed v2 chain: %v\n"+
-			"sealTrace must use chain.GenesisSeedForSchema(traceID, recs[0].SchemaVersion)", err)
+		t.Errorf("verifying a re-stamped replayed chain: %v", err)
+	}
+}
+
+// TestStart_ReplayedTraceCanStillBeCompleted guards the capability the
+// re-stamping approach was chosen to preserve: a crash-interrupted trace stays
+// open after replay, so a root span arriving post-restart still completes it
+// into one chain. Sealing replayed buffers at startup instead would truncate
+// this trace to its replayed prefix.
+func TestStart_ReplayedTraceCanStillBeCompleted(t *testing.T) {
+	env := newTestEnv(t)
+
+	const legacyTraceID = "01010101010101010101010101010101"
+	legacyWAL := `{"type":"span","trace_id":"` + legacyTraceID + `","record":` +
+		`{"schema_version":"v2","trace_id":"` + legacyTraceID + `","span_id":"0102030405060708",` +
+		`"parent_span_id":"aabbccddeeff0011","seq_in_trace":0,"start_time_unix_nano":1764547200123456789,` +
+		`"end_time_unix_nano":1764547200987654321,"span_name":"pre-upgrade.child","otel_kind":"Client",` +
+		`"gen_ai_operation":"","audit_kind":"task","selected_attributes":null,"status":"Ok"}}` + "\n"
+	if err := os.WriteFile(env.cfg.WalPath, []byte(legacyWAL), 0600); err != nil {
+		t.Fatalf("writing legacy WAL: %v", err)
+	}
+
+	exp := startExporter(t, env.cfg)
+	// The root arrives after the upgrade and seals the trace.
+	traceID := [16]byte{1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1}
+	rootID := [8]byte{0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff, 0x00, 0x11}
+	_ = exp.ConsumeTraces(context.Background(),
+		makeSpan(traceID, rootID, zeroParentID, "post-upgrade.root", 1764547200000000000, 1764547201000000000))
+	if err := exp.Shutdown(context.Background()); err != nil {
+		t.Fatalf("Shutdown: %v", err)
+	}
+
+	entries := readLogEntries(t, env.cfg.LogPath)
+	if len(entries) != 2 {
+		t.Fatalf("expected the replayed span and the post-restart root in one chain, got %d entries", len(entries))
+	}
+	// Both entries must carry the same schema version — that is the whole point.
+	if entries[0].Record.SchemaVersion != entries[1].Record.SchemaVersion {
+		t.Errorf("chain mixes schema versions: %q and %q",
+			entries[0].Record.SchemaVersion, entries[1].Record.SchemaVersion)
+	}
+	if got := entries[0].Record.SchemaVersion; got != record.SchemaVersion {
+		t.Errorf("chain schema version: got %q, want %q", got, record.SchemaVersion)
+	}
+	if err := verify.VerifyChain(entries, env.pubKey); err != nil {
+		t.Errorf("verifying a completed post-upgrade chain: %v", err)
 	}
 }

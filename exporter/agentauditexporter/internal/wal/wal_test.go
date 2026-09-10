@@ -276,10 +276,10 @@ func TestWAL_ReplayTolerantPartialLine(t *testing.T) {
 // timestamps as JSON numbers, and a v3 binary must replay those entries
 // unchanged — same values, still pinned to their own schema_version.
 //
-// The sealing half — that such a replayed record then seals into a chain the
-// verifier reproduces — is covered by
-// TestSealTrace_ReplayedLegacyRecordVerifies in the exporter package, which is
-// where the genesis seed is chosen.
+// What happens next is the exporter's business, not the WAL's: on replay it
+// re-stamps the record to the current schema version before buffering it, so
+// the trace seals into a single-version chain. See
+// TestStart_ReplayedRecordsAreRestampedToCurrentSchema in the exporter package.
 func TestWAL_ReplayAcceptsLegacyNumericTimestamps(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "legacy.wal")
 	const legacyLine = `{"type":"span","trace_id":"trace001","record":` +

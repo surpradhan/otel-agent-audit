@@ -189,6 +189,17 @@ func (e *agentAuditExporter) Start(_ context.Context, _ component.Host) error {
 			lastSeen: now,
 		}
 		for _, rec := range recs {
+			// Re-stamp to the current schema version. A WAL entry written by an
+			// earlier binary carries that binary's schema_version, but it is an
+			// unsealed draft: nothing has hashed it, so no stored hash or
+			// signature depends on its encoding, and schema_version describes
+			// the record's format rather than its data. Leaving it alone would
+			// let one sealed chain mix versions, because a re-delivered span
+			// for the same trace replaces its record last-write-wins and would
+			// arrive stamped with the current version. Re-stamping keeps every
+			// chain single-version by construction while still allowing a
+			// crash-interrupted trace to be completed by later spans.
+			rec.SchemaVersion = record.SchemaVersion
 			buf.records[rec.SpanID] = rec
 			if rec.ParentSpanID == "" {
 				buf.hasRoot = true
