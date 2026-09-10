@@ -119,6 +119,28 @@ func (a *Accumulator) DropPending() int {
 	return n
 }
 
+// TrimPending drops the oldest pending tips so at most max remain, returning
+// how many were dropped (0 if none, or if max <= 0, which disables the cap).
+// The newest tips — the ones most likely to still be coverable once
+// checkpointing recovers — are kept.
+//
+// Do NOT call this between Stage and Commit, for the same reason documented on
+// DropPending: it does not preserve the prefix invariant StagedCheckpoint.tipCount
+// relies on. Trimming the front of pending after Stage has captured a prefix
+// would make Commit's pending[st.tipCount:] slice refer to the wrong tips.
+func (a *Accumulator) TrimPending(max int) int {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if max <= 0 || len(a.pending) <= max {
+		return 0
+	}
+	dropped := len(a.pending) - max
+	rest := make([]TraceTip, max)
+	copy(rest, a.pending[dropped:])
+	a.pending = rest
+	return dropped
+}
+
 // CheckpointSigningPayload returns the compact JSON bytes that were signed to
 // produce cp. It reconstructs the checkpointForSigning struct used by Build,
 // allowing callers to re-derive SHA256(payload) for chaining prevHash across

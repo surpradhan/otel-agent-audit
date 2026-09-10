@@ -7,7 +7,9 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"os"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
@@ -212,6 +214,75 @@ func TestAccumulator_PendingCount(t *testing.T) {
 	_, _ = acc.Build(time.Now())
 	if got := acc.PendingCount(); got != 0 {
 		t.Errorf("PendingCount after Build: got %d, want 0", got)
+	}
+}
+
+// TestAccumulator_TrimPending verifies TrimPending drops the oldest tips once
+// pending exceeds max, keeping exactly the newest max tips.
+func TestAccumulator_TrimPending(t *testing.T) {
+	signer, _ := makeTestSignerFull(t)
+	acc := chain.NewAccumulator(signer, 0, chain.ZeroPrevCheckpointHash)
+
+	for i := 0; i < 10; i++ {
+		acc.AddTip(fmt.Sprintf("t%d", i), fmt.Sprintf("h%d", i), 1)
+	}
+	if got := acc.PendingCount(); got != 10 {
+		t.Fatalf("PendingCount before trim: got %d, want 10", got)
+	}
+
+	if dropped := acc.TrimPending(3); dropped != 7 {
+		t.Errorf("TrimPending(3) dropped: got %d, want 7", dropped)
+	}
+	if got := acc.PendingCount(); got != 3 {
+		t.Fatalf("PendingCount after trim: got %d, want 3", got)
+	}
+
+	st, err := acc.Stage(time.Now())
+	if err != nil {
+		t.Fatalf("Stage: %v", err)
+	}
+	var gotIDs []string
+	for _, tip := range st.Checkpoint.TraceTips {
+		gotIDs = append(gotIDs, tip.TraceID)
+	}
+	wantIDs := []string{"t7", "t8", "t9"}
+	if !reflect.DeepEqual(gotIDs, wantIDs) {
+		t.Errorf("surviving tips: got %v, want %v (oldest must be dropped, newest kept)", gotIDs, wantIDs)
+	}
+}
+
+// TestAccumulator_TrimPending_NoopUnderOrAtCap verifies TrimPending does
+// nothing while pending is at or below max.
+func TestAccumulator_TrimPending_NoopUnderOrAtCap(t *testing.T) {
+	signer, _ := makeTestSignerFull(t)
+	acc := chain.NewAccumulator(signer, 0, chain.ZeroPrevCheckpointHash)
+
+	acc.AddTip("t0", "h0", 1)
+	acc.AddTip("t1", "h1", 1)
+
+	if dropped := acc.TrimPending(2); dropped != 0 {
+		t.Errorf("TrimPending at exactly cap: got %d dropped, want 0", dropped)
+	}
+	if dropped := acc.TrimPending(5); dropped != 0 {
+		t.Errorf("TrimPending under cap: got %d dropped, want 0", dropped)
+	}
+	if got := acc.PendingCount(); got != 2 {
+		t.Errorf("PendingCount unchanged: got %d, want 2", got)
+	}
+}
+
+// TestAccumulator_TrimPending_DisabledForNonPositiveMax verifies max<=0
+// disables the cap, matching effectiveMaxPendingTips' "unset" sentinel.
+func TestAccumulator_TrimPending_DisabledForNonPositiveMax(t *testing.T) {
+	signer, _ := makeTestSignerFull(t)
+	acc := chain.NewAccumulator(signer, 0, chain.ZeroPrevCheckpointHash)
+	acc.AddTip("t0", "h0", 1)
+
+	if dropped := acc.TrimPending(0); dropped != 0 {
+		t.Errorf("TrimPending(0): got %d dropped, want 0 (0 disables the cap)", dropped)
+	}
+	if dropped := acc.TrimPending(-1); dropped != 0 {
+		t.Errorf("TrimPending(-1): got %d dropped, want 0", dropped)
 	}
 }
 

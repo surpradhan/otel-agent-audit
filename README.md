@@ -108,6 +108,7 @@ exporters:
     trace_timeout:   30s
     checkpoint_interval: 100
     fsync_log: true   # default; set false to disable for high-throughput testing
+    max_pending_tips: 1000  # default: 10x checkpoint_interval; caps memory during a sustained checkpoint write failure
 
 service:
   pipelines:
