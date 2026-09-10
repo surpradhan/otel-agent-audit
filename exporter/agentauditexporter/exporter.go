@@ -497,7 +497,7 @@ func (e *agentAuditExporter) Start(_ context.Context, _ component.Host) error {
 	// added to the accumulator at all, e.g. a quarantined trace). Sealed
 	// markers for the tips just re-added above are retained so a further crash
 	// before the next checkpoint does not lose them again.
-	if err := w.Compact(e.accumulator.PendingTraceIDs()); err != nil {
+	if err := w.Compact(e.accumulator.PendingTips()); err != nil {
 		e.logger.Warn("agentaudit: WAL compact after replay failed", zap.Error(err))
 	}
 
@@ -646,7 +646,7 @@ func (e *agentAuditExporter) Shutdown(ctx context.Context) error {
 		e.checkFile = nil
 	}
 	if e.wal != nil {
-		if err := e.wal.Compact(e.accumulator.PendingTraceIDs()); err != nil {
+		if err := e.wal.Compact(e.accumulator.PendingTips()); err != nil {
 			e.logger.Warn("agentaudit: final WAL compact failed", zap.Error(err))
 		} else {
 			// No concurrent goroutines remain at this point (compactWG drained,
@@ -950,7 +950,7 @@ func (e *agentAuditExporter) sealTrace(traceID string, buf *traceBuffer, checkpo
 		acc := e.accumulator
 		go func() {
 			defer e.compactWG.Done()
-			if err := w.Compact(acc.PendingTraceIDs()); err != nil {
+			if err := w.Compact(acc.PendingTips()); err != nil {
 				e.logger.Warn("agentaudit: background WAL compact failed", zap.Error(err))
 				return
 			}

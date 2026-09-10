@@ -154,6 +154,11 @@ exists to prevent. In both cases the trace's entries remain durably in the
 audit log and `VerifyLog` does not flag the gap as an error, matching §3a
 and §3c.
 
+This guarantee is scoped per sealed segment, not per `trace_id`: a duplicate
+trace segment (§5) is a second, independent tip under the same `trace_id`, and
+each tip's coverage is tracked and recovered on its own — settling one (by
+checkpoint or by the cases above) never affects the other's pending state.
+
 ---
 
 ## 4. Single-replica constraint

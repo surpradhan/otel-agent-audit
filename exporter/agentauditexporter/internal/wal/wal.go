@@ -7,11 +7,11 @@
 // Sealed-but-uncheckpointed tips: MarkSealed carries the sealed trace's tip hash
 // and entry count. A sealed marker is not simply forgotten once its span entries
 // are compacted away — Compact keeps re-writing it forward, unexpanded, for as
-// long as the caller says the tip is still pending a checkpoint. That lets Start
-// re-add the tip straight to the accumulator via Replay's sealedPending result
-// after a crash, without re-sealing the trace (which would duplicate its already
-// -durable log entries) and without losing checkpoint coverage for it forever.
-// See the pending parameter on Compact and issue #22.
+// long as the caller says that specific tip is still pending a checkpoint. That
+// lets Start re-add the tip straight to the accumulator via Replay's
+// sealedPending result after a crash, without re-sealing the trace (which would
+// duplicate its already-durable log entries) and without losing checkpoint
+// coverage for it forever. See the pending parameter on Compact and issue #22.
 //
 // Thread-safety: WAL has an internal mutex.
 //   - All writes (AppendSpan, MarkSealed) are serialized by the WAL's internal mutex.
@@ -175,18 +175,25 @@ func (w *WAL) Replay() (buffers map[string][]record.AuditRecord, sealedPending [
 }
 
 // Compact rewrites the WAL, dropping in-progress span entries for sealed
-// traces. A sealed marker itself is only dropped once pending says its trace
-// is no longer awaiting a checkpoint (covered by one, or deliberately
-// abandoned by a policy like the pending-tip cap) — until then it is carried
-// forward unexpanded so Replay can restore the tip after a crash instead of
-// silently losing checkpoint coverage for it. Pass the accumulator's current
-// pending trace IDs (e.g. Accumulator.PendingTraceIDs); a nil/empty map keeps
-// no sealed markers, which is correct once nothing is pending.
+// traces. A sealed marker itself is only dropped once pending says its
+// specific tip is no longer awaiting a checkpoint (covered by one, or
+// deliberately abandoned by a policy like the pending-tip cap) — until then it
+// is carried forward unexpanded so Replay can restore the tip after a crash
+// instead of silently losing checkpoint coverage for it. Pass the
+// accumulator's current pending tips (e.g. Accumulator.PendingTips); a
+// nil/empty map keeps no sealed markers, which is correct once nothing is
+// pending.
+//
+// Retention is keyed by (trace_id, tip_hash), not trace_id alone: the same
+// trace_id can have two independent sealed markers outstanding at once (a
+// duplicate_trace_segment re-seal), and trace-ID-only matching would keep an
+// already-settled marker just because its trace_id has another, unrelated tip
+// still pending — resurrecting it into the accumulator on the next restart.
 //
 // It acquires the write lock, atomically renames the new file over the old
 // one, then re-opens the append fd so subsequent AppendSpan calls are not
 // writing to the unlinked inode. Compact calls Sync before rename.
-func (w *WAL) Compact(pending map[string]struct{}) error {
+func (w *WAL) Compact(pending map[string]map[string]struct{}) error {
 	w.mu.Lock()
 	defer w.mu.Unlock()
 
@@ -233,8 +240,10 @@ func (w *WAL) Compact(pending map[string]struct{}) error {
 				}
 			}
 			spans = filtered
-			if _, stillPending := pending[entry.TraceID]; stillPending {
-				keepSealed = append(keepSealed, entry)
+			if hashes, ok := pending[entry.TraceID]; ok {
+				if _, stillPending := hashes[entry.TipHash]; stillPending {
+					keepSealed = append(keepSealed, entry)
+				}
 			}
 		}
 	}

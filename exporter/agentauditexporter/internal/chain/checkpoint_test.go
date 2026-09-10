@@ -217,27 +217,28 @@ func TestAccumulator_PendingCount(t *testing.T) {
 	}
 }
 
-// TestAccumulator_PendingTraceIDs verifies PendingTraceIDs reflects exactly
-// the trace IDs currently awaiting a checkpoint, and that both a successful
-// Commit and a deliberate abandonment (TrimPending) remove a trace from it —
-// the WAL relies on this set to know which sealed markers it may safely drop.
-func TestAccumulator_PendingTraceIDs(t *testing.T) {
+// TestAccumulator_PendingTips verifies PendingTips reflects exactly the
+// (trace_id, tip_hash) pairs currently awaiting a checkpoint, and that both a
+// successful Commit and a deliberate abandonment (TrimPending) remove a tip
+// from it — the WAL relies on this to know which sealed markers it may safely
+// drop.
+func TestAccumulator_PendingTips(t *testing.T) {
 	signer, _ := makeTestSignerFull(t)
 	acc := chain.NewAccumulator(signer, 0, chain.ZeroPrevCheckpointHash)
 
-	if got := acc.PendingTraceIDs(); len(got) != 0 {
-		t.Errorf("initial PendingTraceIDs: got %v, want empty", got)
+	if got := acc.PendingTips(); len(got) != 0 {
+		t.Errorf("initial PendingTips: got %v, want empty", got)
 	}
 
 	acc.AddTip("t1", "h1", 1)
 	acc.AddTip("t2", "h2", 1)
-	got := acc.PendingTraceIDs()
-	want := map[string]struct{}{"t1": {}, "t2": {}}
+	got := acc.PendingTips()
+	want := map[string]map[string]struct{}{"t1": {"h1": {}}, "t2": {"h2": {}}}
 	if !reflect.DeepEqual(got, want) {
-		t.Errorf("PendingTraceIDs after 2 adds: got %v, want %v", got, want)
+		t.Errorf("PendingTips after 2 adds: got %v, want %v", got, want)
 	}
 
-	// A committed checkpoint removes its covered trace from the set.
+	// A committed checkpoint removes its covered tip from the set.
 	st, err := acc.Stage(time.Now())
 	if err != nil {
 		t.Fatalf("Stage: %v", err)
@@ -246,28 +247,61 @@ func TestAccumulator_PendingTraceIDs(t *testing.T) {
 	if err := acc.Commit(st); err != nil {
 		t.Fatalf("Commit: %v", err)
 	}
-	got = acc.PendingTraceIDs()
-	want = map[string]struct{}{"t3": {}}
+	got = acc.PendingTips()
+	want = map[string]map[string]struct{}{"t3": {"h3": {}}}
 	if !reflect.DeepEqual(got, want) {
-		t.Errorf("PendingTraceIDs after Commit: got %v, want %v", got, want)
+		t.Errorf("PendingTips after Commit: got %v, want %v", got, want)
 	}
 
-	// A deliberate abandonment (TrimPending) also removes a trace: it drops the
+	// A deliberate abandonment (TrimPending) also removes a tip: it drops the
 	// OLDEST pending tips, so adding t4 and trimming to 1 drops t3, keeps t4.
 	acc.AddTip("t4", "h4", 1)
 	if dropped := acc.TrimPending(1); dropped != 1 {
 		t.Fatalf("TrimPending(1): dropped %d, want 1", dropped)
 	}
-	got = acc.PendingTraceIDs()
-	want = map[string]struct{}{"t4": {}}
+	got = acc.PendingTips()
+	want = map[string]map[string]struct{}{"t4": {"h4": {}}}
 	if !reflect.DeepEqual(got, want) {
-		t.Errorf("PendingTraceIDs after TrimPending: got %v, want %v", got, want)
+		t.Errorf("PendingTips after TrimPending: got %v, want %v", got, want)
 	}
 
 	// DropPending abandons everything still pending.
 	acc.DropPending()
-	if got := acc.PendingTraceIDs(); len(got) != 0 {
-		t.Errorf("PendingTraceIDs after DropPending: got %v, want empty", got)
+	if got := acc.PendingTips(); len(got) != 0 {
+		t.Errorf("PendingTips after DropPending: got %v, want empty", got)
+	}
+}
+
+// TestAccumulator_PendingTips_TracksSameTraceIndependently pins the fix for
+// duplicate_trace_segment: a re-delivered root span for an already-sealed
+// trace_id starts an independent second chain, so the same trace_id can have
+// two tips pending at once. PendingTips must track them as separate entries —
+// collapsing by trace_id alone would make settling one tip look like it
+// settled the other too, since both would share the same key.
+func TestAccumulator_PendingTips_TracksSameTraceIndependently(t *testing.T) {
+	signer, _ := makeTestSignerFull(t)
+	acc := chain.NewAccumulator(signer, 0, chain.ZeroPrevCheckpointHash)
+
+	acc.AddTip("dup", "h1", 1)
+	acc.AddTip("dup", "h2", 1)
+	got := acc.PendingTips()
+	want := map[string]map[string]struct{}{"dup": {"h1": {}, "h2": {}}}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("PendingTips after 2 adds to the same trace_id: got %v, want %v", got, want)
+	}
+
+	// Settle only h1 (the older of the two) via TrimPending's oldest-first drop
+	// policy; add a third, unrelated tip so trimming to 2 has exactly one tip
+	// to drop.
+	acc.AddTip("other", "h3", 1)
+	if dropped := acc.TrimPending(2); dropped != 1 {
+		t.Fatalf("TrimPending(2): dropped %d, want 1", dropped)
+	}
+	got = acc.PendingTips()
+	want = map[string]map[string]struct{}{"dup": {"h2": {}}, "other": {"h3": {}}}
+	if !reflect.DeepEqual(got, want) {
+		t.Errorf("PendingTips after settling h1: got %v, want %v — h1 must be gone but h2, "+
+			"the same trace_id's other tip, must remain", got, want)
 	}
 }
 

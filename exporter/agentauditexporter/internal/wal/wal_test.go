@@ -196,7 +196,7 @@ func TestWAL_Compact_RetainsSealedMarkerForPendingTip(t *testing.T) {
 		t.Fatalf("MarkSealed: %v", err)
 	}
 
-	pending := map[string]struct{}{"trace001": {}}
+	pending := map[string]map[string]struct{}{"trace001": {"deadbeef": {}}}
 	if err := w.Compact(pending); err != nil {
 		t.Fatalf("Compact: %v", err)
 	}
@@ -247,7 +247,7 @@ func TestWAL_Compact_DropsSealedMarkerOnceNotPending(t *testing.T) {
 
 	// Empty pending set: trace001's tip has already been committed by a
 	// checkpoint (or deliberately dropped) by the time Compact runs.
-	if err := w.Compact(map[string]struct{}{}); err != nil {
+	if err := w.Compact(map[string]map[string]struct{}{}); err != nil {
 		t.Fatalf("Compact: %v", err)
 	}
 
@@ -257,6 +257,46 @@ func TestWAL_Compact_DropsSealedMarkerOnceNotPending(t *testing.T) {
 	}
 	if len(sealedPending) != 0 {
 		t.Errorf("sealedPending after compact = %+v, want none once the tip is no longer pending", sealedPending)
+	}
+}
+
+// TestWAL_Compact_TracksTraceAndTipHashIndependently pins the fix for the case
+// where the same trace_id has two independent sealed tips outstanding at
+// once: a re-delivered root span for an already-sealed trace_id starts a
+// second, independent chain (duplicate_trace_segment) once the exporter's
+// re-seal guard has cleared, producing a second WAL sealed marker under the
+// same trace_id before either tip has settled. Retention must be keyed by
+// (trace_id, tip_hash), not trace_id alone — trace-ID-only matching would keep
+// BOTH markers as long as the trace_id has any pending tip at all, resurrecting
+// an already-settled one into the accumulator on the next restart.
+func TestWAL_Compact_TracksTraceAndTipHashIndependently(t *testing.T) {
+	w, _ := openWAL(t)
+
+	// Two independent seals of the SAME trace_id, each carrying its own tip.
+	if err := w.MarkSealed("trace001", "hash1", 1); err != nil {
+		t.Fatalf("MarkSealed hash1: %v", err)
+	}
+	if err := w.MarkSealed("trace001", "hash2", 1); err != nil {
+		t.Fatalf("MarkSealed hash2: %v", err)
+	}
+
+	// hash1 has already been committed by a checkpoint (or deliberately
+	// dropped); only hash2 is still pending.
+	pending := map[string]map[string]struct{}{"trace001": {"hash2": {}}}
+	if err := w.Compact(pending); err != nil {
+		t.Fatalf("Compact: %v", err)
+	}
+
+	_, sealedPending, err := w.Replay()
+	if err != nil {
+		t.Fatalf("Replay after compact: %v", err)
+	}
+	if len(sealedPending) != 1 {
+		t.Fatalf("sealedPending after compact = %+v, want exactly 1 (only hash2 is still pending)", sealedPending)
+	}
+	if sealedPending[0].TipHash != "hash2" {
+		t.Errorf("sealedPending[0].TipHash = %q, want %q — hash1's settled marker must not survive "+
+			"Compact just because trace001 has another, unrelated tip still pending", sealedPending[0].TipHash, "hash2")
 	}
 }
 
