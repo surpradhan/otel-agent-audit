@@ -158,13 +158,31 @@ func (e *agentAuditExporter) Start(_ context.Context, _ component.Host) error {
 		{"audit log", e.cfg.LogPath},
 		{"checkpoint file", e.cfg.CheckpointPath},
 	} {
-		dropped, repairErr := repairTrailingPartialLine(f.path)
-		if repairErr != nil {
+		rep, repairErr := repairTrailingPartialLine(f.path)
+		switch {
+		case repairErr == nil:
+		case errors.Is(repairErr, errRepairUnavailable):
+			// Nothing is known to be torn, and the append-only open below may
+			// well succeed. Refusing to start here would deny a configuration
+			// that worked before this check existed.
+			e.logger.Error("agentaudit: could not check for a torn trailing line; "+
+				"a partial write left by an earlier crash will not be repaired",
+				zap.String("file", f.path), zap.Error(repairErr))
+		default:
 			return fmt.Errorf("agentaudit: repairing %s %q: %w", f.name, f.path, repairErr)
 		}
-		if dropped > 0 {
-			e.logger.Warn("agentaudit: dropped torn trailing line",
-				zap.String("file", f.path), zap.Int64("bytes", dropped))
+		switch {
+		case rep.Dropped > 0:
+			// Error, not Warn: bytes were removed from an audit file.
+			e.logger.Error("agentaudit: dropped torn trailing line",
+				zap.String("file", f.path),
+				zap.Int64("bytes", rep.Dropped),
+				zap.ByteString("dropped_prefix", rep.Prefix))
+		case rep.Terminated > 0:
+			e.logger.Warn("agentaudit: terminated an unterminated final line; "+
+				"the record was complete but its newline was not persisted",
+				zap.String("file", f.path),
+				zap.Int64("bytes", rep.Terminated))
 		}
 	}
 
@@ -628,16 +646,35 @@ func (e *agentAuditExporter) writeLogEntry(le chain.LogEntry) error {
 	return nil
 }
 
+// tornTailRepair reports what repairTrailingPartialLine did to a file.
+type tornTailRepair struct {
+	Dropped    int64  // bytes discarded as an interrupted write
+	Terminated int64  // bytes preserved by appending the missing newline
+	Prefix     []byte // bounded copy of the affected fragment
+}
+
+// errRepairUnavailable wraps a failure to *inspect* a file for a torn tail, as
+// distinct from a failure to repair one that is known to be torn. Opening
+// O_RDWR is refused for an append-only inode (Linux `chattr +a`, BSD `uappnd`),
+// on a read-only mount, and for a file whose mode grants write but not read —
+// all of which the plain O_APPEND|O_WRONLY open below tolerates. Treating those
+// as fatal would let a hygiene step deny startup for a configuration that
+// worked, and on evidence that says nothing about whether the file is torn.
+var errRepairUnavailable = errors.New("agentaudit: cannot inspect file for a torn trailing line")
+
+// maxTornTailPrefix caps how many bytes of a discarded fragment are logged.
+const maxTornTailPrefix = 256
+
 // repairTrailingPartialLine removes a trailing partial line from path — a line
 // with no terminating newline, which is what an append interrupted by a crash
 // leaves behind.
 //
 // Both the audit log and the checkpoint file are reopened O_APPEND on Start, so
-// without this the next record fuses onto the torn fragment and becomes one
-// corrupt line in the middle of the file. The verifier tolerates an unparseable
-// checkpoint line only as the final line, so a single further append turns a
-// tolerable tail into a hard failure that validates nothing — not even the good
-// prefix before it. See issue #24.
+// without this the next record written *after a restart* fuses onto the torn
+// fragment and becomes one corrupt line in the middle of the file. The verifier
+// tolerates an unparseable checkpoint line only as the final line, so a single
+// further append turns a tolerable tail into a hard failure that validates
+// nothing — not even the good prefix before it. See issue #24.
 //
 // Only an unterminated tail is removed. A complete line that fails to parse is
 // left in place: that is evidence of corruption or tampering the verifier must
@@ -645,33 +682,53 @@ func (e *agentAuditExporter) writeLogEntry(le chain.LogEntry) error {
 // line is by definition unparseable and uncommitted — writeCheckpoint advances
 // the accumulator only after a durable write (#20), so nothing references it.
 //
-// Returns the number of bytes dropped.
-func repairTrailingPartialLine(path string) (int64, error) {
-	f, err := os.OpenFile(path, os.O_RDWR, 0600)
+// The WAL is deliberately not repaired here: wal.Compact runs on Start after
+// Replay and rewrites the file via temp+rename, dropping unparseable lines, so
+// a torn WAL tail is already cleaned before anything appends to it.
+//
+// Single-writer assumption: this is the only place in the exporter that can
+// destroy bytes, and it assumes no other process is appending to path. Two
+// exporters sharing a log_path already corrupt the chain by interleaving, so
+// this does not make a working configuration worse — but the truncate would
+// discard whatever a second writer appended between the Stat and the Truncate.
+//
+// A fragment that is itself valid JSON is not an interrupted write: these files
+// carry one JSON object per line, and a strict prefix of such an object can
+// never parse. It is a complete, durable record whose terminating newline did
+// not reach disk — reachable with fsync_log disabled, where nothing orders the
+// record's bytes against the newline. Discarding it would destroy a signed
+// record and turn a log that verified cleanly into an entry_count_mismatch, so
+// that case is terminated with a newline instead of truncated. The same
+// evidence-preserving rule as for a complete-but-unparseable line.
+//
+// Returns what was done and a bounded prefix of the affected fragment, so an
+// operator can see the bytes rather than only a count.
+func repairTrailingPartialLine(path string) (tornTailRepair, error) {
+	f, err := os.OpenFile(path, os.O_RDWR, 0)
 	if err != nil {
 		if os.IsNotExist(err) {
-			return 0, nil
+			return tornTailRepair{}, nil
 		}
-		return 0, fmt.Errorf("agentaudit: opening %q for repair: %w", path, err)
+		return tornTailRepair{}, fmt.Errorf("%w: %v", errRepairUnavailable, err)
 	}
 	defer func() { _ = f.Close() }()
 
 	st, err := f.Stat()
 	if err != nil {
-		return 0, fmt.Errorf("agentaudit: stat %q: %w", path, err)
+		return tornTailRepair{}, fmt.Errorf("stat: %w", err)
 	}
 	size := st.Size()
 	if size == 0 {
-		return 0, nil
+		return tornTailRepair{}, nil
 	}
 
 	// A file already ending in a newline has no torn tail.
 	var last [1]byte
 	if _, err := f.ReadAt(last[:], size-1); err != nil {
-		return 0, fmt.Errorf("agentaudit: reading last byte of %q: %w", path, err)
+		return tornTailRepair{}, fmt.Errorf("reading last byte: %w", err)
 	}
 	if last[0] == '\n' {
-		return 0, nil
+		return tornTailRepair{}, nil
 	}
 
 	// Scan back for the newline that ends the last complete line. The scan is
@@ -682,28 +739,51 @@ func repairTrailingPartialLine(path string) (int64, error) {
 		start = 0
 	}
 	buf := make([]byte, size-start)
-	if _, err := f.ReadAt(buf, start); err != nil && !errors.Is(err, io.EOF) {
-		return 0, fmt.Errorf("agentaudit: reading tail of %q: %w", path, err)
+	n, err := f.ReadAt(buf, start)
+	if err != nil && !errors.Is(err, io.EOF) {
+		return tornTailRepair{}, fmt.Errorf("reading tail: %w", err)
+	}
+	if int64(n) != size-start {
+		// The file shrank under us, so every offset computed from Stat is stale.
+		return tornTailRepair{}, fmt.Errorf(
+			"file shrank while being repaired (read %d of %d bytes)", n, size-start)
 	}
 
 	cut := int64(0)
 	if idx := bytes.LastIndexByte(buf, '\n'); idx >= 0 {
 		cut = start + int64(idx) + 1
 	} else if start > 0 {
-		return 0, fmt.Errorf(
-			"agentaudit: %q has no line terminator in its last %d bytes; refusing to truncate",
-			path, maxScanTokenSize)
+		return tornTailRepair{}, fmt.Errorf(
+			"no line terminator in the last %d bytes, so the tail is not a partial write; "+
+				"refusing to truncate — inspect and rotate the file manually", maxScanTokenSize)
+	}
+
+	fragment := buf[cut-start:]
+	prefix := make([]byte, min(len(fragment), maxTornTailPrefix))
+	copy(prefix, fragment)
+
+	// A complete record that only lost its newline: terminate, do not discard.
+	if json.Valid(bytes.TrimSpace(fragment)) {
+		if _, err := f.WriteAt([]byte("\n"), size); err != nil {
+			return tornTailRepair{}, fmt.Errorf("terminating unterminated final line: %w", err)
+		}
+		if err := f.Sync(); err != nil {
+			return tornTailRepair{}, fmt.Errorf("syncing terminated final line: %w", err)
+		}
+		return tornTailRepair{Terminated: int64(len(fragment)), Prefix: prefix}, nil
 	}
 
 	if err := f.Truncate(cut); err != nil {
-		return 0, fmt.Errorf("agentaudit: truncating torn tail of %q: %w", path, err)
+		return tornTailRepair{}, fmt.Errorf("truncating torn tail: %w", err)
 	}
 	// Persist the repair, so a crash before the next write does not resurrect
 	// the torn tail and leave the same fusion hazard for the following start.
+	// Truncation mutates the inode's size, which fsync flushes; no parent-dir
+	// sync is needed because this open never creates a directory entry.
 	if err := f.Sync(); err != nil {
-		return 0, fmt.Errorf("agentaudit: syncing repair of %q: %w", path, err)
+		return tornTailRepair{}, fmt.Errorf("syncing repair: %w", err)
 	}
-	return size - cut, nil
+	return tornTailRepair{Dropped: size - cut, Prefix: prefix}, nil
 }
 
 // readLastCheckpoint opens path for reading and returns the last valid Checkpoint
@@ -885,10 +965,9 @@ func (e *agentAuditExporter) writeCheckpoint() (err error) {
 //
 // What is already persisted still verifies for the lifetime of this process,
 // and a restart resumes the chain correctly — readLastCheckpoint picks the last
-// *valid* line. But a torn line left behind by the failed truncate still needs
-// manual attention: the file is opened O_APPEND, so the next checkpoint written
-// after a restart fuses onto it, and the verifier only tolerates an unparseable
-// line when it is the final one. See the follow-up issue on a newline guard.
+// *valid* line. A torn line left behind by the failed truncate is removed by
+// repairTrailingPartialLine on the next Start (#24); it was never committed to
+// the accumulator, so nothing references it.
 func (e *agentAuditExporter) poisonCheckpoint(msg string, err, cause error) {
 	if e.checkpointPoisoned {
 		return
