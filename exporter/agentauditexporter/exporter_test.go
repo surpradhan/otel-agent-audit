@@ -2561,6 +2561,10 @@ func TestPendingCap_SuppressesPerAttemptLogOnceAtCap(t *testing.T) {
 	if err := exp.Start(context.Background(), nil); err != nil {
 		t.Fatalf("Start: %v", err)
 	}
+	// Drain the background WAL-compact goroutines sealTrace spawns before
+	// t.TempDir() removes the directory out from under them — otherwise this
+	// races os.RemoveAll and flakes with "unlinkat: directory not empty".
+	t.Cleanup(func() { _ = exp.Shutdown(context.Background()) })
 
 	counter := &countingWriteFile{
 		logSyncer: exp.checkFile,
