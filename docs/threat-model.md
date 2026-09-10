@@ -113,6 +113,8 @@ write+`fsync` attempt rate against the already-faulting file rises to one per
 sealed trace. The per-attempt failure log is suppressed during this steady
 state (the one-time cap-exceeded log and the `Shutdown` summary already cover
 it), so log volume does not scale with it, only the write attempts themselves do.
+Decoupling the attempt rate itself from recovery-detection speed is tracked as
+a follow-up (issue #30) rather than addressed here.
 
 This is distinct from the **poisoned** state (`errCheckpointPoisoned`): poisoning
 means no checkpoint can *ever* be written again for the life of the process, so

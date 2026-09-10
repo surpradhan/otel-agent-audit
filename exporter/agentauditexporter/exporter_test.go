@@ -22,6 +22,8 @@ import (
 	"go.opentelemetry.io/collector/exporter"
 	"go.opentelemetry.io/collector/pdata/pcommon"
 	"go.opentelemetry.io/collector/pdata/ptrace"
+	"go.uber.org/zap"
+	"go.uber.org/zap/zaptest/observer"
 
 	"github.com/surpradhan/otel-agent-audit/exporter/agentauditexporter/internal/chain"
 	"github.com/surpradhan/otel-agent-audit/exporter/agentauditexporter/internal/record"
@@ -2538,6 +2540,57 @@ func TestPendingCap_DropsOldestTipsAndRecovers(t *testing.T) {
 	shutdownErr := exp.Shutdown(context.Background())
 	if shutdownErr == nil {
 		t.Error("expected Shutdown to report the tips dropped for the pending cap")
+	}
+}
+
+// TestPendingCap_SuppressesPerAttemptLogOnceAtCap is the regression guard for
+// the log-flood fix in sealTrace's Step 6: once pending is pinned at the cap,
+// nextCheckpointRetryAt's clamp means shouldCheckpoint retries on literally
+// every seal for the rest of the outage, so an unthrottled per-attempt
+// "write checkpoint" failure log would flood for as long as it lasts. Only the
+// one-time "pending tip set exceeded its cap" warning should survive at
+// steady state — the per-attempt log must stop once pendingCapWarned is set.
+func TestPendingCap_SuppressesPerAttemptLogOnceAtCap(t *testing.T) {
+	env := newTestEnv(t)
+	cfg := env.cfg
+	cfg.CheckpointInterval = 1
+	cfg.MaxPendingTips = 5
+
+	core, logs := observer.New(zap.ErrorLevel)
+	exp := newAgentAuditExporter(cfg, zap.New(core))
+	if err := exp.Start(context.Background(), nil); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+
+	counter := &countingWriteFile{
+		logSyncer: exp.checkFile,
+		syncErr:   fmt.Errorf("simulated ENOSPC"),
+	}
+	exp.mu.Lock()
+	exp.checkFile = counter
+	exp.mu.Unlock()
+
+	const seals = 40
+	for i := 0; i < seals; i++ {
+		traceID := [16]byte{0xC0, byte(i)}
+		if err := exp.ConsumeTraces(context.Background(),
+			makeSpan(traceID, [8]byte{byte(i + 1)}, zeroParentID, "op",
+				uint64(1_000_000*(i+1)), uint64(1_000_000*(i+2)))); err != nil {
+			t.Fatalf("ConsumeTraces %d: %v", i, err)
+		}
+	}
+
+	// The exact pre-cap schedule for interval=1, cap=5: attempts fire at
+	// pending 1, 2, 4, 5 (four total) before pendingCapWarned is set during the
+	// seal that first exceeds the cap, which is also when the per-attempt log
+	// for that same seal is suppressed — asserting the exact count (not a loose
+	// bound) so a regression back to "logs every seal" cannot slip past.
+	if got := logs.FilterMessage("agentaudit: write checkpoint").Len(); got != 4 {
+		t.Errorf("per-attempt \"write checkpoint\" failure logs across %d seals: got %d, want 4 — "+
+			"suppression once pinned at the cap must not be logging every attempt", seals, got)
+	}
+	if got := logs.FilterMessageSnippet("pending tip set exceeded its cap").Len(); got != 1 {
+		t.Errorf("pending-cap-exceeded warning logs: got %d, want exactly 1 (once per degraded episode)", got)
 	}
 }
 
