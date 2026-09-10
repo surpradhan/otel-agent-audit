@@ -881,8 +881,9 @@ func (e *agentAuditExporter) sealTrace(traceID string, buf *traceBuffer, checkpo
 	// pending (added to the accumulator, not yet checkpoint-committed), a crash
 	// before the next successful checkpoint does not lose its coverage. A trace
 	// that is never added to the accumulator (poisoned, quarantined, unsealable)
-	// is never pending, so Compact drops its marker immediately regardless of
-	// the payload — see wal.Compact.
+	// is never pending, so sealedMarkerTip below writes an empty marker for it
+	// immediately, the same as Compact would otherwise drop it on its next
+	// pass — see wal.Compact and sealedMarkerTip.
 	tipHash := chain.TipHash(entries)
 
 	// Step 5: update accumulator.
@@ -932,18 +933,9 @@ func (e *agentAuditExporter) sealTrace(traceID string, buf *traceBuffer, checkpo
 	}
 
 	// Step 7: mark WAL sealed (calls Sync), carrying the tip so Compact below
-	// can retain it if the trace is still pending a checkpoint. Step 6's own
-	// checkpoint attempt may have just committed this exact tip inline (its
-	// interval reached on this very seal) — re-check PendingTips rather than
-	// carrying tipHash unconditionally, or a crash between this fsynced write
-	// and Step 8's Compact would resurrect an already-covered tip as pending
-	// on restart. Mirrors the empty-tip convention markWALSealed already uses
-	// for a trace that was never added to the accumulator.
+	// can retain it if the trace is still pending a checkpoint.
 	if e.wal != nil {
-		sealTipHash, sealEntryCount := tipHash, len(entries)
-		if _, stillPending := e.accumulator.PendingTips()[traceID][tipHash]; !stillPending {
-			sealTipHash, sealEntryCount = "", 0
-		}
+		sealTipHash, sealEntryCount := sealedMarkerTip(e.accumulator, traceID, tipHash, len(entries))
 		if err := e.wal.MarkSealed(traceID, sealTipHash, sealEntryCount); err != nil {
 			e.logger.Error("agentaudit: WAL mark sealed",
 				zap.String("trace_id", traceID), zap.Error(err))
@@ -1060,6 +1052,25 @@ func (e *agentAuditExporter) quarantineRecords(traceID string, recs []record.Aud
 		zap.Int("quarantined", written),
 		zap.String("quarantine_path", path))
 	return written
+}
+
+// sealedMarkerTip decides what tip payload sealTrace's Step 7 should carry
+// into the WAL's sealed marker: the trace's own tip if it is still awaiting a
+// checkpoint, or an empty marker otherwise. "Otherwise" covers two distinct
+// cases identically: Step 6's checkpoint attempt already committed this exact
+// tip inline on this same seal (the ordinary, common case — see the crash
+// window this closes at exporter.go's sealTrace Step 7), or the trace was
+// never added to the accumulator at all (checkpointPoisoned, quarantined,
+// unsealable — acc.PendingTips()[traceID] is then absent and the lookup is a
+// safe nil-map read). Either way carrying the stale tipHash forward would let
+// a crash before Step 8's Compact resurrect a tip that must not come back:
+// already durably covered in the first case, permanently uncoverable in the
+// second.
+func sealedMarkerTip(acc *chain.Accumulator, traceID, tipHash string, entryCount int) (string, int) {
+	if _, stillPending := acc.PendingTips()[traceID][tipHash]; !stillPending {
+		return "", 0
+	}
+	return tipHash, entryCount
 }
 
 // markWALSealed marks traceID sealed in the WAL, logging rather than returning

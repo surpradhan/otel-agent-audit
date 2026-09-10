@@ -2164,86 +2164,94 @@ func TestRestart_SecondSegmentSpanSurvivesCrashAfterRetainedEarlierMarker(t *tes
 	}
 }
 
-// TestSealTrace_DoesNotResurrectTipCheckpointedInlineOnTheSameSeal mirrors
-// sealTrace's Step 5-7 sequence directly against chain.Accumulator and
-// wal.WAL, rather than through the live exporter. sealTrace's Step 6 can
-// commit a trace's own just-added tip inline (e.g. CheckpointInterval
-// reached on this very seal), and Step 7 must not then carry that
-// already-committed tip into MarkSealed — otherwise a crash strictly between
-// Step 7's fsynced WAL write and Step 8's async Compact resurrects it as
-// pending on restart.
+// TestSealedMarkerTip exercises sealedMarkerTip directly — the real function
+// sealTrace's Step 7 calls, not a copy of its logic — against the real
+// chain.Accumulator, covering both cases where Step 7 must not carry the tip
+// forward: an inline-committed checkpoint, and a trace never added to the
+// accumulator at all (checkpointPoisoned, quarantined, unsealable).
 //
-// That window is exactly what Step 8's own Compact call heals once it runs —
-// Compact reads PendingTips() live and correctly drops a stale marker just as
-// well as Step 7 writing an empty one from the start would have — so the two
-// are indistinguishable by any check made AFTER Step 8 completes; the only
-// way to observe the difference is a crash strictly inside that window.
-// Racing that goroutine from a black-box test to land inside it is exactly
-// the kind of non-determinism this file already works around elsewhere via
-// compactWG.Wait() (see TestSealedTraces_EvictedAfterCompact) — and unlike
-// that case, there is no wait-based fix here, since waiting for Step 8 is
-// precisely what erases the difference this test exists to catch. So this
-// deliberately does not call sealTrace or go through ConsumeTraces: it
-// reproduces Step 7's decision inline against the real chain.Accumulator and
-// wal.WAL, the same approach used to independently confirm this gap in the
-// first place. That means a future regression that reintroduces the bug by
-// changing sealTrace's own code (rather than the Accumulator/WAL contract
-// this test pins) would NOT be caught here — a known, accepted gap given the
-// alternative is a non-deterministic live test.
-func TestSealTrace_DoesNotResurrectTipCheckpointedInlineOnTheSameSeal(t *testing.T) {
+// This still cannot exercise sealTrace's own call to sealedMarkerTip through
+// the live exporter: the bug this closes is only observable in the narrow
+// window between Step 7's fsynced WAL write and Step 8's async Compact
+// completing, and Compact reads PendingTips() live, so it heals a stale
+// marker exactly as well as sealedMarkerTip writing an empty one from the
+// start would have — the two are indistinguishable by anything checked after
+// Step 8 completes. Racing that goroutine from a black-box test to land
+// inside the window is exactly the non-determinism this file already works
+// around elsewhere via compactWG.Wait() (see TestSealedTraces_EvictedAfterCompact)
+// — and unlike that case, there is no wait-based fix here, since waiting for
+// Step 8 is precisely what erases the difference this test exists to catch.
+// Calling the real sealedMarkerTip (rather than copying its body inline, as
+// an earlier version of this test did) at least means a regression inside
+// that function is still caught; only "sealTrace stopped calling it" would
+// not be.
+func TestSealedMarkerTip(t *testing.T) {
 	priv, _, err := sign.GenerateEd25519Key()
 	if err != nil {
 		t.Fatalf("GenerateEd25519Key: %v", err)
 	}
-	acc := chain.NewAccumulator(sign.NewEd25519Signer(priv), 0, chain.ZeroPrevCheckpointHash)
 
-	const traceID = "01010101010101010101010101010101"
-	const tipHash = "deadbeef"
+	t.Run("inline_committed_checkpoint", func(t *testing.T) {
+		acc := chain.NewAccumulator(sign.NewEd25519Signer(priv), 0, chain.ZeroPrevCheckpointHash)
+		const traceID = "01010101010101010101010101010101"
+		const tipHash = "deadbeef"
 
-	// Step 5.
-	acc.AddTip(traceID, tipHash, 1)
+		// Step 5.
+		acc.AddTip(traceID, tipHash, 1)
 
-	// Step 6, standing in for writeCheckpoint succeeding inline on this same
-	// seal: Stage+Commit removes the tip from pending before Step 7 runs.
-	st, err := acc.Stage(time.Now())
-	if err != nil {
-		t.Fatalf("Stage: %v", err)
-	}
-	if err := acc.Commit(st); err != nil {
-		t.Fatalf("Commit: %v", err)
-	}
-	if got := acc.PendingCount(); got != 0 {
-		t.Fatalf("PendingCount after inline commit: got %d, want 0", got)
-	}
+		// Step 6, standing in for writeCheckpoint succeeding inline on this
+		// same seal: Stage+Commit removes the tip from pending before Step 7
+		// runs.
+		st, err := acc.Stage(time.Now())
+		if err != nil {
+			t.Fatalf("Stage: %v", err)
+		}
+		if err := acc.Commit(st); err != nil {
+			t.Fatalf("Commit: %v", err)
+		}
+		if got := acc.PendingCount(); got != 0 {
+			t.Fatalf("PendingCount after inline commit: got %d, want 0", got)
+		}
 
-	// Step 7's decision, exactly as sealTrace implements it.
-	sealTipHash, sealEntryCount := tipHash, 1
-	if _, stillPending := acc.PendingTips()[traceID][tipHash]; !stillPending {
-		sealTipHash, sealEntryCount = "", 0
-	}
-	if sealTipHash != "" || sealEntryCount != 0 {
-		t.Fatalf("Step 7 would carry a stale tip (%q, %d) into MarkSealed after Step 6 already "+
-			"committed it inline; a crash before Step 8's Compact resurrects it as pending on restart",
-			sealTipHash, sealEntryCount)
-	}
+		sealTipHash, sealEntryCount := sealedMarkerTip(acc, traceID, tipHash, 1)
+		if sealTipHash != "" || sealEntryCount != 0 {
+			t.Fatalf("sealedMarkerTip = (%q, %d), want (\"\", 0) — Step 6 already committed this "+
+				"tip inline; carrying it forward would resurrect it as pending after a crash before "+
+				"Step 8's Compact runs", sealTipHash, sealEntryCount)
+		}
 
-	// Confirm this actually matters at the WAL layer: writing MarkSealed with
-	// the re-checked values must not surface as a restorable pending tip.
-	w, err := wal.Open(filepath.Join(t.TempDir(), "test.wal"))
-	if err != nil {
-		t.Fatalf("wal.Open: %v", err)
-	}
-	defer func() { _ = w.Close() }()
-	if err := w.MarkSealed(traceID, sealTipHash, sealEntryCount); err != nil {
-		t.Fatalf("MarkSealed: %v", err)
-	}
-	_, sealedPending, err := w.Replay()
-	if err != nil {
-		t.Fatalf("Replay: %v", err)
-	}
-	if len(sealedPending) != 0 {
-		t.Errorf("sealedPending after replay = %+v, want none — the tip was already checkpoint-committed", sealedPending)
-	}
+		// Confirm this actually matters at the WAL layer: MarkSealed with the
+		// re-checked values must not surface as a restorable pending tip.
+		w, err := wal.Open(filepath.Join(t.TempDir(), "test.wal"))
+		if err != nil {
+			t.Fatalf("wal.Open: %v", err)
+		}
+		defer func() { _ = w.Close() }()
+		if err := w.MarkSealed(traceID, sealTipHash, sealEntryCount); err != nil {
+			t.Fatalf("MarkSealed: %v", err)
+		}
+		_, sealedPending, err := w.Replay()
+		if err != nil {
+			t.Fatalf("Replay: %v", err)
+		}
+		if len(sealedPending) != 0 {
+			t.Errorf("sealedPending after replay = %+v, want none — the tip was already checkpoint-committed", sealedPending)
+		}
+	})
+
+	t.Run("never_added_to_accumulator", func(t *testing.T) {
+		// Mirrors the checkpointPoisoned (and quarantined/unsealable) path:
+		// AddTip is skipped entirely, so the trace was never pending in the
+		// first place.
+		acc := chain.NewAccumulator(sign.NewEd25519Signer(priv), 0, chain.ZeroPrevCheckpointHash)
+		const traceID = "02020202020202020202020202020202"
+
+		sealTipHash, sealEntryCount := sealedMarkerTip(acc, traceID, "somehash", 3)
+		if sealTipHash != "" || sealEntryCount != 0 {
+			t.Errorf("sealedMarkerTip = (%q, %d), want (\"\", 0) for a trace never added to the accumulator",
+				sealTipHash, sealEntryCount)
+		}
+	})
 }
 
 // TestCheckpointSyncFailure_RollsBackAndRetriesTips covers the other half of the
