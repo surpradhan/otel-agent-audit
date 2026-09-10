@@ -60,20 +60,40 @@ type UnixNano uint64
 
 // MarshalJSON encodes t as a quoted decimal string. Records pinned to a legacy
 // schema version never reach this method; see AuditRecord.MarshalJSON.
+//
+// The digits are appended straight into the quoted buffer rather than going
+// through strconv.Quote: a decimal uint64 contains nothing JSON would escape,
+// and this is on the per-span seal path, which marshals every record twice.
 func (t UnixNano) MarshalJSON() ([]byte, error) {
-	return strconv.AppendQuote(nil, strconv.FormatUint(uint64(t), 10)), nil
+	// 20 digits max for a uint64, plus the two quotes.
+	b := make([]byte, 0, 22)
+	b = append(b, '"')
+	b = strconv.AppendUint(b, uint64(t), 10)
+	return append(b, '"'), nil
 }
 
 // UnmarshalJSON decodes either a quoted decimal string (v3+) or a bare JSON
-// number (v1/v2). Anything else — a float, an exponent form, a sign, a
-// non-decimal literal — is rejected rather than silently coerced.
+// number (v1/v2). Everything else is rejected rather than silently coerced: a
+// float, an exponent form, a sign, a leading zero, a JSON escape sequence, or
+// any non-decimal literal. The canonical form is the shortest run of ASCII
+// digits, and accepting a second spelling of the same value would mean two
+// inputs that canonicalize alike but hash differently.
+//
+// JSON null is the one exception: it decodes to zero, following the
+// encoding/json convention that unmarshaling null into a value is a no-op on
+// the wire's part. A record carrying null timestamps still fails verification,
+// because re-marshaling emits "0" and the entry hash no longer matches.
 func (t *UnixNano) UnmarshalJSON(b []byte) error {
 	s := string(b)
 	if s == "null" {
+		*t = 0
 		return nil
 	}
 	if len(s) >= 2 && s[0] == '"' && s[len(s)-1] == '"' {
 		s = s[1 : len(s)-1]
+	}
+	if len(s) > 1 && s[0] == '0' {
+		return fmt.Errorf("record: non-canonical unix-nano timestamp %s: leading zeros", b)
 	}
 	v, err := strconv.ParseUint(s, 10, 64)
 	if err != nil {
@@ -134,9 +154,15 @@ type AuditRecord struct {
 	Status             string           `json:"status"`
 }
 
-// currentRecord is AuditRecord without its JSON methods, so the encoder falls
-// through to the struct tags (and to UnixNano's string encoding) instead of
-// recursing into AuditRecord.MarshalJSON.
+// currentRecord is AuditRecord without its MarshalJSON method, so the encoder
+// falls through to the struct tags (and to UnixNano's string encoding) instead
+// of recursing into AuditRecord.MarshalJSON.
+//
+// There is deliberately no AuditRecord.UnmarshalJSON: decoding needs no
+// version dispatch, because UnixNano accepts both the v1/v2 numeric form and
+// the v3 decimal-string form. Adding one would also make *AuditRecord a
+// json.Unmarshaler, which would silently disable json.Decoder's
+// DisallowUnknownFields for every field of the record.
 type currentRecord AuditRecord
 
 // legacyV1V2Record is the frozen v1/v2 wire shape: the same fields in the same
@@ -181,13 +207,6 @@ func (r AuditRecord) MarshalJSON() ([]byte, error) {
 		SelectedAttributes: r.SelectedAttributes,
 		Status:             r.Status,
 	})
-}
-
-// UnmarshalJSON decodes a record of any schema version: UnixNano accepts both
-// the v1/v2 numeric form and the v3 decimal-string form, so the verifier can
-// read a log of either vintage without knowing its version up front.
-func (r *AuditRecord) UnmarshalJSON(b []byte) error {
-	return json.Unmarshal(b, (*currentRecord)(r))
 }
 
 // attributeAllowlist is the fixed, sorted set of span attribute keys captured

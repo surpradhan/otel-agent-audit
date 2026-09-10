@@ -2582,3 +2582,49 @@ func TestNextCheckpointRetryAt(t *testing.T) {
 		}
 	}
 }
+
+// TestSealTrace_ReplayedLegacyRecordVerifies is the regression lock for the
+// upgrade path: a record replayed from a WAL written by an earlier binary keeps
+// its own schema_version, and sealTrace must derive the genesis seed from that
+// version rather than from the current package constant. When it doesn't, the
+// sealed chain fails verification on a log nobody tampered with — the worst
+// failure mode this component has.
+func TestSealTrace_ReplayedLegacyRecordVerifies(t *testing.T) {
+	env := newTestEnv(t)
+
+	// A WAL line as a v2-era binary would have written it: numeric timestamps,
+	// schema_version "v2", never sealed because the process crashed first.
+	const legacyTraceID = "01010101010101010101010101010101"
+	legacyWAL := `{"type":"span","trace_id":"` + legacyTraceID + `","record":` +
+		`{"schema_version":"v2","trace_id":"` + legacyTraceID + `","span_id":"0102030405060708",` +
+		`"parent_span_id":"","seq_in_trace":0,"start_time_unix_nano":1764547200123456789,` +
+		`"end_time_unix_nano":1764547200987654321,"span_name":"pre-upgrade.root","otel_kind":"Client",` +
+		`"gen_ai_operation":"","audit_kind":"task","selected_attributes":null,"status":"Ok"}}` + "\n"
+	if err := os.WriteFile(env.cfg.WalPath, []byte(legacyWAL), 0600); err != nil {
+		t.Fatalf("writing legacy WAL: %v", err)
+	}
+
+	// Start replays it; Shutdown force-seals it.
+	exp := startExporter(t, env.cfg)
+	if err := exp.Shutdown(context.Background()); err != nil {
+		t.Fatalf("Shutdown: %v", err)
+	}
+
+	entries := readLogEntries(t, env.cfg.LogPath)
+	if len(entries) != 1 {
+		t.Fatalf("expected 1 sealed entry, got %d", len(entries))
+	}
+	if got := entries[0].Record.SchemaVersion; got != "v2" {
+		t.Errorf("sealed record schema_version: got %q, want %q — a replayed record keeps its own version", got, "v2")
+	}
+	if got := uint64(entries[0].Record.StartTimeUnixNano); got != 1764547200123456789 {
+		t.Errorf("StartTimeUnixNano: got %d, want 1764547200123456789", got)
+	}
+
+	// The whole point: the verifier, which derives the seed from the stored
+	// schema_version, must accept this chain.
+	if err := verify.VerifyChain(entries, env.pubKey); err != nil {
+		t.Errorf("verifying a sealed replayed v2 chain: %v\n"+
+			"sealTrace must use chain.GenesisSeedForSchema(traceID, recs[0].SchemaVersion)", err)
+	}
+}

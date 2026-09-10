@@ -21,8 +21,10 @@ verifier reads `schema_version` from the first log entry and calls
 `GenesisSeedForSchema(traceID, schemaVersion)` to re-derive the correct genesis
 seed. Since v3 the schema version also selects the **timestamp encoding** (§2.1),
 so re-serializing a stored record reproduces the bytes that were originally
-hashed regardless of the record's vintage. Do not mix entries of different
-schema versions in the same log file.
+hashed regardless of the record's vintage. One log file may contain traces of
+different schema versions — each trace's seed and encoding come from its own
+entries — but entries of different schema versions must never appear inside a
+single trace's chain.
 
 **Breaking-change policy:** any change to field names, JSON key names, field
 order, types, value encodings, or the `SelectedAttributes` allowlist is a
@@ -83,7 +85,13 @@ strings for exactly this reason; v3 follows that precedent.
 
 - **Producers** MUST emit a quoted, unsigned, base-10 integer with no leading
   `+`, no leading zeros, no exponent and no fractional part — the shortest
-  decimal representation of the `uint64` value.
+  decimal representation of the `uint64` value. The string MUST contain only
+  ASCII digits: no JSON escape sequences, even though `"\u0031"` is a
+  conformant JSON spelling of `"1"`. A second spelling of the same value would
+  be a second canonical form, which the format cannot have.
+- **Consumers** SHOULD reject the non-canonical spellings rather than
+  normalizing them. The Go implementation does; normalizing would let two
+  different inputs canonicalize alike while hashing differently upstream.
 - **Consumers** MUST parse the string with an exact 64-bit integer parser. Never
   route the value through a float, and never re-encode it as a JSON number.
 - **Consumers** SHOULD accept a bare JSON number as well, so that one code path

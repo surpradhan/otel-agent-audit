@@ -342,6 +342,15 @@ func TestUnixNano_UnmarshalRejectsNonDecimal(t *testing.T) {
 		`true`,
 		`{}`,
 		`"18446744073709551616"`, // overflows uint64
+		// Non-canonical spellings of a valid value. Accepting a second
+		// spelling would mean two inputs that canonicalize alike but hash
+		// differently, so the parser must agree with the spec's "shortest
+		// run of ASCII digits, no leading zeros, no escapes".
+		`"01"`,
+		`"0000001764547200123456789"`,
+		`01`,
+		// A JSON escape sequence spelling the same digits.
+		`"\u0031764547200123456789"`,
 	} {
 		t.Run(bad, func(t *testing.T) {
 			var got UnixNano
@@ -349,6 +358,21 @@ func TestUnixNano_UnmarshalRejectsNonDecimal(t *testing.T) {
 				t.Errorf("Unmarshal(%s) succeeded with %d; want an error", bad, uint64(got))
 			}
 		})
+	}
+}
+
+// TestUnixNano_UnmarshalNullDecodesToZero pins the one input that is accepted
+// rather than rejected. Decoding null to zero follows the encoding/json
+// convention, and it must not leave whatever happened to be in the receiver.
+// A record carrying null timestamps is still caught downstream: re-marshaling
+// emits "0", so its entry hash no longer matches and verification reports it.
+func TestUnixNano_UnmarshalNullDecodesToZero(t *testing.T) {
+	got := UnixNano(42)
+	if err := json.Unmarshal([]byte(`null`), &got); err != nil {
+		t.Fatalf("Unmarshal(null): %v", err)
+	}
+	if got != 0 {
+		t.Errorf("Unmarshal(null): got %d, want 0 — null must not leave the prior value in place", uint64(got))
 	}
 }
 

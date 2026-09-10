@@ -112,9 +112,12 @@ parser — routing a nanosecond timestamp through an IEEE-754 double loses
 precision and makes the hash unreproducible. See
 [docs/audit-record-schema.md §2.1](audit-record-schema.md#21-timestamp-encoding-v3).
 
-Do not mix schema versions within one log file. If a collector upgrade split a
-file across versions, split the file by `record.schema_version` and verify each
-part, the same way key epochs are handled below.
+A single log file **may** contain traces of different schema versions — the
+verifier derives each trace's genesis seed and timestamp encoding from that
+trace's own entries, so a file spanning a collector upgrade verifies as-is. What
+must not happen is entries of different schema versions inside **one trace's
+chain**; the exporter seals each trace against the schema version of its own
+seq-0 record.
 
 ## Key-id verification
 

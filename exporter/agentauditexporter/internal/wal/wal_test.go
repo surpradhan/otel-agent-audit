@@ -271,11 +271,15 @@ func TestWAL_ReplayTolerantPartialLine(t *testing.T) {
 	}
 }
 
-// TestWAL_ReplayAcceptsLegacyNumericTimestamps covers the upgrade path: a WAL
-// left behind by a v2-era binary encodes start/end timestamps as JSON numbers.
-// A v3 binary must replay those entries unchanged — same values, still pinned to
-// their own schema_version — so an in-flight trace survives the upgrade and
-// seals into a chain the verifier can still reproduce.
+// TestWAL_ReplayAcceptsLegacyNumericTimestamps covers the decoding half of the
+// upgrade path: a WAL left behind by a v2-era binary encodes start/end
+// timestamps as JSON numbers, and a v3 binary must replay those entries
+// unchanged — same values, still pinned to their own schema_version.
+//
+// The sealing half — that such a replayed record then seals into a chain the
+// verifier reproduces — is covered by
+// TestSealTrace_ReplayedLegacyRecordVerifies in the exporter package, which is
+// where the genesis seed is chosen.
 func TestWAL_ReplayAcceptsLegacyNumericTimestamps(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "legacy.wal")
 	const legacyLine = `{"type":"span","trace_id":"trace001","record":` +

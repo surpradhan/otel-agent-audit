@@ -472,7 +472,15 @@ func (e *agentAuditExporter) sealTrace(traceID string, buf *traceBuffer, checkpo
 	}
 
 	// Step 3: build chain.
-	genesisSeed, err := chain.GenesisSeed(traceID)
+	//
+	// The seed must come from the SEALED RECORDS' own schema_version, not from
+	// the package constant: a verifier derives it from entries[0]'s stored
+	// schema_version, so a chain built with a different one fails verification
+	// on an untampered log. They diverge after an upgrade — records replayed
+	// from a WAL written by an earlier binary keep the schema version they were
+	// created with. recs is sorted above, so recs[0] is the seq-0 entry the
+	// verifier reads.
+	genesisSeed, err := chain.GenesisSeedForSchema(traceID, recs[0].SchemaVersion)
 	if err != nil {
 		e.logger.Error("agentaudit: genesis seed", zap.String("trace_id", traceID), zap.Error(err))
 		return

@@ -57,8 +57,10 @@ func SortRecords(records []record.AuditRecord) {
 }
 
 // GenesisSeedForSchema computes SHA256(hex.DecodeString(traceID) || []byte(schemaVersion)).
-// Use this when the schema version must be taken from the log entry (e.g. in
-// the verifier, which must handle both v1 and v2 logs).
+// Use this whenever the schema version must be taken from the records
+// themselves rather than assumed — the verifier, which handles v1, v2 and v3
+// logs, and the exporter's seal path, which may be sealing records replayed
+// from a WAL written by an earlier binary.
 // Returns an error if traceID is invalid hex or schemaVersion is empty (which
 // indicates a corrupted or zero-value log entry rather than a valid schema).
 func GenesisSeedForSchema(traceID, schemaVersion string) ([]byte, error) {
@@ -77,6 +79,11 @@ func GenesisSeedForSchema(traceID, schemaVersion string) ([]byte, error) {
 
 // GenesisSeed computes SHA256(hex.DecodeString(traceID) || []byte(record.SchemaVersion)).
 // Returns an error if traceID is not valid lowercase hex (32 hex chars = 16 bytes).
+//
+// Only valid when every record being chained carries record.SchemaVersion.
+// Callers chaining records of a stored or replayed version — after WAL replay,
+// for instance — must use GenesisSeedForSchema with that record's own
+// schema_version, or the chain will fail verification on an untampered log.
 func GenesisSeed(traceID string) ([]byte, error) {
 	return GenesisSeedForSchema(traceID, record.SchemaVersion)
 }
