@@ -932,9 +932,19 @@ func (e *agentAuditExporter) sealTrace(traceID string, buf *traceBuffer, checkpo
 	}
 
 	// Step 7: mark WAL sealed (calls Sync), carrying the tip so Compact below
-	// can retain it if the trace is still pending a checkpoint.
+	// can retain it if the trace is still pending a checkpoint. Step 6's own
+	// checkpoint attempt may have just committed this exact tip inline (its
+	// interval reached on this very seal) — re-check PendingTips rather than
+	// carrying tipHash unconditionally, or a crash between this fsynced write
+	// and Step 8's Compact would resurrect an already-covered tip as pending
+	// on restart. Mirrors the empty-tip convention markWALSealed already uses
+	// for a trace that was never added to the accumulator.
 	if e.wal != nil {
-		if err := e.wal.MarkSealed(traceID, tipHash, len(entries)); err != nil {
+		sealTipHash, sealEntryCount := tipHash, len(entries)
+		if _, stillPending := e.accumulator.PendingTips()[traceID][tipHash]; !stillPending {
+			sealTipHash, sealEntryCount = "", 0
+		}
+		if err := e.wal.MarkSealed(traceID, sealTipHash, sealEntryCount); err != nil {
 			e.logger.Error("agentaudit: WAL mark sealed",
 				zap.String("trace_id", traceID), zap.Error(err))
 		}
