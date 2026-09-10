@@ -390,9 +390,14 @@ func TestWAL_Compact_DoesNotDropOpenSecondSegmentSpan(t *testing.T) {
 // later Compact call — which unlatches on the span, then re-latches and
 // unconditionally evicts on the next sealed-marker line it sees — mis-scopes
 // that eviction onto the wrong segment. This test runs Compact THREE times
-// with segment 2 left open throughout, which the write-order fix must survive
-// (a single-cycle fix that only unlatches on span, without also preserving
-// marker-before-span order, passes one cycle but fails the second).
+// with segment 2 left open throughout, which the write-order fix must
+// survive. A fix that only unlatches on span, without also preserving
+// marker-before-span order, never establishes even one stable cycle: with
+// the old spans-then-markers write order, the very first Compact call here
+// already rewrites the file as [span][marker] instead of [marker][span], so
+// TestWAL_Compact_DoesNotDropOpenSecondSegmentSpan's single follow-up Compact
+// — and this test's first loop iteration — already mis-scope the marker's
+// eviction onto segment 2's span.
 func TestWAL_Compact_StableAcrossRepeatedCyclesWithOpenSecondSegment(t *testing.T) {
 	w, _ := openWAL(t)
 
