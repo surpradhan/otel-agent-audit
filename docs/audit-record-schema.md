@@ -469,9 +469,31 @@ what was set aside and why. The dropped `trace_id` is then closed for the life o
 the process, so a later span cannot open a fresh chain under it and present a
 silently truncated trace that verifies cleanly.
 
-The same handling applies to a record whose `schema_version` cannot seed a chain
-at all (empty, as a corrupt WAL line decodes to): quarantined, dropped, and its
-WAL entries marked sealed rather than retried on every restart.
+The same handling applies to a record this binary cannot seal honestly:
+
+- a `schema_version` that cannot seed a chain at all (empty, as a corrupt WAL
+  line decodes to); and
+- a `schema_version` **this binary does not implement** — what a rollback to an
+  older collector leaves behind. Such a record was decoded through the current
+  struct, so any field its version added is already gone, and re-serializing it
+  would emit current-shaped bytes under that version's label. Signing that would
+  attest to evidence the exporter altered, and a verifier that does implement
+  the version would reproduce different bytes and report tampering on an
+  untampered log. It is quarantined instead. (Contrast v1, which is *not*
+  restampable but *is* implemented: its chain is sealed at v1, in v1's encoding,
+  and is genuinely a v1 chain.)
+
+**If the quarantine write itself fails** — a full disk, a path that is not
+writable — the WAL entries are deliberately left in place rather than marked
+sealed. The trace re-quarantines on the next start, which is loud and repeats,
+but never destroys the only remaining copy. This is the one case where the
+exporter prefers repeating work to finality.
+
+> **The sidecar is a diagnostic copy, not evidence.** Its lines are not part of
+> any hash chain, carry no signature, and are not tamper-evident. It exists so an
+> operator can see and reconstruct what was set aside; it cannot be relied on to
+> attest to what those records were. Include it in whatever retention covers the
+> WAL.
 
 Already-sealed logs are a different matter: never hand-edit a v2 log into v3
 form. Those records have been hashed and signed, so changing their canonical

@@ -528,3 +528,31 @@ func TestRestampableToCurrent(t *testing.T) {
 			"re-evaluate every other member of the set at the same time", SchemaVersion)
 	}
 }
+
+// TestImplemented pins which schema versions this binary can write. Every
+// version here must have a marshalling path: v1 and v2 through the frozen
+// legacy shape, v3 through the current struct. A version listed here without
+// that code would let the exporter sign bytes it invented.
+func TestImplemented(t *testing.T) {
+	for _, v := range []string{"v1", "v2", "v3"} {
+		if !Implemented(v) {
+			t.Errorf("Implemented(%q) = false, want true", v)
+		}
+	}
+	// A version from a rollback, or garbage, is not something we can write.
+	for _, v := range []string{"v4", "v99", "", "V1", "v1 "} {
+		if Implemented(v) {
+			t.Errorf("Implemented(%q) = true, want false", v)
+		}
+	}
+	if !Implemented(SchemaVersion) {
+		t.Errorf("the current SchemaVersion %q must be implemented", SchemaVersion)
+	}
+	// Anything restampable must also be implemented: re-stamping rewrites a
+	// record into the current shape, which presupposes we could read its own.
+	for _, v := range []string{"v1", "v2", "v3", "v4", "v99", ""} {
+		if RestampableToCurrent(v) && !Implemented(v) {
+			t.Errorf("%q is restampable but not implemented — restamping presupposes implementing", v)
+		}
+	}
+}

@@ -73,6 +73,33 @@ func RestampableToCurrent(schemaVersion string) bool {
 	return ok
 }
 
+// implementedSchemas is the set of schema versions whose wire format THIS
+// binary can actually produce. It is the union of the versions the marshaller
+// has code for: the frozen legacy shape (v1, v2) and the current one.
+//
+// It is not the same question as restampableToCurrent, which asks whether a
+// record MEANS the same under two versions. This asks whether we can write the
+// version's bytes at all. A record stamped with a version absent here — what a
+// rollback leaves behind — cannot be sealed honestly: this binary would decode
+// it through the current struct (silently dropping any field that version
+// added), re-serialize it in the current shape, and sign the result under that
+// version's label. A verifier that does implement the version would then
+// reproduce different bytes and report tampering on an untampered log.
+var implementedSchemas = map[string]struct{}{
+	"v1": {},
+	"v2": {},
+	"v3": {},
+}
+
+// Implemented reports whether this binary can produce schemaVersion's wire
+// format. Callers holding a stored record use it to decide whether sealing that
+// record is honest; a record of an unimplemented version must not be sealed and
+// signed, because the signature would attest to bytes this binary invented.
+func Implemented(schemaVersion string) bool {
+	_, ok := implementedSchemas[schemaVersion]
+	return ok
+}
+
 // UnixNano is a Unix-epoch nanosecond timestamp.
 //
 // It marshals as a JSON decimal string ("1764547200123456789"), not as a JSON
