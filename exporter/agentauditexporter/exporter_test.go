@@ -2636,11 +2636,18 @@ func TestRestart_TornCheckpointLine_Fusion(t *testing.T) {
 // a complete line that fails to parse, which is evidence the verifier has to see.
 func TestRepairTrailingPartialLine(t *testing.T) {
 	tests := []struct {
-		name        string
-		content     string
-		wantContent string
-		wantDropped int64
+		name           string
+		content        string
+		wantContent    string
+		wantDropped    int64
+		wantTerminated int64
 	}{
+		{
+			name:           "durable record missing only its newline is terminated",
+			content:        "{\"a\":1}\n{\"b\":2}",
+			wantContent:    "{\"a\":1}\n{\"b\":2}\n",
+			wantTerminated: 7,
+		},
 		{
 			name:        "torn tail is dropped",
 			content:     "{\"a\":1}\n{\"b\":2}\n{\"c\":",
@@ -2692,6 +2699,9 @@ func TestRepairTrailingPartialLine(t *testing.T) {
 			if rep.Dropped != tc.wantDropped {
 				t.Errorf("dropped: got %d, want %d", rep.Dropped, tc.wantDropped)
 			}
+			if rep.Terminated != tc.wantTerminated {
+				t.Errorf("terminated: got %d, want %d", rep.Terminated, tc.wantTerminated)
+			}
 			got, err := os.ReadFile(path)
 			if err != nil {
 				t.Fatalf("ReadFile: %v", err)
@@ -2706,6 +2716,9 @@ func TestRepairTrailingPartialLine(t *testing.T) {
 			}
 			if againRep.Dropped != 0 {
 				t.Errorf("second pass dropped %d bytes, want 0", againRep.Dropped)
+			}
+			if againRep.Terminated != 0 {
+				t.Errorf("second pass terminated %d bytes, want 0", againRep.Terminated)
 			}
 		})
 	}

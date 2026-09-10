@@ -180,9 +180,10 @@ func (e *agentAuditExporter) Start(_ context.Context, _ component.Host) error {
 				zap.ByteString("dropped_prefix", rep.Prefix))
 		case rep.Terminated > 0:
 			e.logger.Warn("agentaudit: terminated an unterminated final line; "+
-				"the record was complete but its newline was not persisted",
+				"the fragment was syntactically complete, so it was not an interrupted write",
 				zap.String("file", f.path),
-				zap.Int64("bytes", rep.Terminated))
+				zap.Int64("bytes", rep.Terminated),
+				zap.ByteString("terminated_prefix", rep.Prefix))
 		}
 	}
 
@@ -655,12 +656,13 @@ type tornTailRepair struct {
 
 // errRepairUnavailable wraps a failure to *inspect* a file for a torn tail, as
 // distinct from a failure to repair one that is known to be torn. Opening
-// O_RDWR is refused for an append-only inode (Linux `chattr +a`, BSD `uappnd`),
-// on a read-only mount, and for a file whose mode grants write but not read —
-// all of which the plain O_APPEND|O_WRONLY open below tolerates. Treating those
-// as fatal would let a hygiene step deny startup for a configuration that
-// worked, and on evidence that says nothing about whether the file is torn.
-var errRepairUnavailable = errors.New("agentaudit: cannot inspect file for a torn trailing line")
+// O_RDWR is refused for an append-only inode (Linux `chattr +a`, BSD `uappnd`)
+// and for a file whose mode grants write but not read, both of which the plain
+// O_APPEND|O_WRONLY open below tolerates. Treating those as fatal would let a
+// hygiene step deny startup for a configuration that worked, on evidence that
+// says nothing about whether the file is torn. (A read-only mount fails that
+// open too, so there this only buys a clearer error.)
+var errRepairUnavailable = errors.New("cannot inspect file for a torn trailing line")
 
 // maxTornTailPrefix caps how many bytes of a discarded fragment are logged.
 const maxTornTailPrefix = 256
@@ -684,22 +686,29 @@ const maxTornTailPrefix = 256
 //
 // The WAL is deliberately not repaired here: wal.Compact runs on Start after
 // Replay and rewrites the file via temp+rename, dropping unparseable lines, so
-// a torn WAL tail is already cleaned before anything appends to it.
+// a torn WAL tail is normally cleaned before anything appends to it. A Compact
+// failure is only logged, so a torn tail can survive it — but both Replay and
+// Compact skip unparseable lines, which bounds the damage.
 //
 // Single-writer assumption: this is the only place in the exporter that can
 // destroy bytes, and it assumes no other process is appending to path. Two
 // exporters sharing a log_path already corrupt the chain by interleaving, so
-// this does not make a working configuration worse — but the truncate would
-// discard whatever a second writer appended between the Stat and the Truncate.
+// this does not make a working configuration worse — but note the asymmetry:
+// concurrent appends previously only ever added bytes, whereas here the truncate
+// would discard whatever a second writer appended between the Stat and the
+// Truncate, and the terminating WriteAt would land a newline in the middle of
+// it, splitting one complete record into two corrupt lines.
 //
-// A fragment that is itself valid JSON is not an interrupted write: these files
-// carry one JSON object per line, and a strict prefix of such an object can
-// never parse. It is a complete, durable record whose terminating newline did
-// not reach disk — reachable with fsync_log disabled, where nothing orders the
-// record's bytes against the newline. Discarding it would destroy a signed
-// record and turn a log that verified cleanly into an entry_count_mismatch, so
-// that case is terminated with a newline instead of truncated. The same
-// evidence-preserving rule as for a complete-but-unparseable line.
+// A fragment that is itself valid JSON is provably not an interrupted write:
+// these files carry one top-level JSON object per line, and a strict prefix of
+// such an object always leaves a brace unbalanced, so it can never parse. It is
+// most likely a complete, durable record whose terminating newline did not reach
+// disk — reachable with fsync_log disabled, where nothing orders the record's
+// bytes against the newline. Discarding it would destroy a signed record and
+// turn a log that verified cleanly into an entry_count_mismatch, so it is
+// terminated with a newline rather than truncated. If such a fragment is instead
+// injected or corrupt, terminating it preserves it as evidence under the same
+// rule that keeps a complete-but-unparseable line.
 //
 // Returns what was done and a bounded prefix of the affected fragment, so an
 // operator can see the bytes rather than only a count.
@@ -709,7 +718,7 @@ func repairTrailingPartialLine(path string) (tornTailRepair, error) {
 		if os.IsNotExist(err) {
 			return tornTailRepair{}, nil
 		}
-		return tornTailRepair{}, fmt.Errorf("%w: %v", errRepairUnavailable, err)
+		return tornTailRepair{}, fmt.Errorf("%w: %w", errRepairUnavailable, err)
 	}
 	defer func() { _ = f.Close() }()
 
