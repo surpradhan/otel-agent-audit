@@ -84,6 +84,49 @@ After the `trace_timeout` (default 30 s), the exporter seals whatever has been
 buffered — root present or not. A verifier sees a valid but potentially partial
 chain for timed-out traces.
 
+### 3c. Sustained checkpoint write failure (pending-tip cap)
+
+A checkpoint write that fails (ENOSPC, EIO, a revoked permission) keeps its
+trace tips pending for retry rather than dropping them — that is deliberate:
+the alternative is silently losing sealed traces on an ordinary, possibly
+transient, IO error. Below the pending-tip cap described next, a backoff
+(doubling after the first retry, capped at `maxCheckpointRetryGap`) bounds the wasted
+re-signing work and thins the retry attempts as pending grows.
+
+If the failure is **persistent** rather than transient, retained tips would
+otherwise grow the pending set for as long as the outage lasts. `max_pending_tips`
+(default `10 * checkpoint_interval`) bounds this: once exceeded, the **oldest**
+pending tips are dropped — logged once per degraded episode, with a running
+count reported at `Shutdown` — so the exporter trades a bounded amount of
+additional data loss for a bounded memory footprint. The traces whose tips are
+dropped this way are the same as any other checkpoint-uncovered trace: their
+entries are still durably in the audit log, `VerifyLog` does not flag them as
+an error (`internal/verify/verify.go` deliberately tolerates checkpoint-uncovered
+traces), and only the checkpoint's coverage of them is lost.
+
+Once pending is pinned at the cap, the backoff's thinning intentionally stops:
+every subsequently sealed trace both retries the checkpoint write and re-trims
+the pending set, for as long as the outage lasts. That is the trade for
+guaranteeing the very next successful write is retried immediately rather than
+at some later, possibly much larger, pending count — but it does mean the
+write+`fsync` attempt rate against the already-faulting file rises to one per
+sealed trace. The per-attempt failure log is suppressed during this steady
+state (the one-time cap-exceeded log and the `Shutdown` summary already cover
+it), so log volume does not scale with it, only the write attempts themselves do.
+Decoupling the attempt rate itself from recovery-detection speed is tracked as
+a follow-up (issue #30) rather than addressed here.
+
+This is distinct from the **poisoned** state (`errCheckpointPoisoned`): poisoning
+means no checkpoint can *ever* be written again for the life of the process, so
+every subsequent tip is dropped immediately with no cap to reach. The
+pending-tip cap instead covers the merely-persistent-but-not-fatal case, where
+checkpointing could still succeed once the underlying fault clears.
+
+**Mitigation:** monitor for the `pending tip set exceeded its cap` error log and
+the `tips_dropped_for_pending_cap` count at `Shutdown` — both indicate degraded
+coverage, not a crash. Size `max_pending_tips` for the outage duration an
+operator is willing to tolerate before accepting additional loss.
+
 ---
 
 ## 4. Single-replica constraint

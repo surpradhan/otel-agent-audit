@@ -43,6 +43,16 @@ type Config struct {
 	// next restart (the checkpoint references entries that were buffered but not
 	// flushed to disk). See docs/threat-model.md §3a for the operational implications.
 	FsyncLog *bool `mapstructure:"fsync_log"`
+
+	// MaxPendingTips caps how many sealed-but-uncheckpointed trace tips the
+	// accumulator retains. A checkpoint write failure keeps its tips pending for
+	// retry (see writeCheckpoint), so a *sustained* failure — ENOSPC, EIO, a
+	// revoked permission — would otherwise grow the pending set for as long as
+	// the outage lasts. Once the cap is exceeded, the oldest tips are dropped
+	// (with a logged error and a count reported at Shutdown) so memory stays
+	// bounded; this reintroduces bounded, observable data loss in exchange for
+	// that bound. Default: 0, meaning 10 * CheckpointInterval.
+	MaxPendingTips int `mapstructure:"max_pending_tips"`
 }
 
 // Validate checks that the configuration is valid.
@@ -77,6 +87,20 @@ func (c *Config) Validate() error {
 	}
 	if c.CheckpointInterval < 0 {
 		return errors.New("checkpoint_interval must not be negative")
+	}
+	if c.MaxPendingTips < 0 {
+		return errors.New("max_pending_tips must not be negative")
+	}
+	// If the effective cap is below the effective interval, TrimPending would
+	// hold pending below the threshold shouldCheckpoint needs to ever fire a
+	// checkpoint, so no checkpoint — successful or not — could ever be written.
+	// Delegates to the same effective*Of functions agentAuditExporter uses, so
+	// the "unset -> default" rule lives in exactly one place.
+	effectiveInterval := effectiveCheckpointIntervalOf(c.CheckpointInterval)
+	effectiveMaxPending := effectiveMaxPendingTipsOf(c.MaxPendingTips, effectiveInterval)
+	if effectiveMaxPending < effectiveInterval {
+		return fmt.Errorf("max_pending_tips (%d) must be at least checkpoint_interval (%d), or a checkpoint could never fire",
+			effectiveMaxPending, effectiveInterval)
 	}
 	return nil
 }

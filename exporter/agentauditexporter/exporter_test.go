@@ -22,6 +22,8 @@ import (
 	"go.opentelemetry.io/collector/exporter"
 	"go.opentelemetry.io/collector/pdata/pcommon"
 	"go.opentelemetry.io/collector/pdata/ptrace"
+	"go.uber.org/zap"
+	"go.uber.org/zap/zaptest/observer"
 
 	"github.com/surpradhan/otel-agent-audit/exporter/agentauditexporter/internal/chain"
 	"github.com/surpradhan/otel-agent-audit/exporter/agentauditexporter/internal/record"
@@ -1630,6 +1632,55 @@ func TestConfig_Validate_NegativeValues(t *testing.T) {
 	if err := neg2.Validate(); err == nil {
 		t.Error("expected error for negative checkpoint_interval")
 	}
+
+	neg3 := base
+	neg3.MaxPendingTips = -1
+	if err := neg3.Validate(); err == nil {
+		t.Error("expected error for negative max_pending_tips")
+	}
+}
+
+// TestConfig_Validate_MaxPendingTipsBelowCheckpointInterval verifies the
+// cross-field check: if the effective pending-tip cap is below the effective
+// checkpoint interval, TrimPending would hold pending below the threshold
+// shouldCheckpoint needs, so a checkpoint could never fire. This must be
+// rejected at config-validation time rather than silently degrading at runtime.
+func TestConfig_Validate_MaxPendingTipsBelowCheckpointInterval(t *testing.T) {
+	base := Config{
+		LogPath:        "/tmp/a.jsonl",
+		KeyPath:        "/tmp/k.pem",
+		WalPath:        "/tmp/w.jsonl",
+		CheckpointPath: "/tmp/c.jsonl",
+	}
+
+	// Both explicit and conflicting.
+	bad := base
+	bad.CheckpointInterval = 100
+	bad.MaxPendingTips = 50
+	if err := bad.Validate(); err == nil {
+		t.Error("expected error when max_pending_tips is below checkpoint_interval (both explicit)")
+	}
+
+	// Interval defaults to 100; an explicit cap below that must still be caught.
+	bad2 := base
+	bad2.MaxPendingTips = 50
+	if err := bad2.Validate(); err == nil {
+		t.Error("expected error when max_pending_tips is below the *default* checkpoint_interval")
+	}
+
+	// Equal is fine — the boundary itself must not be rejected.
+	ok := base
+	ok.CheckpointInterval = 100
+	ok.MaxPendingTips = 100
+	if err := ok.Validate(); err != nil {
+		t.Errorf("expected no error when max_pending_tips equals checkpoint_interval, got %v", err)
+	}
+
+	// Both defaulted (0, 0): 10x100 default never conflicts with the 100 default.
+	def := base
+	if err := def.Validate(); err != nil {
+		t.Errorf("expected no error with both fields defaulted, got %v", err)
+	}
 }
 
 // Ensure record import doesn't cause "imported and not used" when tests don't directly use it.
@@ -1725,6 +1776,20 @@ func TestEffectiveCheckpointInterval(t *testing.T) {
 	set := newAgentAuditExporter(&Config{CheckpointInterval: 250}, nil)
 	if got := set.effectiveCheckpointInterval(); got != 250 {
 		t.Fatalf("configured interval = %d, want 250", got)
+	}
+}
+
+// TestEffectiveMaxPendingTips verifies that an unset cap falls back to 10x the
+// effective checkpoint interval, and that an explicit positive value overrides it.
+func TestEffectiveMaxPendingTips(t *testing.T) {
+	def := newAgentAuditExporter(&Config{CheckpointInterval: 100}, nil)
+	if got := def.effectiveMaxPendingTips(def.effectiveCheckpointInterval()); got != 1000 {
+		t.Fatalf("default cap = %d, want 1000 (10x checkpoint interval)", got)
+	}
+
+	set := newAgentAuditExporter(&Config{CheckpointInterval: 100, MaxPendingTips: 42}, nil)
+	if got := set.effectiveMaxPendingTips(set.effectiveCheckpointInterval()); got != 42 {
+		t.Fatalf("configured cap = %d, want 42", got)
 	}
 }
 
@@ -2150,10 +2215,16 @@ func TestCheckpointRollbackFailure_PoisonsCheckpointFile(t *testing.T) {
 // ever-growing pending set on every sealed trace. With the file permanently
 // broken, attempts must thin out as the pending set grows rather than happening
 // once per seal.
+//
+// MaxPendingTips is set well above the 16 seals this test drives so the
+// pending-tip cap (TestPendingCap_DropsOldestTipsAndRecovers) does not
+// interfere with the schedule asserted here — this test is specifically about
+// the backoff arithmetic below the cap, not the cap itself.
 func TestCheckpointFailure_BacksOffInsteadOfRetryingEverySeal(t *testing.T) {
 	env := newTestEnv(t)
 	cfg := env.cfg
 	cfg.CheckpointInterval = 1
+	cfg.MaxPendingTips = 1024
 
 	exp := startExporter(t, cfg)
 
@@ -2360,6 +2431,173 @@ func TestPoisonedCheckpoint_DoesNotAccumulateTips(t *testing.T) {
 	}
 }
 
+// TestPendingCap_DropsOldestTipsAndRecovers covers the policy chosen for
+// issue #21: a sustained but rollback-able checkpoint write failure must not
+// grow the pending set without bound. Once MaxPendingTips is exceeded, the
+// oldest tips are dropped (not the file poisoned), a loud warning fires once
+// per degraded episode, and — critically — checkpointing must still detect
+// recovery: this is also the regression guard for the nextCheckpointRetryAt
+// clamp, since without it the backoff target could grow past what a capped
+// pending set can ever reach again, permanently starving retries.
+func TestPendingCap_DropsOldestTipsAndRecovers(t *testing.T) {
+	env := newTestEnv(t)
+	cfg := env.cfg
+	cfg.CheckpointInterval = 1
+	cfg.MaxPendingTips = 5
+
+	exp := startExporter(t, cfg)
+
+	realFile := exp.checkFile
+	counter := &countingWriteFile{
+		logSyncer: realFile,
+		syncErr:   fmt.Errorf("simulated ENOSPC"),
+	}
+	exp.mu.Lock()
+	exp.checkFile = counter
+	exp.mu.Unlock()
+
+	seal := func(i int) {
+		t.Helper()
+		traceID := [16]byte{0xB0, byte(i)}
+		if err := exp.ConsumeTraces(context.Background(),
+			makeSpan(traceID, [8]byte{byte(i + 1)}, zeroParentID, "op",
+				uint64(1_000_000*(i+1)), uint64(1_000_000*(i+2)))); err != nil {
+			t.Fatalf("ConsumeTraces %d: %v", i, err)
+		}
+	}
+	traceIDHex := func(i int) string {
+		b := [16]byte{0xB0, byte(i)}
+		return hex.EncodeToString(b[:])
+	}
+
+	const failingSeals = 12
+	for i := 0; i < failingSeals; i++ {
+		seal(i)
+	}
+
+	exp.mu.Lock()
+	pending := exp.accumulator.PendingCount()
+	dropped := exp.pendingCapDropped
+	warned := exp.pendingCapWarned
+	poisoned := exp.checkpointPoisoned
+	exp.mu.Unlock()
+
+	if pending != 5 {
+		t.Errorf("pending after %d failing seals: got %d, want 5 (capped)", failingSeals, pending)
+	}
+	if dropped != failingSeals-5 {
+		t.Errorf("pendingCapDropped: got %d, want %d", dropped, failingSeals-5)
+	}
+	if !warned {
+		t.Error("expected pendingCapWarned once the cap was first hit")
+	}
+	if poisoned {
+		t.Error("a repeatedly failing but rollback-able checkpoint file must not be poisoned")
+	}
+
+	// Recovery: the underlying file becomes writable again.
+	exp.mu.Lock()
+	exp.checkFile = realFile
+	exp.mu.Unlock()
+	seal(failingSeals) // index 12; also trimmed before its own checkpoint attempt.
+
+	exp.mu.Lock()
+	pendingAfter := exp.accumulator.PendingCount()
+	warnedAfter := exp.pendingCapWarned
+	droppedAfter := exp.pendingCapDropped
+	exp.mu.Unlock()
+
+	if pendingAfter != 0 {
+		t.Fatalf("pending after the recovery seal: got %d, want 0 (checkpoint must have succeeded — "+
+			"if this is nonzero, retries likely stopped firing once pending hit the cap)", pendingAfter)
+	}
+	if warnedAfter {
+		t.Error("pendingCapWarned must reset once a checkpoint succeeds")
+	}
+	if want := failingSeals - 5 + 1; droppedAfter != want {
+		t.Errorf("pendingCapDropped after recovery: got %d, want %d (the recovery seal is also trimmed before its checkpoint succeeds)",
+			droppedAfter, want)
+	}
+
+	cps := readCheckpoints(t, cfg.CheckpointPath)
+	if len(cps) != 1 {
+		t.Fatalf("checkpoints written: got %d, want 1", len(cps))
+	}
+	var gotIDs []string
+	for _, tip := range cps[0].TraceTips {
+		gotIDs = append(gotIDs, tip.TraceID)
+	}
+	var wantIDs []string
+	for i := 8; i <= 12; i++ {
+		wantIDs = append(wantIDs, traceIDHex(i))
+	}
+	if !reflect.DeepEqual(gotIDs, wantIDs) {
+		t.Errorf("checkpointed tips: got %v, want %v (only the newest 5 survivors)", gotIDs, wantIDs)
+	}
+
+	// pendingCapDropped is a lifetime counter and must still be surfaced at
+	// Shutdown even though the exporter has since recovered.
+	shutdownErr := exp.Shutdown(context.Background())
+	if shutdownErr == nil {
+		t.Error("expected Shutdown to report the tips dropped for the pending cap")
+	}
+}
+
+// TestPendingCap_SuppressesPerAttemptLogOnceAtCap is the regression guard for
+// the log-flood fix in sealTrace's Step 6: once pending is pinned at the cap,
+// nextCheckpointRetryAt's clamp means shouldCheckpoint retries on literally
+// every seal for the rest of the outage, so an unthrottled per-attempt
+// "write checkpoint" failure log would flood for as long as it lasts. Only the
+// one-time "pending tip set exceeded its cap" warning should survive at
+// steady state — the per-attempt log must stop once pendingCapWarned is set.
+func TestPendingCap_SuppressesPerAttemptLogOnceAtCap(t *testing.T) {
+	env := newTestEnv(t)
+	cfg := env.cfg
+	cfg.CheckpointInterval = 1
+	cfg.MaxPendingTips = 5
+
+	core, logs := observer.New(zap.ErrorLevel)
+	exp := newAgentAuditExporter(cfg, zap.New(core))
+	if err := exp.Start(context.Background(), nil); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	// Drain the background WAL-compact goroutines sealTrace spawns before
+	// t.TempDir() removes the directory out from under them — otherwise this
+	// races os.RemoveAll and flakes with "unlinkat: directory not empty".
+	t.Cleanup(func() { _ = exp.Shutdown(context.Background()) })
+
+	counter := &countingWriteFile{
+		logSyncer: exp.checkFile,
+		syncErr:   fmt.Errorf("simulated ENOSPC"),
+	}
+	exp.mu.Lock()
+	exp.checkFile = counter
+	exp.mu.Unlock()
+
+	const seals = 40
+	for i := 0; i < seals; i++ {
+		traceID := [16]byte{0xC0, byte(i)}
+		if err := exp.ConsumeTraces(context.Background(),
+			makeSpan(traceID, [8]byte{byte(i + 1)}, zeroParentID, "op",
+				uint64(1_000_000*(i+1)), uint64(1_000_000*(i+2)))); err != nil {
+			t.Fatalf("ConsumeTraces %d: %v", i, err)
+		}
+	}
+
+	// The exact pre-cap schedule for interval=1, cap=5: attempts fire at
+	// pending 1, 2, 4, 5 (four total) before pendingCapWarned is set during the
+	// seal that first exceeds the cap, which is also when the per-attempt log
+	// for that same seal is suppressed — asserting the exact count (not a loose
+	// bound) so a regression back to "logs every seal" cannot slip past.
+	if got := logs.FilterMessage("agentaudit: write checkpoint").Len(); got != 4 {
+		t.Errorf("per-attempt \"write checkpoint\" failure logs across %d seals: got %d, want 4 — "+
+			"suppression once pinned at the cap must not be logging every attempt", seals, got)
+	}
+	if got := logs.FilterMessageSnippet("pending tip set exceeded its cap").Len(); got != 1 {
+		t.Errorf("pending-cap-exceeded warning logs: got %d, want exactly 1 (once per degraded episode)", got)
+	}
+}
+
 // TestCheckpointWriteFailure_ZeroBytesDoesNotPoison verifies that a write which
 // fails having emitted nothing does not poison the file. The file is already
 // byte-identical to its pre-write state, so there is nothing to roll back —
@@ -2546,11 +2784,15 @@ func TestTransientCheckpointFailure_RetriesOnNextSeal(t *testing.T) {
 }
 
 // TestNextCheckpointRetryAt covers the retry schedule directly, including the
-// cap. Without a cap, recovery latency after a healed outage grows with the
-// length of the outage: a file that becomes writable again at pending=600 would
-// not be retried until pending=1024, and a long outage is far worse.
+// gap cap. Without a gap cap, recovery latency after a healed outage grows with
+// the length of the outage: a file that becomes writable again at pending=600
+// would not be retried until pending=1024, and a long outage is far worse.
+//
+// MaxPendingTips is set to an effectively unlimited value so this arithmetic is
+// exercised in isolation from the separate pending-tip-cap clamp covered by
+// TestNextCheckpointRetryAt_ClampedToPendingCap below.
 func TestNextCheckpointRetryAt(t *testing.T) {
-	e := newAgentAuditExporter(&Config{}, nil)
+	e := newAgentAuditExporter(&Config{MaxPendingTips: 1 << 30}, nil)
 
 	tests := []struct {
 		name     string
@@ -2582,6 +2824,37 @@ func TestNextCheckpointRetryAt(t *testing.T) {
 		if gap := e.nextCheckpointRetryAt(pending) - pending; gap > maxCheckpointRetryGap {
 			t.Errorf("retry gap at pending=%d: got %d, want <= %d", pending, gap, maxCheckpointRetryGap)
 		}
+	}
+}
+
+// TestNextCheckpointRetryAt_ClampedToPendingCap is the regression guard for the
+// bug the pending-tip cap would otherwise introduce: an unclamped backoff
+// target can grow past the cap, and since TrimPending holds pending at the cap
+// forever during a sustained failure, pending could then never again satisfy
+// shouldCheckpoint's "pending >= checkpointRetryAt" and retries would stop
+// permanently — even after the underlying outage heals.
+func TestNextCheckpointRetryAt_ClampedToPendingCap(t *testing.T) {
+	e := newAgentAuditExporter(&Config{CheckpointInterval: 100, MaxPendingTips: 1000}, nil)
+
+	tests := []struct {
+		name     string
+		failures int
+		pending  int
+		want     int
+	}{
+		{"under the cap: unclamped", 5, 400, 800},
+		{"doubling would exceed the cap: clamped", 5, 600, 1000},
+		{"already at the cap: clamped to itself so a retry can still fire", 5, 1000, 1000},
+		{"first failure past the cap: still clamped", 1, 1000, 1000},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			e.checkpointFailures = tt.failures
+			if got := e.nextCheckpointRetryAt(tt.pending); got != tt.want {
+				t.Errorf("nextCheckpointRetryAt(%d) with %d failures: got %d, want %d",
+					tt.pending, tt.failures, got, tt.want)
+			}
+		})
 	}
 }
 
