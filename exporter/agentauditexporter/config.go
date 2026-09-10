@@ -2,6 +2,7 @@ package agentauditexporter
 
 import (
 	"errors"
+	"fmt"
 	"time"
 )
 
@@ -64,6 +65,12 @@ func (c *Config) Validate() error {
 	// Prevent operator misconfiguration from corrupting multiple log files.
 	if c.LogPath == c.WalPath || c.LogPath == c.CheckpointPath || c.WalPath == c.CheckpointPath {
 		return errors.New("log_path, wal_path, and checkpoint_path must all be distinct")
+	}
+	// The quarantine sidecar is derived from wal_path rather than configured, so
+	// it escapes the check above. Pointing log_path or checkpoint_path at it
+	// would interleave quarantined records into an attestable file.
+	if quarantine := c.WalPath + quarantineSuffix; c.LogPath == quarantine || c.CheckpointPath == quarantine {
+		return fmt.Errorf("log_path and checkpoint_path must not collide with the quarantine sidecar %q (derived from wal_path)", quarantine)
 	}
 	if c.TraceTimeout < 0 {
 		return errors.New("trace_timeout must not be negative")

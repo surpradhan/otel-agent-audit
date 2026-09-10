@@ -12,6 +12,7 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
@@ -2935,4 +2936,824 @@ func tailOf(b []byte) []byte {
 		return b[len(b)-32:]
 	}
 	return b
+}
+
+// TestSealTrace_UsesRecordSchemaVersionForGenesisSeed is the regression lock for
+// the genesis-seed derivation. sealTrace must seed the chain from the schema
+// version of the records it is sealing, not from the record.SchemaVersion
+// package constant: a verifier derives the seed from each entry's stored
+// schema_version, so a chain seeded from anything else fails verification on a
+// log nobody tampered with — the worst failure mode this component has.
+//
+// The buffer is populated directly rather than through WAL replay, because
+// replay now re-stamps records to the current version (see
+// TestStart_ReplayedRecordsAreRestampedToCurrentSchema). That makes this the
+// only test holding the seed derivation honest, which is the point: the
+// derivation must be correct for whatever version reaches it.
+func TestSealTrace_UsesRecordSchemaVersionForGenesisSeed(t *testing.T) {
+	env := newTestEnv(t)
+	exp := startExporter(t, env.cfg)
+
+	const legacyTraceID = "01010101010101010101010101010101"
+	exp.mu.Lock()
+	exp.buffers[legacyTraceID] = &traceBuffer{
+		records: map[string]record.AuditRecord{
+			"0102030405060708": {
+				SchemaVersion:     "v2",
+				TraceID:           legacyTraceID,
+				SpanID:            "0102030405060708",
+				ParentSpanID:      "",
+				StartTimeUnixNano: 1764547200123456789,
+				EndTimeUnixNano:   1764547200987654321,
+				SpanName:          "legacy.root",
+				OtelKind:          "Client",
+				AuditKind:         record.AuditKindTask,
+				Status:            "Ok",
+			},
+		},
+		lastSeen: time.Now(),
+		hasRoot:  true,
+	}
+	exp.mu.Unlock()
+
+	if err := exp.Shutdown(context.Background()); err != nil {
+		t.Fatalf("Shutdown: %v", err)
+	}
+
+	entries := readLogEntries(t, env.cfg.LogPath)
+	if len(entries) != 1 {
+		t.Fatalf("expected 1 sealed entry, got %d", len(entries))
+	}
+	if got := entries[0].Record.SchemaVersion; got != "v2" {
+		t.Errorf("sealed record schema_version: got %q, want %q", got, "v2")
+	}
+	if err := verify.VerifyChain(entries, env.pubKey); err != nil {
+		t.Errorf("verifying a chain sealed from a v2 record: %v\n"+
+			"sealTrace must use chain.GenesisSeedForSchema(traceID, recs[0].SchemaVersion)", err)
+	}
+}
+
+// TestStart_ReplayedRecordsAreRestampedToCurrentSchema pins the upgrade path: a
+// WAL left by an earlier binary carries that binary's schema_version, but its
+// entries are unsealed drafts — nothing has hashed them. Replay re-stamps them
+// to the current version so a trace completed after the upgrade seals into a
+// single-version chain, rather than one silently mixing encodings because a
+// re-delivered span replaced its record last-write-wins.
+//
+// The timestamp values must survive the re-stamp exactly: only the encoding
+// changes (JSON number to decimal string), never the instant recorded.
+func TestStart_ReplayedRecordsAreRestampedToCurrentSchema(t *testing.T) {
+	env := newTestEnv(t)
+
+	const legacyTraceID = "01010101010101010101010101010101"
+	legacyWAL := `{"type":"span","trace_id":"` + legacyTraceID + `","record":` +
+		`{"schema_version":"v2","trace_id":"` + legacyTraceID + `","span_id":"0102030405060708",` +
+		`"parent_span_id":"","seq_in_trace":0,"start_time_unix_nano":1764547200123456789,` +
+		`"end_time_unix_nano":1764547200987654321,"span_name":"pre-upgrade.root","otel_kind":"Client",` +
+		`"gen_ai_operation":"","audit_kind":"task","selected_attributes":null,"status":"Ok"}}` + "\n"
+	if err := os.WriteFile(env.cfg.WalPath, []byte(legacyWAL), 0600); err != nil {
+		t.Fatalf("writing legacy WAL: %v", err)
+	}
+
+	exp := startExporter(t, env.cfg)
+	if err := exp.Shutdown(context.Background()); err != nil {
+		t.Fatalf("Shutdown: %v", err)
+	}
+
+	entries := readLogEntries(t, env.cfg.LogPath)
+	if len(entries) != 1 {
+		t.Fatalf("expected 1 sealed entry, got %d", len(entries))
+	}
+	if got := entries[0].Record.SchemaVersion; got != record.SchemaVersion {
+		t.Errorf("replayed record schema_version: got %q, want %q", got, record.SchemaVersion)
+	}
+	if got := uint64(entries[0].Record.StartTimeUnixNano); got != 1764547200123456789 {
+		t.Errorf("StartTimeUnixNano changed across the re-stamp: got %d, want 1764547200123456789", got)
+	}
+	if got := uint64(entries[0].Record.EndTimeUnixNano); got != 1764547200987654321 {
+		t.Errorf("EndTimeUnixNano changed across the re-stamp: got %d, want 1764547200987654321", got)
+	}
+
+	// The re-stamped record must be written in the current encoding.
+	raw, err := os.ReadFile(env.cfg.LogPath)
+	if err != nil {
+		t.Fatalf("reading log: %v", err)
+	}
+	if !bytes.Contains(raw, []byte(`"start_time_unix_nano":"1764547200123456789"`)) {
+		t.Errorf("re-stamped record not written with v3 string encoding: %s", raw)
+	}
+
+	if err := verify.VerifyChain(entries, env.pubKey); err != nil {
+		t.Errorf("verifying a re-stamped replayed chain: %v", err)
+	}
+}
+
+// TestStart_ReplayedTraceCanStillBeCompleted guards the capability the
+// re-stamping approach was chosen to preserve: a crash-interrupted trace stays
+// open after replay, so a root span arriving post-restart still completes it
+// into one chain. Sealing replayed buffers at startup instead would truncate
+// this trace to its replayed prefix.
+func TestStart_ReplayedTraceCanStillBeCompleted(t *testing.T) {
+	env := newTestEnv(t)
+
+	const legacyTraceID = "01010101010101010101010101010101"
+	legacyWAL := `{"type":"span","trace_id":"` + legacyTraceID + `","record":` +
+		`{"schema_version":"v2","trace_id":"` + legacyTraceID + `","span_id":"0102030405060708",` +
+		`"parent_span_id":"aabbccddeeff0011","seq_in_trace":0,"start_time_unix_nano":1764547200123456789,` +
+		`"end_time_unix_nano":1764547200987654321,"span_name":"pre-upgrade.child","otel_kind":"Client",` +
+		`"gen_ai_operation":"","audit_kind":"task","selected_attributes":null,"status":"Ok"}}` + "\n"
+	if err := os.WriteFile(env.cfg.WalPath, []byte(legacyWAL), 0600); err != nil {
+		t.Fatalf("writing legacy WAL: %v", err)
+	}
+
+	exp := startExporter(t, env.cfg)
+	// The root arrives after the upgrade and seals the trace.
+	traceID := [16]byte{1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1}
+	rootID := [8]byte{0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff, 0x00, 0x11}
+	_ = exp.ConsumeTraces(context.Background(),
+		makeSpan(traceID, rootID, zeroParentID, "post-upgrade.root", 1764547200000000000, 1764547201000000000))
+	if err := exp.Shutdown(context.Background()); err != nil {
+		t.Fatalf("Shutdown: %v", err)
+	}
+
+	entries := readLogEntries(t, env.cfg.LogPath)
+	if len(entries) != 2 {
+		t.Fatalf("expected the replayed span and the post-restart root in one chain, got %d entries", len(entries))
+	}
+	// Naming both spans guards against a pass where replay silently dropped the
+	// child and some other entry took its place.
+	var names []string
+	for _, e := range entries {
+		names = append(names, e.Record.SpanName)
+	}
+	slices.Sort(names)
+	if !slices.Equal(names, []string{"post-upgrade.root", "pre-upgrade.child"}) {
+		t.Errorf("chain span names: got %v, want the replayed child and the post-restart root", names)
+	}
+	// Both entries must carry the same schema version — that is the whole point.
+	if entries[0].Record.SchemaVersion != entries[1].Record.SchemaVersion {
+		t.Errorf("chain mixes schema versions: %q and %q",
+			entries[0].Record.SchemaVersion, entries[1].Record.SchemaVersion)
+	}
+	if got := entries[0].Record.SchemaVersion; got != record.SchemaVersion {
+		t.Errorf("chain schema version: got %q, want %q", got, record.SchemaVersion)
+	}
+	if err := verify.VerifyChain(entries, env.pubKey); err != nil {
+		t.Errorf("verifying a completed post-upgrade chain: %v", err)
+	}
+}
+
+// legacyWALLine builds a WAL span line stamped with an arbitrary schema version
+// and numeric (v1/v2-shaped) timestamps, as an earlier binary would have written it.
+func legacyWALLine(schemaVersion, traceID, spanID, parentSpanID, name string) string {
+	return `{"type":"span","trace_id":"` + traceID + `","record":` +
+		`{"schema_version":"` + schemaVersion + `","trace_id":"` + traceID + `","span_id":"` + spanID + `",` +
+		`"parent_span_id":"` + parentSpanID + `","seq_in_trace":0,"start_time_unix_nano":1764547200123456789,` +
+		`"end_time_unix_nano":1764547200987654321,"span_name":"` + name + `","otel_kind":"Client",` +
+		`"gen_ai_operation":"","audit_kind":"task","selected_attributes":null,"status":"Ok"}}` + "\n"
+}
+
+// TestStart_DataIncompatibleVersionIsSealedAtItsOwnVersion pins one limit of
+// re-stamping. v1 predates v2's widening of attributeAllowlist, so a v1
+// record's selected_attributes were captured under narrower rules; re-stamping
+// would assert that a v1 binary looked for guardrail attributes and found none,
+// when it never looked. But this binary DOES implement v1's wire format, so
+// sealing the trace as a v1 chain is honest — the bytes signed are the bytes v1
+// defines — and the records are preserved.
+func TestStart_DataIncompatibleVersionIsSealedAtItsOwnVersion(t *testing.T) {
+	env := newTestEnv(t)
+	const traceID = "01010101010101010101010101010101"
+	if err := os.WriteFile(env.cfg.WalPath,
+		[]byte(legacyWALLine("v1", traceID, "0102030405060708", "", "pre-upgrade.root")), 0600); err != nil {
+		t.Fatalf("writing legacy WAL: %v", err)
+	}
+
+	exp := startExporter(t, env.cfg)
+	if err := exp.Shutdown(context.Background()); err != nil {
+		t.Fatalf("Shutdown: %v", err)
+	}
+
+	entries := readLogEntries(t, env.cfg.LogPath)
+	if len(entries) != 1 {
+		t.Fatalf("expected 1 sealed entry, got %d", len(entries))
+	}
+	if got := entries[0].Record.SchemaVersion; got != "v1" {
+		t.Errorf("schema_version: got %q, want v1 — this version must not be re-stamped", got)
+	}
+
+	// Written in v1's encoding, not merely labelled v1.
+	raw, err := os.ReadFile(env.cfg.LogPath)
+	if err != nil {
+		t.Fatalf("reading log: %v", err)
+	}
+	if !bytes.Contains(raw, []byte(`"start_time_unix_nano":1764547200123456789`)) {
+		t.Errorf("v1 record not written with numeric timestamps:\n%s", raw)
+	}
+	if err := verify.VerifyChain(entries, env.pubKey); err != nil {
+		t.Errorf("verifying a chain sealed at v1: %v", err)
+	}
+}
+
+// TestStart_UnimplementedVersionIsQuarantinedNotSealed covers the case a
+// rollback produces: a WAL written by a NEWER binary. This one must not be
+// sealed at all.
+//
+// The records were decoded through the current AuditRecord, so any field that
+// version added is already gone, and canonical.Marshal would emit current-shaped
+// bytes under that version's label. Signing that attests to evidence this binary
+// altered, and a verifier that does implement the version reproduces different
+// bytes and reports tampering on an untampered log. The earlier version of this
+// test asserted the opposite and passed only because the verifier it used was
+// this same binary.
+func TestStart_UnimplementedVersionIsQuarantinedNotSealed(t *testing.T) {
+	env := newTestEnv(t)
+	const traceID = "01010101010101010101010101010101"
+	if err := os.WriteFile(env.cfg.WalPath,
+		[]byte(legacyWALLine("v99", traceID, "0102030405060708", "", "post-rollback.root")), 0600); err != nil {
+		t.Fatalf("writing WAL: %v", err)
+	}
+
+	exp := startExporter(t, env.cfg)
+	if err := exp.Shutdown(context.Background()); err != nil {
+		t.Fatalf("Shutdown: %v", err)
+	}
+
+	if entries := readLogEntries(t, env.cfg.LogPath); len(entries) != 0 {
+		t.Fatalf("a record of an unimplemented version must not be sealed and signed; got %d entries", len(entries))
+	}
+
+	quarantined, err := os.ReadFile(env.cfg.WalPath + ".quarantine.jsonl")
+	if err != nil {
+		t.Fatalf("reading quarantine sidecar: %v", err)
+	}
+	if !bytes.Contains(quarantined, []byte(`"span_name":"post-rollback.root"`)) {
+		t.Errorf("record was destroyed rather than quarantined:\n%s", quarantined)
+	}
+	if !bytes.Contains(quarantined, []byte(`"v99"`)) {
+		t.Errorf("quarantine entry does not record the stored version:\n%s", quarantined)
+	}
+}
+
+// TestStart_UnrestampableTraceIsSealedNotLeftOpen is the other half: a trace
+// held at its stored version must not stay open, or a span stamped with the
+// current version would join it and the chain would mix versions.
+func TestStart_UnrestampableTraceIsSealedNotLeftOpen(t *testing.T) {
+	env := newTestEnv(t)
+	const traceIDHex = "01010101010101010101010101010101"
+	if err := os.WriteFile(env.cfg.WalPath,
+		[]byte(legacyWALLine("v1", traceIDHex, "0102030405060708", "aabbccddeeff0011", "pre-upgrade.child")), 0600); err != nil {
+		t.Fatalf("writing legacy WAL: %v", err)
+	}
+
+	exp := startExporter(t, env.cfg)
+
+	// A current-version span for the same trace arrives after the restart. The
+	// replayed trace is already sealed, so it is dropped rather than joining it.
+	traceID := [16]byte{1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1}
+	rootID := [8]byte{0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff, 0x00, 0x11}
+	_ = exp.ConsumeTraces(context.Background(),
+		makeSpan(traceID, rootID, zeroParentID, "post-upgrade.root", 1764547200000000000, 1764547201000000000))
+	if err := exp.Shutdown(context.Background()); err != nil {
+		t.Fatalf("Shutdown: %v", err)
+	}
+
+	entries := readLogEntries(t, env.cfg.LogPath)
+	for i, e := range entries {
+		if e.Record.SchemaVersion != entries[0].Record.SchemaVersion {
+			t.Fatalf("chain mixes schema versions at seq %d: %q vs %q",
+				i, e.Record.SchemaVersion, entries[0].Record.SchemaVersion)
+		}
+	}
+	if len(entries) != 1 {
+		t.Fatalf("expected the v1 trace sealed alone, got %d entries", len(entries))
+	}
+	if got := entries[0].Record.SchemaVersion; got != "v1" {
+		t.Errorf("sealed at %q, want v1", got)
+	}
+	if err := verify.VerifyChain(entries, env.pubKey); err != nil {
+		t.Errorf("verifying the sealed v1 chain: %v", err)
+	}
+}
+
+// TestStart_RestampSurvivesSameSpanRedelivery covers the scenario the re-stamp
+// exists for, which no earlier test exercised: the SAME span_id is re-delivered
+// after the restart, replacing its replayed record last-write-wins with one
+// stamped at the current version. Without the re-stamp the buffer would hold
+// one v2 record and one v3 record and seal a chain mixing both.
+func TestStart_RestampSurvivesSameSpanRedelivery(t *testing.T) {
+	env := newTestEnv(t)
+	const traceIDHex = "01010101010101010101010101010101"
+	const childSpanHex = "0102030405060708"
+	if err := os.WriteFile(env.cfg.WalPath,
+		[]byte(legacyWALLine("v2", traceIDHex, childSpanHex, "aabbccddeeff0011", "pre-upgrade.child")), 0600); err != nil {
+		t.Fatalf("writing legacy WAL: %v", err)
+	}
+
+	exp := startExporter(t, env.cfg)
+
+	traceID := [16]byte{1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1}
+	childID := [8]byte{1, 2, 3, 4, 5, 6, 7, 8}
+	rootID := [8]byte{0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff, 0x00, 0x11}
+
+	// The upstream exporter re-delivers the same span after the restart.
+	_ = exp.ConsumeTraces(context.Background(),
+		makeSpan(traceID, childID, rootID, "redelivered.child", 1764547200123456789, 1764547200987654321))
+	// Then the root arrives and seals the trace.
+	_ = exp.ConsumeTraces(context.Background(),
+		makeSpan(traceID, rootID, zeroParentID, "post-upgrade.root", 1764547200000000000, 1764547201000000000))
+	if err := exp.Shutdown(context.Background()); err != nil {
+		t.Fatalf("Shutdown: %v", err)
+	}
+
+	entries := readLogEntries(t, env.cfg.LogPath)
+	if len(entries) != 2 {
+		t.Fatalf("expected the re-delivered child and the root in one chain, got %d entries", len(entries))
+	}
+	for i, e := range entries {
+		if e.Record.SchemaVersion != record.SchemaVersion {
+			t.Errorf("entry %d schema_version: got %q, want %q", i, e.Record.SchemaVersion, record.SchemaVersion)
+		}
+	}
+	// Last write wins: the re-delivered span replaced the replayed record.
+	var names []string
+	for _, e := range entries {
+		names = append(names, e.Record.SpanName)
+	}
+	if !slices.Contains(names, "redelivered.child") {
+		t.Errorf("re-delivered span did not replace the replayed record; span names: %v", names)
+	}
+	if err := verify.VerifyChain(entries, env.pubKey); err != nil {
+		t.Errorf("verifying the chain after a same-span re-delivery: %v", err)
+	}
+}
+
+// TestStart_MultipleUnrestampableTracesSealSafely covers the concurrency shape
+// the earlier tests missed: sealing more than one trace during Start. sealTrace
+// requires e.mu and dispatches a compaction goroutine that takes the lock
+// itself, so an unlocked seal loop raced that goroutine from the second
+// iteration onward — a concurrent map write that can panic the collector at
+// startup. One unrestampable trace never exposed it; -race catches it here.
+func TestStart_MultipleUnrestampableTracesSealSafely(t *testing.T) {
+	env := newTestEnv(t)
+
+	const traces = 6
+	var walLines string
+	for i := 0; i < traces; i++ {
+		walLines += legacyWALLine("v1",
+			fmt.Sprintf("%032x", 0x1000+i), fmt.Sprintf("%016x", 0x20+i), "", "legacy.root")
+	}
+	if err := os.WriteFile(env.cfg.WalPath, []byte(walLines), 0600); err != nil {
+		t.Fatalf("writing WAL: %v", err)
+	}
+
+	exp := startExporter(t, env.cfg)
+	if err := exp.Shutdown(context.Background()); err != nil {
+		t.Fatalf("Shutdown: %v", err)
+	}
+
+	entries := readLogEntries(t, env.cfg.LogPath)
+	if len(entries) != traces {
+		t.Fatalf("expected %d sealed entries, got %d", traces, len(entries))
+	}
+	for i, e := range entries {
+		if e.Record.SchemaVersion != "v1" {
+			t.Errorf("entry %d: schema_version %q, want v1", i, e.Record.SchemaVersion)
+		}
+	}
+}
+
+// TestStart_TraceSpanningSchemaVersionsIsDropped covers the case a per-record
+// decision got wrong: two crash-and-upgrade cycles on one in-flight trace leave
+// a WAL trace holding records of different versions. No single-version chain can
+// represent it, and a mixed chain is one this project's own verifier rejects —
+// so the trace is dropped loudly rather than sealed into an unverifiable log.
+//
+// The combinations are the four the round-3 validator measured writing a mixed
+// chain: a restampable version paired with a non-restampable one, in both
+// directions, and two non-restampable ones together.
+func TestStart_TraceSpanningSchemaVersionsIsDropped(t *testing.T) {
+	for _, versions := range [][2]string{
+		{"v2", "v1"},
+		{"v1", "v99"},
+		{record.SchemaVersion, "v1"},
+		{"v2", "v99"},
+	} {
+		versions := versions
+		t.Run(versions[0]+"+"+versions[1], func(t *testing.T) {
+			env := newTestEnv(t)
+			const traceID = "01010101010101010101010101010101"
+			walLines := legacyWALLine(versions[0], traceID, "0102030405060708", "aabbccddeeff0011", "first") +
+				legacyWALLine(versions[1], traceID, "0203040506070809", "aabbccddeeff0011", "second")
+			if err := os.WriteFile(env.cfg.WalPath, []byte(walLines), 0600); err != nil {
+				t.Fatalf("writing WAL: %v", err)
+			}
+
+			exp := startExporter(t, env.cfg)
+
+			entries := readLogEntries(t, env.cfg.LogPath)
+			if len(entries) != 0 {
+				var got []string
+				for _, e := range entries {
+					got = append(got, e.Record.SchemaVersion)
+				}
+				t.Fatalf("a trace spanning schema versions must not be sealed; got %d entries at %v", len(entries), got)
+			}
+
+			// It must not replay forever. Asserting "the log is still empty after
+			// a restart" would be vacuous — a still-present mixed trace is simply
+			// re-dropped, silently, every time. The durable property is that the
+			// records are gone from the WAL, so assert that directly.
+			walAfter, err := os.ReadFile(env.cfg.WalPath)
+			if err != nil && !os.IsNotExist(err) {
+				t.Fatalf("reading WAL: %v", err)
+			}
+			for _, name := range []string{"first", "second"} {
+				if bytes.Contains(walAfter, []byte(`"span_name":"`+name+`"`)) {
+					t.Errorf("dropped record %q still in the WAL; it will replay on every restart:\n%s", name, walAfter)
+				}
+			}
+
+			// And the records must have been set aside, not destroyed.
+			quarantined, err := os.ReadFile(env.cfg.WalPath + ".quarantine.jsonl")
+			if err != nil {
+				t.Fatalf("reading quarantine sidecar: %v", err)
+			}
+			for _, name := range []string{"first", "second"} {
+				if !bytes.Contains(quarantined, []byte(`"span_name":"`+name+`"`)) {
+					t.Errorf("dropped record %q is not in quarantine; it was destroyed:\n%s", name, quarantined)
+				}
+			}
+
+			// A later span must not re-open the dropped trace_id and write a
+			// silently truncated chain under it that verifies cleanly.
+			traceIDBytes := [16]byte{1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1}
+			rootID := [8]byte{0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff, 0x00, 0x11}
+			_ = exp.ConsumeTraces(context.Background(),
+				makeSpan(traceIDBytes, rootID, zeroParentID, "post-drop.root", 1764547200000000000, 1764547201000000000))
+			if entries := readLogEntries(t, env.cfg.LogPath); len(entries) != 0 {
+				t.Errorf("a span after the drop re-opened the trace and wrote %d entries; the trace must stay closed", len(entries))
+			}
+			if err := exp.Shutdown(context.Background()); err != nil {
+				t.Fatalf("Shutdown: %v", err)
+			}
+		})
+	}
+}
+
+// TestSealTrace_UnseedableRecordDoesNotReplayForever pins the other half of the
+// same lesson. sealTrace drops the buffer before deriving the genesis seed, so a
+// record whose schema_version cannot be seeded — empty, as a corrupt WAL line
+// yields — used to vanish from the log while staying in the WAL, re-processed on
+// every restart. It must be recorded as an unrecoverable drop instead.
+func TestSealTrace_UnseedableRecordDoesNotReplayForever(t *testing.T) {
+	env := newTestEnv(t)
+	const traceID = "01010101010101010101010101010101"
+	// schema_version "" is what a zero-value or corrupt record decodes to.
+	if err := os.WriteFile(env.cfg.WalPath,
+		[]byte(legacyWALLine("", traceID, "0102030405060708", "", "corrupt.root")), 0600); err != nil {
+		t.Fatalf("writing WAL: %v", err)
+	}
+
+	exp := startExporter(t, env.cfg)
+	if err := exp.Shutdown(context.Background()); err != nil {
+		t.Fatalf("Shutdown: %v", err)
+	}
+	if entries := readLogEntries(t, env.cfg.LogPath); len(entries) != 0 {
+		t.Fatalf("an unseedable record must not be sealed, got %d entries", len(entries))
+	}
+
+	walAfter, err := os.ReadFile(env.cfg.WalPath)
+	if err != nil {
+		t.Fatalf("reading WAL: %v", err)
+	}
+	if strings.Contains(string(walAfter), "corrupt.root") {
+		t.Errorf("unseedable record still in the WAL after seal; it will replay on every restart:\n%s", walAfter)
+	}
+}
+
+// TestStart_SealedAtOwnVersionSurvivesCompaction closes the window the
+// startup-seal guarantee actually has to hold across. sealTrace dispatches a
+// background Compact whose success handler resets sealedTraces — correct for an
+// ordinary seal, which only needs the guard until the sealed WAL records are
+// gone. A trace sealed during Start at an earlier schema version is different:
+// re-opening it would let a current-version span start a second chain under the
+// same trace_id, seq restarting at 0, which the verifier reports as
+// duplicate_trace_segment forever after.
+//
+// Waiting on the compaction before sending the span is what makes this
+// deterministic: without it the test merely wins a race, which is why the
+// sibling test passes with or without the guard.
+func TestStart_SealedAtOwnVersionSurvivesCompaction(t *testing.T) {
+	env := newTestEnv(t)
+	const traceIDHex = "01010101010101010101010101010101"
+	if err := os.WriteFile(env.cfg.WalPath,
+		[]byte(legacyWALLine("v1", traceIDHex, "0102030405060708", "aabbccddeeff0011", "pre-upgrade.child")), 0600); err != nil {
+		t.Fatalf("writing WAL: %v", err)
+	}
+
+	exp := startExporter(t, env.cfg)
+
+	// Let the compaction dispatched by the startup seal run to completion, so
+	// sealedTraces has been reset by the time the span arrives.
+	exp.compactWG.Wait()
+
+	traceID := [16]byte{1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1}
+	rootID := [8]byte{0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff, 0x00, 0x11}
+	_ = exp.ConsumeTraces(context.Background(),
+		makeSpan(traceID, rootID, zeroParentID, "post-upgrade.root", 1764547200000000000, 1764547201000000000))
+	if err := exp.Shutdown(context.Background()); err != nil {
+		t.Fatalf("Shutdown: %v", err)
+	}
+
+	entries := readLogEntries(t, env.cfg.LogPath)
+	if len(entries) != 1 {
+		var got []string
+		for _, e := range entries {
+			got = append(got, fmt.Sprintf("seq=%d %s %s", e.Record.SeqInTrace, e.Record.SchemaVersion, e.Record.SpanName))
+		}
+		t.Fatalf("the startup-sealed trace must stay closed after compaction; got %d entries: %v", len(entries), got)
+	}
+	if got := entries[0].Record.SchemaVersion; got != "v1" {
+		t.Errorf("sealed at %q, want v1", got)
+	}
+}
+
+// TestStart_TraceSpanningRestampableVersionsIsKept is the counterpart to the
+// drop test, and covers the pair the ordinary upgrade path actually produces.
+//
+// Re-stamping is in-memory only — wal.Compact deliberately rewrites each record
+// at its stored version — so one upgrade plus a second crash leaves a WAL trace
+// holding {previous, current}. Every version present is restampable to current,
+// so they collapse onto it exactly as a single one would; dropping the trace
+// because the SET has more than one member destroys audit data on a common path.
+func TestStart_TraceSpanningRestampableVersionsIsKept(t *testing.T) {
+	env := newTestEnv(t)
+	const traceIDHex = "01010101010101010101010101010101"
+	walLines := legacyWALLine("v2", traceIDHex, "0102030405060708", "aabbccddeeff0011", "pre-upgrade.child") +
+		legacyWALLine(record.SchemaVersion, traceIDHex, "0203040506070809", "aabbccddeeff0011", "post-upgrade.child")
+	if err := os.WriteFile(env.cfg.WalPath, []byte(walLines), 0600); err != nil {
+		t.Fatalf("writing WAL: %v", err)
+	}
+
+	exp := startExporter(t, env.cfg)
+	if err := exp.Shutdown(context.Background()); err != nil {
+		t.Fatalf("Shutdown: %v", err)
+	}
+
+	entries := readLogEntries(t, env.cfg.LogPath)
+	if len(entries) != 2 {
+		t.Fatalf("both records must survive; got %d entries", len(entries))
+	}
+	for i, e := range entries {
+		if e.Record.SchemaVersion != record.SchemaVersion {
+			t.Errorf("entry %d: schema_version %q, want %q", i, e.Record.SchemaVersion, record.SchemaVersion)
+		}
+	}
+	if err := verify.VerifyChain(entries, env.pubKey); err != nil {
+		t.Errorf("verifying the re-stamped chain: %v", err)
+	}
+	if _, err := os.Stat(env.cfg.WalPath + ".quarantine.jsonl"); !os.IsNotExist(err) {
+		t.Errorf("nothing should have been quarantined; sidecar exists (stat err: %v)", err)
+	}
+}
+
+// TestStart_SameSpanRedeliveredAcrossRestartIsNotDropped covers the other false
+// drop. wal.Replay returns every appended span line with no dedup, so a span
+// written under v2 and re-delivered post-upgrade as v3 appears twice under one
+// span_id. The buffer dedups it last-write-wins into a single current-version
+// record, so the trace is unanimous — but a version set computed over the raw
+// replayed slice sees two versions and destroys it.
+func TestStart_SameSpanRedeliveredAcrossRestartIsNotDropped(t *testing.T) {
+	env := newTestEnv(t)
+	const traceIDHex = "01010101010101010101010101010101"
+	const spanIDHex = "0102030405060708"
+	// The same span_id twice: the original v1 entry and its v3 re-delivery. v1 is
+	// chosen deliberately — it is NOT restampable, so if the version set is taken
+	// over the raw replayed slice the trace looks irreconcilable and is destroyed.
+	// After dedup only the v3 record survives, and the trace is unanimous.
+	walLines := legacyWALLine("v1", traceIDHex, spanIDHex, "", "original") +
+		legacyWALLine(record.SchemaVersion, traceIDHex, spanIDHex, "", "redelivered")
+	if err := os.WriteFile(env.cfg.WalPath, []byte(walLines), 0600); err != nil {
+		t.Fatalf("writing WAL: %v", err)
+	}
+
+	exp := startExporter(t, env.cfg)
+	if err := exp.Shutdown(context.Background()); err != nil {
+		t.Fatalf("Shutdown: %v", err)
+	}
+
+	entries := readLogEntries(t, env.cfg.LogPath)
+	if len(entries) != 1 {
+		t.Fatalf("a re-delivered span must dedup to one record, not be dropped; got %d entries", len(entries))
+	}
+	if got := entries[0].Record.SpanName; got != "redelivered" {
+		t.Errorf("span name %q, want the last write to win with %q", got, "redelivered")
+	}
+	if got := entries[0].Record.SchemaVersion; got != record.SchemaVersion {
+		t.Errorf("schema_version %q, want %q", got, record.SchemaVersion)
+	}
+	if err := verify.VerifyChain(entries, env.pubKey); err != nil {
+		t.Errorf("verifying the deduped chain: %v", err)
+	}
+}
+
+// TestSealTrace_UnsealableRecordsAreQuarantined pins that sealTrace's
+// cannot-seal path sets the records aside rather than erasing them. The audit
+// log has no way to record its own gap, so a drop with only a counter in a log
+// line leaves an operator unable to tell what was lost.
+func TestSealTrace_UnsealableRecordsAreQuarantined(t *testing.T) {
+	env := newTestEnv(t)
+	const traceID = "01010101010101010101010101010101"
+	if err := os.WriteFile(env.cfg.WalPath,
+		[]byte(legacyWALLine("", traceID, "0102030405060708", "", "corrupt.root")), 0600); err != nil {
+		t.Fatalf("writing WAL: %v", err)
+	}
+
+	exp := startExporter(t, env.cfg)
+	if err := exp.Shutdown(context.Background()); err != nil {
+		t.Fatalf("Shutdown: %v", err)
+	}
+
+	quarantined, err := os.ReadFile(env.cfg.WalPath + ".quarantine.jsonl")
+	if err != nil {
+		t.Fatalf("reading quarantine sidecar: %v", err)
+	}
+	if !bytes.Contains(quarantined, []byte(`"span_name":"corrupt.root"`)) {
+		t.Errorf("unsealable record was destroyed rather than quarantined:\n%s", quarantined)
+	}
+	// The sidecar must carry enough context to act on.
+	for _, want := range []string{`"trace_id"`, `"reason"`, `"current_schema_version"`, `"quarantined_at"`} {
+		if !bytes.Contains(quarantined, []byte(want)) {
+			t.Errorf("quarantine entry missing %s:\n%s", want, quarantined)
+		}
+	}
+}
+
+// TestQuarantine_OpenFailureLeavesRecordsInWAL covers the one path where this
+// component would otherwise destroy audit data outright. When the sidecar
+// cannot be written, the records must stay in the WAL rather than being marked
+// sealed and compacted away: the seal failure that sent them there is
+// deterministic, but a quarantine failure — a full disk, a directory not yet
+// writable at startup — is typically transient. Loud and repeating beats gone.
+func TestQuarantine_OpenFailureLeavesRecordsInWAL(t *testing.T) {
+	env := newTestEnv(t)
+	const traceID = "01010101010101010101010101010101"
+	walLines := legacyWALLine("v1", traceID, "0102030405060708", "aabbccddeeff0011", "first") +
+		legacyWALLine(record.SchemaVersion, traceID, "0203040506070809", "aabbccddeeff0011", "second")
+	if err := os.WriteFile(env.cfg.WalPath, []byte(walLines), 0600); err != nil {
+		t.Fatalf("writing WAL: %v", err)
+	}
+	// A directory where the sidecar should be: os.OpenFile fails with EISDIR
+	// for any uid, unlike a permission bit that root ignores.
+	if err := os.Mkdir(env.cfg.WalPath+".quarantine.jsonl", 0700); err != nil {
+		t.Fatalf("creating blocking directory: %v", err)
+	}
+
+	exp := startExporter(t, env.cfg)
+	if err := exp.Shutdown(context.Background()); err != nil {
+		t.Fatalf("Shutdown must still succeed when quarantine is unwritable: %v", err)
+	}
+
+	// The audit log is untouched — nothing unsealable was written to it.
+	if entries := readLogEntries(t, env.cfg.LogPath); len(entries) != 0 {
+		t.Errorf("unsealable records must not reach the audit log; got %d entries", len(entries))
+	}
+
+	// The records must still be in the WAL: they were not quarantined, so they
+	// must not have been erased.
+	walAfter, err := os.ReadFile(env.cfg.WalPath)
+	if err != nil {
+		t.Fatalf("reading WAL: %v", err)
+	}
+	for _, name := range []string{"first", "second"} {
+		if !bytes.Contains(walAfter, []byte(`"span_name":"`+name+`"`)) {
+			t.Errorf("record %q was erased despite quarantine failing; it existed nowhere else:\n%s", name, walAfter)
+		}
+	}
+}
+
+// TestQuarantine_AppendsAcrossDropsAndIsPrivate pins two properties of the
+// sidecar that nothing else would catch: it appends rather than truncating, so
+// a second drop cannot erase the first's records, and it is 0600, since it
+// holds complete audit records including span names and selected attributes.
+func TestQuarantine_AppendsAcrossDropsAndIsPrivate(t *testing.T) {
+	env := newTestEnv(t)
+	// Two different traces, each irreconcilable, replayed together.
+	walLines := legacyWALLine("v1", "01010101010101010101010101010101", "0102030405060708", "aabbccddeeff0011", "traceA.first") +
+		legacyWALLine(record.SchemaVersion, "01010101010101010101010101010101", "0203040506070809", "aabbccddeeff0011", "traceA.second") +
+		legacyWALLine("v1", "02020202020202020202020202020202", "0304050607080900", "bbccddeeff001122", "traceB.first") +
+		legacyWALLine(record.SchemaVersion, "02020202020202020202020202020202", "0405060708090001", "bbccddeeff001122", "traceB.second")
+	if err := os.WriteFile(env.cfg.WalPath, []byte(walLines), 0600); err != nil {
+		t.Fatalf("writing WAL: %v", err)
+	}
+
+	exp := startExporter(t, env.cfg)
+	if err := exp.Shutdown(context.Background()); err != nil {
+		t.Fatalf("Shutdown: %v", err)
+	}
+
+	path := env.cfg.WalPath + ".quarantine.jsonl"
+	quarantined, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("reading quarantine sidecar: %v", err)
+	}
+	// All four records from both traces must be present: a second drop must not
+	// have truncated the first.
+	for _, name := range []string{"traceA.first", "traceA.second", "traceB.first", "traceB.second"} {
+		if !bytes.Contains(quarantined, []byte(`"span_name":"`+name+`"`)) {
+			t.Errorf("%q missing from quarantine; a later drop truncated it:\n%s", name, quarantined)
+		}
+	}
+	if got := bytes.Count(bytes.TrimRight(quarantined, "\n"), []byte("\n")) + 1; got != 4 {
+		t.Errorf("quarantine holds %d lines, want 4", got)
+	}
+
+	info, err := os.Stat(path)
+	if err != nil {
+		t.Fatalf("stat quarantine: %v", err)
+	}
+	if perm := info.Mode().Perm(); perm != 0o600 {
+		t.Errorf("quarantine sidecar mode %04o, want 0600 — it holds complete audit records", perm)
+	}
+}
+
+// TestQuarantine_TornTrailingLineIsRepaired covers the sidecar with the same
+// guarantee #24 gave the audit log and checkpoint file. It is appended the same
+// way, so a crash mid-write leaves a fragment that the next append fuses onto —
+// and here that corrupts both the torn record and the next one, in the only
+// file still holding either.
+func TestQuarantine_TornTrailingLineIsRepaired(t *testing.T) {
+	env := newTestEnv(t)
+	quarantinePath := env.cfg.WalPath + ".quarantine.jsonl"
+
+	// A fragment as an interrupted append leaves it: no trailing newline, cut
+	// mid-token.
+	torn := `{"trace_id":"aaaa","quarantined_at":"2026-06-22T00:00:00Z","reason":"earlier drop","record":{"schema_ver`
+	if err := os.WriteFile(quarantinePath, []byte(torn), 0600); err != nil {
+		t.Fatalf("writing torn sidecar: %v", err)
+	}
+
+	const traceID = "01010101010101010101010101010101"
+	walLines := legacyWALLine("v1", traceID, "0102030405060708", "aabbccddeeff0011", "first") +
+		legacyWALLine(record.SchemaVersion, traceID, "0203040506070809", "aabbccddeeff0011", "second")
+	if err := os.WriteFile(env.cfg.WalPath, []byte(walLines), 0600); err != nil {
+		t.Fatalf("writing WAL: %v", err)
+	}
+
+	exp := startExporter(t, env.cfg)
+	if err := exp.Shutdown(context.Background()); err != nil {
+		t.Fatalf("Shutdown: %v", err)
+	}
+
+	quarantined, err := os.ReadFile(quarantinePath)
+	if err != nil {
+		t.Fatalf("reading quarantine sidecar: %v", err)
+	}
+	// Every line must be parseable — nothing fused onto the fragment.
+	for i, line := range bytes.Split(bytes.TrimRight(quarantined, "\n"), []byte("\n")) {
+		if len(bytes.TrimSpace(line)) == 0 {
+			continue
+		}
+		var entry map[string]any
+		if err := json.Unmarshal(line, &entry); err != nil {
+			t.Errorf("quarantine line %d is not valid JSON (a torn line fused onto it): %v\n%s", i, err, line)
+		}
+	}
+	// And the new records still arrived.
+	for _, name := range []string{"first", "second"} {
+		if !bytes.Contains(quarantined, []byte(`"span_name":"`+name+`"`)) {
+			t.Errorf("%q missing from the repaired sidecar:\n%s", name, quarantined)
+		}
+	}
+}
+
+// TestConfig_Validate_QuarantineSidecarCollision covers the one audit path that
+// is derived rather than configured. Config.Validate already requires log_path,
+// wal_path and checkpoint_path to be distinct, but the quarantine sidecar is
+// derived from wal_path and escapes that check — pointing an attestable file at
+// it would interleave quarantined records into one.
+func TestConfig_Validate_QuarantineSidecarCollision(t *testing.T) {
+	base := func() *Config {
+		return &Config{
+			LogPath:        "/tmp/audit.jsonl",
+			WalPath:        "/tmp/audit.wal",
+			CheckpointPath: "/tmp/checkpoint.jsonl",
+			KeyPath:        "/tmp/key.pem",
+		}
+	}
+	if err := base().Validate(); err != nil {
+		t.Fatalf("baseline config must be valid: %v", err)
+	}
+
+	cfg := base()
+	cfg.LogPath = cfg.WalPath + quarantineSuffix
+	if err := cfg.Validate(); err == nil {
+		t.Error("log_path colliding with the quarantine sidecar must be rejected")
+	}
+
+	cfg = base()
+	cfg.CheckpointPath = cfg.WalPath + quarantineSuffix
+	if err := cfg.Validate(); err == nil {
+		t.Error("checkpoint_path colliding with the quarantine sidecar must be rejected")
+	}
 }

@@ -93,6 +93,32 @@ Status: FAILED (1 error(s))
 - A missing log or checkpoint file is treated as empty — no error is returned.
 - An unparseable line in the log or checkpoint file (e.g. a truncated line from a crash) causes the verifier to return an I/O error (exit 2). The WAL, not the audit log, absorbs crash-partial writes; the audit log only receives complete JSONL entries.
 
+## Schema versions in a log
+
+The verifier re-derives each entry's hash by re-serializing its `record` — so it
+must reproduce the wire shape that entry was written in, not the newest one. Both
+inputs come from the record itself:
+
+- the **genesis seed** is `SHA256(traceIDBytes ‖ schema_version)`, taken from
+  `record.schema_version` rather than the verifier's own constant; and
+- since **v3**, the same field selects the **timestamp encoding**:
+  `start_time_unix_nano` and `end_time_unix_nano` are decimal strings in v3 and
+  later, JSON numbers in v1 and v2.
+
+`otel-agent-audit-verify` handles both automatically, so a current binary
+verifies v1, v2 and v3 logs. A third-party verifier must implement the same
+dispatch, and must parse the v3 timestamp strings with an exact 64-bit integer
+parser — routing a nanosecond timestamp through an IEEE-754 double loses
+precision and makes the hash unreproducible. See
+[docs/audit-record-schema.md §2.1](audit-record-schema.md#21-timestamp-encoding-v3).
+
+A single log file **may** contain traces of different schema versions — the
+verifier derives each trace's genesis seed and timestamp encoding from that
+trace's own entries, so a file spanning a collector upgrade verifies as-is. What
+must not happen is entries of different schema versions inside **one trace's
+chain**; the exporter seals each trace against the schema version of its own
+seq-0 record, and the verifier rejects a chain whose entries disagree.
+
 ## Key-id verification
 
 Every log entry and checkpoint carries a `key_id` field equal to

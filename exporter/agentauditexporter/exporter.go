@@ -29,6 +29,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"sort"
 	"sync"
 	"time"
 
@@ -52,6 +53,22 @@ type traceBuffer struct {
 	records  map[string]record.AuditRecord // keyed by span_id for dedup
 	lastSeen time.Time
 	hasRoot  bool
+}
+
+// quarantineSuffix is appended to wal_path to derive the quarantine sidecar.
+// Config.Validate rejects a log_path or checkpoint_path that collides with it.
+const quarantineSuffix = ".quarantine.jsonl"
+
+// quarantineEntry is one line of the quarantine sidecar: the record that could
+// not be sealed, plus enough context for an operator to understand why it is
+// there and what to do with it.
+type quarantineEntry struct {
+	TraceID        string             `json:"trace_id"`
+	QuarantinedAt  string             `json:"quarantined_at"`
+	Reason         string             `json:"reason"`
+	SchemaVersions []string           `json:"schema_versions"`
+	CurrentSchema  string             `json:"current_schema_version"`
+	Record         record.AuditRecord `json:"record"`
 }
 
 // logSyncer is the subset of *os.File behaviour used by the exporter's append-
@@ -80,6 +97,21 @@ type agentAuditExporter struct {
 	// traceID will be buffered and sealed again as a new chain — this is an accepted
 	// at-least-once pipeline trade-off, addressed in B3 by the agentauditselect processor.
 	sealedTraces map[string]struct{} // guarded by mu
+
+	// startupSealed holds traces sealed during Start because they had to keep a
+	// schema version this binary must not re-stamp. Unlike sealedTraces it is
+	// never cleared: Compact clearing sealedTraces is safe for an ordinary seal,
+	// which only needs the guard until the sealed WAL records are gone, but
+	// these traces must stay closed for the process's lifetime. Re-opening one
+	// would let a span stamped with the current version start a second chain
+	// under the same trace_id. Bounded by the traces in flight at crash time.
+	//
+	// The guarantee is process-scoped, not absolute: after a restart the WAL
+	// entries are gone and a re-delivered span does start a fresh chain, which
+	// a verifier reports as duplicate_trace_segment. That is the same accepted
+	// at-least-once trade-off documented on sealedTraces above, addressed
+	// upstream by agentauditselect rather than here.
+	startupSealed map[string]struct{} // guarded by mu
 
 	// checkpointPoisoned is set when a failed checkpoint write could not be
 	// rolled back, so the file may still hold an uncommitted checkpoint line.
@@ -157,10 +189,24 @@ func (e *agentAuditExporter) Start(_ context.Context, _ component.Host) error {
 	}{
 		{"audit log", e.cfg.LogPath},
 		{"checkpoint file", e.cfg.CheckpointPath},
+		// The quarantine sidecar is appended the same way and needs the same
+		// repair — more so, since it holds the only surviving copy of records
+		// that could not be sealed, so a fused line corrupts the one thing
+		// standing between an operator and total loss. Unlike the two above it
+		// is diagnostic rather than attestable, so a repair failure on it is
+		// logged rather than fatal: see the fatal-vs-logged split below.
+		{"quarantine sidecar", e.quarantinePath()},
 	} {
 		rep, repairErr := repairTrailingPartialLine(f.path)
 		switch {
 		case repairErr == nil:
+		case f.path == e.quarantinePath():
+			// Never refuse to start over a diagnostic file. Losing the repair
+			// risks a fused quarantine line; refusing to start guarantees the
+			// collector records nothing at all.
+			e.logger.Error("agentaudit: could not repair the quarantine sidecar; "+
+				"a partial write left by an earlier crash may fuse onto the next entry",
+				zap.String("file", f.path), zap.Error(repairErr))
 		case errors.Is(repairErr, errRepairUnavailable):
 			// Nothing is known to be torn, and the append-only open below may
 			// well succeed. Refusing to start here would deny a configuration
@@ -223,7 +269,20 @@ func (e *agentAuditExporter) Start(_ context.Context, _ component.Host) error {
 	now := time.Now()
 	e.buffers = make(map[string]*traceBuffer, len(replayed))
 	e.sealedTraces = make(map[string]struct{})
+	e.startupSealed = make(map[string]struct{})
+	// sealAtOwnVersion collects traces that must keep the schema version they
+	// were written with. They are sealed as soon as the accumulator exists,
+	// below, rather than left open: an open buffer would go on to accept spans
+	// stamped with the current version and seal one chain mixing two.
+	var sealAtOwnVersion []string
+
 	for traceID, recs := range replayed {
+		// Build the buffer BEFORE deciding anything. WAL span entries are in
+		// append order and the same span_id can appear more than once — a span
+		// re-delivered after an upgrade is appended again under the current
+		// version, leaving its older copy on disk. Only the deduped records are
+		// ever sealed, so the schema-version decision has to be made over those;
+		// deciding over the raw slice counts a re-delivery as two versions.
 		buf := &traceBuffer{
 			records:  make(map[string]record.AuditRecord, len(recs)),
 			lastSeen: now,
@@ -234,7 +293,111 @@ func (e *agentAuditExporter) Start(_ context.Context, _ component.Host) error {
 				buf.hasRoot = true
 			}
 		}
-		e.buffers[traceID] = buf
+
+		// Decide per TRACE, not per record. A chain carries exactly one
+		// schema_version, so a replayed trace's disposition is a property of
+		// all its records together; deciding record by record can leave a
+		// buffer holding two versions and seal a chain this project's own
+		// verifier rejects.
+		stored := map[string]struct{}{}
+		for _, rec := range buf.records {
+			stored[rec.SchemaVersion] = struct{}{}
+		}
+		versions := make([]string, 0, len(stored))
+		for v := range stored {
+			versions = append(versions, v)
+		}
+		sort.Strings(versions)
+
+		// A WAL entry is an unsealed draft: nothing has hashed it, so adopting
+		// the current schema version costs no stored hash or signature. That is
+		// only safe where the versions agree on what a record's fields MEAN —
+		// record.RestampableToCurrent is the authority, and it excludes v1
+		// (whose attributeAllowlist was narrower) and every version this binary
+		// does not implement, including a newer one left by a rollback.
+		//
+		// The test is over the whole SET, not its size: several restampable
+		// versions collapse onto the current one just as safely as one does,
+		// and a trace really can hold two of them. Re-stamping is in-memory
+		// only — wal.Compact deliberately rewrites each record at its stored
+		// version — so one upgrade plus a second crash is enough to leave a
+		// {previous, current} WAL trace, which is an ordinary upgrade path and
+		// must not lose data.
+		allRestampable := true
+		for _, v := range versions {
+			if !record.RestampableToCurrent(v) {
+				allRestampable = false
+				break
+			}
+		}
+
+		switch {
+		case allRestampable:
+			restamped := 0
+			for spanID, rec := range buf.records {
+				if rec.SchemaVersion != record.SchemaVersion {
+					rec.SchemaVersion = record.SchemaVersion
+					buf.records[spanID] = rec
+					restamped++
+				}
+			}
+			e.buffers[traceID] = buf
+			if restamped > 0 {
+				e.logger.Info("agentaudit: re-stamped replayed WAL records to the current schema version",
+					zap.String("trace_id", traceID),
+					zap.Strings("from", versions),
+					zap.String("to", record.SchemaVersion),
+					zap.Int("records", restamped))
+			}
+
+		case len(versions) == 1 && record.Implemented(versions[0]):
+			// A single version this binary must not re-stamp but CAN write —
+			// v1, whose wire shape the frozen legacy marshaller still produces.
+			// Sealing it is honest: the bytes we sign are the bytes that
+			// version defines. Seal it below rather than leaving it open to
+			// accept spans stamped with the current version.
+			e.buffers[traceID] = buf
+			sealAtOwnVersion = append(sealAtOwnVersion, traceID)
+
+		default:
+			// Either several versions that cannot be reconciled into one chain,
+			// or a single version this binary cannot write — what a rollback
+			// leaves behind. Both are unsealable for the same underlying
+			// reason: any chain we produced would be signed over bytes that do
+			// not represent the records. The unimplemented case is the worse of
+			// the two, because the records were decoded through the current
+			// struct and any field that version added is already gone, so
+			// sealing would attest to altered evidence.
+			//
+			// Set the records aside where an operator can find them, then drop
+			// the trace: erasing evidence with only a log line to show for it
+			// is not an option for an audit component.
+			unsealable := make([]record.AuditRecord, 0, len(buf.records))
+			for _, rec := range buf.records {
+				unsealable = append(unsealable, rec)
+			}
+			reason := "trace spans schema versions that cannot be reconciled into one chain"
+			if len(versions) == 1 {
+				reason = "schema version is not implemented by this binary; its records cannot be sealed honestly"
+			}
+			retained := e.quarantineRecords(traceID, unsealable, versions, reason)
+			e.startupSealed[traceID] = struct{}{}
+			if retained == len(unsealable) {
+				// Every record is safely set aside, so the WAL copies can go.
+				e.markWALSealed(traceID)
+			} else {
+				// Quarantine is typically transient — a full disk, a directory
+				// not yet writable at startup — unlike the seal failure that
+				// sent us here, which is deterministic. Leave the WAL entries
+				// alone: the trace re-quarantines on the next start, which is
+				// loud and repeats, but does not destroy the only copy.
+				e.logger.Error("agentaudit: not all records could be quarantined; leaving them in the WAL rather than erasing them",
+					zap.String("trace_id", traceID),
+					zap.Int("records", len(unsealable)),
+					zap.Int("quarantined", retained))
+			}
+			continue
+		}
 	}
 
 	// Compact WAL after replay to remove any sealed entries from before the crash.
@@ -264,6 +427,28 @@ func (e *agentAuditExporter) Start(_ context.Context, _ component.Host) error {
 		e.logger.Warn("agentaudit: could not read last checkpoint on restart", zap.Error(cpErr))
 	}
 	e.accumulator = chain.NewAccumulator(e.signer, initialSeq, prevHash)
+
+	// Seal the traces that must keep their stored schema version, now that the
+	// accumulator sealTrace adds tips to exists. Sealing here costs them the
+	// trace_timeout grace window; leaving them open would cost the chain its
+	// single-version guarantee, which is the more expensive of the two.
+	//
+	// sealTrace's contract is that the caller holds e.mu: it mutates e.buffers
+	// and e.sealedTraces, and dispatches a compaction goroutine that takes the
+	// lock itself. Those goroutines simply block until this loop is done.
+	e.mu.Lock()
+	for _, traceID := range sealAtOwnVersion {
+		buf := e.buffers[traceID]
+		if buf == nil {
+			continue
+		}
+		e.logger.Error("agentaudit: replayed trace holds records this binary must not re-stamp; sealing at its own schema version",
+			zap.String("trace_id", traceID),
+			zap.String("current_schema_version", record.SchemaVersion))
+		e.startupSealed[traceID] = struct{}{}
+		e.sealTrace(traceID, buf, e.effectiveCheckpointInterval())
+	}
+	e.mu.Unlock()
 
 	traceTimeout := e.cfg.TraceTimeout
 	if traceTimeout <= 0 {
@@ -445,6 +630,11 @@ func (e *agentAuditExporter) bufferSpan(rec record.AuditRecord, now time.Time, c
 
 	// Drop spans for already-sealed traces. A second root span would create a second
 	// chain for the same trace_id, making the log ambiguous for verifiers.
+	if _, sealed := e.startupSealed[traceID]; sealed {
+		e.logger.Warn("agentaudit: span for a trace sealed at an earlier schema version during startup, dropping",
+			zap.String("trace_id", traceID))
+		return nil
+	}
 	if _, sealed := e.sealedTraces[traceID]; sealed {
 		e.logger.Warn("agentaudit: span for already-sealed trace, dropping",
 			zap.String("trace_id", traceID))
@@ -512,15 +702,39 @@ func (e *agentAuditExporter) sealTrace(traceID string, buf *traceBuffer, checkpo
 	}
 
 	// Step 3: build chain.
-	genesisSeed, err := chain.GenesisSeed(traceID)
+	//
+	// The seed must come from the SEALED RECORDS' own schema_version, not from
+	// the package constant: a verifier derives it from entries[0]'s stored
+	// schema_version, so a chain built with a different one fails verification
+	// on an untampered log. They diverge after an upgrade — records replayed
+	// from a WAL written by an earlier binary keep the schema version they were
+	// created with. recs is sorted above, so recs[0] is the seq-0 entry the
+	// verifier reads.
+	genesisSeed, err := chain.GenesisSeedForSchema(traceID, recs[0].SchemaVersion)
 	if err != nil {
-		e.logger.Error("agentaudit: genesis seed", zap.String("trace_id", traceID), zap.Error(err))
+		// The buffer is already dropped above, so returning here would lose the
+		// records from the log AND leave them in the WAL to replay on every
+		// restart. The failure is deterministic — a record whose schema_version
+		// is empty or unseedable never becomes sealable — so record it as an
+		// unrecoverable drop instead of retrying it forever.
+		e.logger.Error("agentaudit: genesis seed; dropping trace, its records cannot be sealed",
+			zap.String("trace_id", traceID),
+			zap.String("schema_version", recs[0].SchemaVersion),
+			zap.Int("records", len(recs)),
+			zap.Error(err))
+		if e.quarantineRecords(traceID, recs, nil, "schema_version cannot seed a chain") == len(recs) {
+			e.markWALSealed(traceID)
+		}
 		return
 	}
 
 	entries, err := chain.BuildChain(recs, genesisSeed, e.signer)
 	if err != nil {
-		e.logger.Error("agentaudit: build chain", zap.String("trace_id", traceID), zap.Error(err))
+		e.logger.Error("agentaudit: build chain; dropping trace, its records cannot be sealed",
+			zap.String("trace_id", traceID), zap.Int("records", len(recs)), zap.Error(err))
+		if e.quarantineRecords(traceID, recs, nil, "chain could not be built") == len(recs) {
+			e.markWALSealed(traceID)
+		}
 		return
 	}
 
@@ -628,6 +842,113 @@ func (e *agentAuditExporter) sealTrace(traceID string, buf *traceBuffer, checkpo
 			e.sealedTraces = make(map[string]struct{})
 			e.mu.Unlock()
 		}()
+	}
+}
+
+// quarantinePath is the sidecar the exporter writes records to when it cannot
+// seal them into a chain. It sits next to the WAL so it inherits the same
+// directory and retention the operator already manages for in-flight data.
+func (e *agentAuditExporter) quarantinePath() string {
+	return e.cfg.WalPath + quarantineSuffix
+}
+
+// quarantineRecords writes records that cannot be sealed to the quarantine
+// sidecar, one JSON object per line, and logs where they went and what they
+// were. It is the difference between "these spans were destroyed" and "these
+// spans were set aside for a human": the audit log itself has no way to record
+// a gap, so if the records are erased with only a counter in a log line, no
+// operator can tell what was lost or reconstruct it.
+//
+// Best-effort by design — a quarantine failure is logged, not propagated,
+// because the caller's alternative is to seal an unverifiable chain. Called
+// with e.mu held; during Start it runs before the background goroutine
+// that would contend for it exists.
+func (e *agentAuditExporter) quarantineRecords(traceID string, recs []record.AuditRecord, versions []string, reason string) int {
+	bySpanID := make(map[string]record.AuditRecord, len(recs))
+	spanIDs := make([]string, 0, len(recs))
+	seenVersions := map[string]struct{}{}
+	for _, rec := range recs {
+		if _, seen := bySpanID[rec.SpanID]; !seen {
+			spanIDs = append(spanIDs, rec.SpanID)
+		}
+		bySpanID[rec.SpanID] = rec
+		seenVersions[rec.SchemaVersion] = struct{}{}
+	}
+	sort.Strings(spanIDs)
+
+	// Derive the versions rather than trusting the caller to have got them
+	// right: this file's whole job is telling an operator what happened, so it
+	// must not report a set that does not match the records beside it.
+	if versions == nil {
+		versions = make([]string, 0, len(seenVersions))
+		for v := range seenVersions {
+			versions = append(versions, v)
+		}
+		sort.Strings(versions)
+	}
+
+	path := e.quarantinePath()
+	f, err := os.OpenFile(path, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o600)
+	if err != nil {
+		e.logger.Error("agentaudit: cannot open quarantine file; unsealable records are being dropped with no copy retained",
+			zap.String("trace_id", traceID),
+			zap.String("path", path),
+			zap.Strings("span_ids", spanIDs),
+			zap.Error(err))
+		return 0
+	}
+	defer func() { _ = f.Close() }()
+
+	written := 0
+	for _, spanID := range spanIDs {
+		line, err := json.Marshal(quarantineEntry{
+			TraceID:        traceID,
+			QuarantinedAt:  time.Now().UTC().Format(time.RFC3339),
+			Reason:         reason,
+			SchemaVersions: versions,
+			CurrentSchema:  record.SchemaVersion,
+			Record:         bySpanID[spanID],
+		})
+		if err != nil {
+			e.logger.Error("agentaudit: marshalling quarantined record",
+				zap.String("trace_id", traceID), zap.String("span_id", spanID), zap.Error(err))
+			continue
+		}
+		if _, err := f.Write(append(line, '\n')); err != nil {
+			e.logger.Error("agentaudit: writing quarantined record",
+				zap.String("trace_id", traceID), zap.String("span_id", spanID), zap.Error(err))
+			continue
+		}
+		written++
+	}
+	if err := f.Sync(); err != nil {
+		e.logger.Warn("agentaudit: syncing quarantine file", zap.String("path", path), zap.Error(err))
+	}
+
+	e.logger.Error("agentaudit: records could not be sealed into a chain; they are quarantined and the trace is dropped",
+		zap.String("trace_id", traceID),
+		zap.String("reason", reason),
+		zap.Strings("schema_versions", versions),
+		zap.Strings("span_ids", spanIDs),
+		zap.Int("records", len(recs)),
+		zap.Int("quarantined", written),
+		zap.String("quarantine_path", path))
+	return written
+}
+
+// markWALSealed marks traceID sealed in the WAL, logging rather than returning
+// a failure. Called on the paths where a trace has been removed from the
+// buffers but no chain could be written for it: without this its records
+// replay on every restart, since Compact only drops entries for sealed traces.
+// Called either under e.mu, or from Start before the goroutine that contends
+// for it exists.
+func (e *agentAuditExporter) markWALSealed(traceID string) {
+	if e.wal == nil {
+		return
+	}
+	if err := e.wal.MarkSealed(traceID); err != nil {
+		e.logger.Warn("agentaudit: WAL mark sealed failed",
+			zap.String("trace_id", traceID), zap.Error(err))
 	}
 }
 
