@@ -156,34 +156,49 @@ type agentAuditExporter struct {
 	doneCh    chan struct{}
 }
 
-// defaultCheckpointInterval is applied when CheckpointInterval is unset. Also
-// used by Config.Validate to cross-check MaxPendingTips against the interval
-// that would actually be in effect.
+// defaultCheckpointInterval is applied when CheckpointInterval is unset.
 const defaultCheckpointInterval = 100
 
-// effectiveCheckpointInterval returns the configured interval with a default
-// of 100 applied when unset (zero). Centralizes the three-way repeated default.
-func (e *agentAuditExporter) effectiveCheckpointInterval() int {
-	if e.cfg.CheckpointInterval > 0 {
-		return e.cfg.CheckpointInterval
+// defaultMaxPendingTipsFactor is the default pending-tip cap expressed as a
+// multiple of the effective checkpoint interval, applied when MaxPendingTips
+// is unset. See effectiveMaxPendingTipsOf.
+const defaultMaxPendingTipsFactor = 10
+
+// effectiveCheckpointIntervalOf returns interval with defaultCheckpointInterval
+// applied when unset (<= 0). A free function, rather than a method, so
+// Config.Validate can share this exact defaulting rule with
+// agentAuditExporter.effectiveCheckpointInterval without duplicating it.
+func effectiveCheckpointIntervalOf(interval int) int {
+	if interval > 0 {
+		return interval
 	}
 	return defaultCheckpointInterval
 }
 
-// defaultMaxPendingTipsFactor is the default pending-tip cap expressed as a
-// multiple of the effective checkpoint interval, applied when MaxPendingTips
-// is unset. See effectiveMaxPendingTips.
-const defaultMaxPendingTipsFactor = 10
+// effectiveMaxPendingTipsOf returns maxPendingTips with the
+// defaultMaxPendingTipsFactor-times-interval default applied when unset
+// (<= 0). Shared between Config.Validate and
+// agentAuditExporter.effectiveMaxPendingTips for the same reason as
+// effectiveCheckpointIntervalOf.
+func effectiveMaxPendingTipsOf(maxPendingTips, checkpointInterval int) int {
+	if maxPendingTips > 0 {
+		return maxPendingTips
+	}
+	return defaultMaxPendingTipsFactor * checkpointInterval
+}
+
+// effectiveCheckpointInterval returns the configured interval with a default
+// of 100 applied when unset (zero). Centralizes the three-way repeated default.
+func (e *agentAuditExporter) effectiveCheckpointInterval() int {
+	return effectiveCheckpointIntervalOf(e.cfg.CheckpointInterval)
+}
 
 // effectiveMaxPendingTips returns the configured pending-tip cap, defaulting
 // to defaultMaxPendingTipsFactor times checkpointInterval when MaxPendingTips
 // is unset (zero). This bounds how far Accumulator.pending can grow during a
 // sustained checkpoint write failure — see the TrimPending call in sealTrace.
 func (e *agentAuditExporter) effectiveMaxPendingTips(checkpointInterval int) int {
-	if e.cfg.MaxPendingTips > 0 {
-		return e.cfg.MaxPendingTips
-	}
-	return defaultMaxPendingTipsFactor * checkpointInterval
+	return effectiveMaxPendingTipsOf(e.cfg.MaxPendingTips, checkpointInterval)
 }
 
 // fsyncLog reports whether the audit-log file should be fsynced after each
@@ -872,7 +887,16 @@ func (e *agentAuditExporter) sealTrace(traceID string, buf *traceBuffer, checkpo
 	// failed attempt).
 	if e.shouldCheckpoint(checkpointInterval) {
 		if err := e.writeCheckpoint(); err != nil {
-			e.logger.Error("agentaudit: write checkpoint", zap.Error(err))
+			// Once pinned at the pending-tip cap, nextCheckpointRetryAt's clamp
+			// means shouldCheckpoint retries on literally every seal for as long
+			// as the outage lasts (see its doc comment) — logging each of those
+			// failures would flood the log for no new information beyond what the
+			// one-time pendingCapWarned log and the Shutdown summary already give.
+			// Below the cap, attempts are already rare (the backoff is doing its
+			// job), so log every one of those.
+			if !e.pendingCapWarned {
+				e.logger.Error("agentaudit: write checkpoint", zap.Error(err))
+			}
 		}
 	}
 
@@ -1260,6 +1284,14 @@ func (e *agentAuditExporter) shouldCheckpoint(checkpointInterval int) bool {
 // checkpointRetryAt" condition and retries would stop permanently — even after
 // the underlying outage heals. Clamping guarantees pending sitting at the cap
 // always qualifies for a retry, so recovery is still detected.
+//
+// This deliberately gives up the backoff's thinning once pending is pinned at
+// the cap: from that point every seal both retries and re-trims, for as long
+// as the outage lasts. That is the trade for guaranteeing recovery is detected
+// on the very next successful write rather than at some later, possibly much
+// larger, pending count. See the pendingCapWarned check around the
+// writeCheckpoint call in sealTrace, which is what keeps that steady-state
+// retrying from also flooding the log.
 func (e *agentAuditExporter) nextCheckpointRetryAt(pending int) int {
 	next := pending + 1
 	if e.checkpointFailures > 1 {

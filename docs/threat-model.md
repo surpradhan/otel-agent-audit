@@ -89,8 +89,9 @@ chain for timed-out traces.
 A checkpoint write that fails (ENOSPC, EIO, a revoked permission) keeps its
 trace tips pending for retry rather than dropping them — that is deliberate:
 the alternative is silently losing sealed traces on an ordinary, possibly
-transient, IO error. A backoff (doubling after the first retry, capped at
-`maxCheckpointRetryGap`) bounds the wasted re-signing work as pending grows.
+transient, IO error. Below the pending-tip cap described next, a backoff
+(doubling after the first retry, capped at `maxCheckpointRetryGap`) bounds the wasted
+re-signing work and thins the retry attempts as pending grows.
 
 If the failure is **persistent** rather than transient, retained tips would
 otherwise grow the pending set for as long as the outage lasts. `max_pending_tips`
@@ -102,6 +103,16 @@ dropped this way are the same as any other checkpoint-uncovered trace: their
 entries are still durably in the audit log, `VerifyLog` does not flag them as
 an error (`internal/verify/verify.go` deliberately tolerates checkpoint-uncovered
 traces), and only the checkpoint's coverage of them is lost.
+
+Once pending is pinned at the cap, the backoff's thinning intentionally stops:
+every subsequently sealed trace both retries the checkpoint write and re-trims
+the pending set, for as long as the outage lasts. That is the trade for
+guaranteeing the very next successful write is retried immediately rather than
+at some later, possibly much larger, pending count — but it does mean the
+write+`fsync` attempt rate against the already-faulting file rises to one per
+sealed trace. The per-attempt failure log is suppressed during this steady
+state (the one-time cap-exceeded log and the `Shutdown` summary already cover
+it), so log volume does not scale with it, only the write attempts themselves do.
 
 This is distinct from the **poisoned** state (`errCheckpointPoisoned`): poisoning
 means no checkpoint can *ever* be written again for the life of the process, so

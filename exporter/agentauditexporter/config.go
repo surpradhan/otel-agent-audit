@@ -94,14 +94,10 @@ func (c *Config) Validate() error {
 	// If the effective cap is below the effective interval, TrimPending would
 	// hold pending below the threshold shouldCheckpoint needs to ever fire a
 	// checkpoint, so no checkpoint — successful or not — could ever be written.
-	effectiveInterval := c.CheckpointInterval
-	if effectiveInterval <= 0 {
-		effectiveInterval = defaultCheckpointInterval
-	}
-	effectiveMaxPending := c.MaxPendingTips
-	if effectiveMaxPending <= 0 {
-		effectiveMaxPending = defaultMaxPendingTipsFactor * effectiveInterval
-	}
+	// Delegates to the same effective*Of functions agentAuditExporter uses, so
+	// the "unset -> default" rule lives in exactly one place.
+	effectiveInterval := effectiveCheckpointIntervalOf(c.CheckpointInterval)
+	effectiveMaxPending := effectiveMaxPendingTipsOf(c.MaxPendingTips, effectiveInterval)
 	if effectiveMaxPending < effectiveInterval {
 		return fmt.Errorf("max_pending_tips (%d) must be at least checkpoint_interval (%d), or a checkpoint could never fire",
 			effectiveMaxPending, effectiveInterval)

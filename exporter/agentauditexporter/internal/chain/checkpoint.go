@@ -124,6 +124,13 @@ func (a *Accumulator) DropPending() int {
 // The newest tips — the ones most likely to still be coverable once
 // checkpointing recovers — are kept.
 //
+// Trims in place, reusing pending's existing backing array, rather than
+// allocating a new one: once pending is pinned at the cap during a sustained
+// outage, this runs on every subsequently sealed trace for as long as the
+// outage lasts (see the pendingCapWarned discussion in sealTrace), and an
+// O(max) allocation on that path would add avoidable GC pressure right when
+// the process is already dealing with a faulting filesystem.
+//
 // Do NOT call this between Stage and Commit, for the same reason documented on
 // DropPending: it does not preserve the prefix invariant StagedCheckpoint.tipCount
 // relies on. Trimming the front of pending after Stage has captured a prefix
@@ -135,9 +142,8 @@ func (a *Accumulator) TrimPending(max int) int {
 		return 0
 	}
 	dropped := len(a.pending) - max
-	rest := make([]TraceTip, max)
-	copy(rest, a.pending[dropped:])
-	a.pending = rest
+	copy(a.pending, a.pending[dropped:])
+	a.pending = a.pending[:max]
 	return dropped
 }
 
