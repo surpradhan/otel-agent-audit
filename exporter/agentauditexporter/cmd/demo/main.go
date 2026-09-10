@@ -59,14 +59,19 @@ func run() error {
 	// which is the same deterministic order the exporter uses at seal time.
 	const traceID = "aabbccddeeff00112233445566778899"
 
+	// traceStartNano is a realistic Unix-epoch nanosecond timestamp: it exceeds
+	// 2^53, so the printed log entries show why v3 encodes these two fields as
+	// decimal strings rather than JSON numbers.
+	const traceStartNano record.UnixNano = 1_764_547_200_000_000_000
+
 	recs := []record.AuditRecord{
 		{
 			SchemaVersion:     record.SchemaVersion,
 			TraceID:           traceID,
 			SpanID:            "0102030405060708",
 			ParentSpanID:      "0a0b0c0d0e0f0102",
-			StartTimeUnixNano: 1_000_000_000,
-			EndTimeUnixNano:   2_000_000_000,
+			StartTimeUnixNano: traceStartNano + 1_000_000_000,
+			EndTimeUnixNano:   traceStartNano + 2_000_000_000,
 			SpanName:          "tool.web_search",
 			OtelKind:          "Client",
 			GenAIOperation:    "execute_tool",
@@ -82,8 +87,8 @@ func run() error {
 			TraceID:           traceID,
 			SpanID:            "0203040506070809",
 			ParentSpanID:      "0a0b0c0d0e0f0102",
-			StartTimeUnixNano: 2_000_000_000,
-			EndTimeUnixNano:   3_000_000_000,
+			StartTimeUnixNano: traceStartNano + 2_000_000_000,
+			EndTimeUnixNano:   traceStartNano + 3_000_000_000,
 			SpanName:          "tool.read_file",
 			OtelKind:          "Client",
 			GenAIOperation:    "execute_tool",
@@ -99,8 +104,8 @@ func run() error {
 			TraceID:           traceID,
 			SpanID:            "0a0b0c0d0e0f0102",
 			ParentSpanID:      "",
-			StartTimeUnixNano: 500_000_000,
-			EndTimeUnixNano:   3_500_000_000,
+			StartTimeUnixNano: traceStartNano + 500_000_000,
+			EndTimeUnixNano:   traceStartNano + 3_500_000_000,
 			SpanName:          "gen_ai.chat",
 			OtelKind:          "Client",
 			GenAIOperation:    "chat",

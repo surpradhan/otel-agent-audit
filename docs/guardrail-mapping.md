@@ -1,6 +1,6 @@
-# Guardrail Attribute Mapping — v2
+# Guardrail Attribute Mapping — v3
 
-> **Status:** Active · **Introduced:** Phase W8 · **Schema version:** `v2`
+> **Status:** Active · **Introduced:** Phase W8 · **Schema version:** `v3` (allowlist unchanged since `v2`)
 
 This document describes how guardrail evaluation events should be instrumented
 as OTel spans so that `agentauditexporter` captures them correctly in
@@ -26,7 +26,7 @@ inference rules).
 
 ---
 
-## Captured attributes (v2 allowlist)
+## Captured attributes (introduced in v2; unchanged in v3)
 
 | OTel attribute | Type | Required | Description |
 |---|---|---|---|

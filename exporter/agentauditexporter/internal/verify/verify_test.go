@@ -380,17 +380,10 @@ func TestVerifyLog_PartialLastCheckpointLine(t *testing.T) {
 	}
 }
 
-// TestVerifyLog_HappyPath_V1Log is an integration test for the version-aware
-// genesis-seed path: it builds a v1 log on disk (records with SchemaVersion "v1",
-// chain built with GenesisSeedForSchema(traceID, "v1")), then calls VerifyLog and
-// asserts zero errors. This ensures the verifier correctly reads SchemaVersion from
-// entries[0].Record.SchemaVersion rather than always using record.SchemaVersion.
-//
-// Note: the checkpoint is built with chain.NewAccumulator which uses the current
-// record.SchemaVersion ("v2") for the checkpoint's schema_version field. This is an
-// intentional simplification — the verifier does not enforce that log and checkpoint
-// schema_version values agree, so the v1/v2 mismatch is harmless in this test.
-func TestVerifyLog_HappyPath_V1Log(t *testing.T) {
+// TestVerifyLog_HappyPath_V3Log is the current-format counterpart of the legacy
+// test below: a log written at record.SchemaVersion must carry decimal-string
+// timestamps on disk — the whole point of v3 — and verify cleanly.
+func TestVerifyLog_HappyPath_V3Log(t *testing.T) {
 	priv, pubKey, err := sign.GenerateEd25519Key()
 	if err != nil {
 		t.Fatalf("GenerateEd25519Key: %v", err)
@@ -399,21 +392,23 @@ func TestVerifyLog_HappyPath_V1Log(t *testing.T) {
 
 	recs := []record.AuditRecord{
 		{
-			SchemaVersion: "v1",
-			TraceID:       fixtureTraceID,
-			SpanID:        "0102030405060708",
-			ParentSpanID:  "0000000000000000",
-			SeqInTrace:    0,
-			SpanName:      "v1-root",
-			OtelKind:      "Internal",
-			AuditKind:     record.AuditKindTask,
-			Status:        "Ok",
+			SchemaVersion:     record.SchemaVersion,
+			TraceID:           fixtureTraceID,
+			SpanID:            "0102030405060708",
+			ParentSpanID:      "0000000000000000",
+			SeqInTrace:        0,
+			StartTimeUnixNano: 1764547200123456789,
+			EndTimeUnixNano:   1764547200987654321,
+			SpanName:          "v3-root",
+			OtelKind:          "Internal",
+			AuditKind:         record.AuditKindTask,
+			Status:            "Ok",
 		},
 	}
 
-	genesisSeed, err := chain.GenesisSeedForSchema(fixtureTraceID, "v1")
+	genesisSeed, err := chain.GenesisSeed(fixtureTraceID)
 	if err != nil {
-		t.Fatalf("GenesisSeedForSchema v1: %v", err)
+		t.Fatalf("GenesisSeed: %v", err)
 	}
 	entries, err := chain.BuildChain(recs, genesisSeed, signer)
 	if err != nil {
@@ -421,8 +416,8 @@ func TestVerifyLog_HappyPath_V1Log(t *testing.T) {
 	}
 
 	dir := t.TempDir()
-	logPath := filepath.Join(dir, "v1audit.jsonl")
-	checkpointPath := filepath.Join(dir, "v1checkpoint.jsonl")
+	logPath := filepath.Join(dir, "audit.jsonl")
+	checkpointPath := filepath.Join(dir, "checkpoint.jsonl")
 
 	lf, err := os.Create(logPath)
 	if err != nil {
@@ -433,6 +428,17 @@ func TestVerifyLog_HappyPath_V1Log(t *testing.T) {
 		_, _ = lf.Write(append(line, '\n'))
 	}
 	_ = lf.Close()
+
+	raw, err := os.ReadFile(logPath)
+	if err != nil {
+		t.Fatalf("read log: %v", err)
+	}
+	if !strings.Contains(string(raw), `"start_time_unix_nano":"1764547200123456789"`) {
+		t.Errorf("v3 log does not carry a decimal-string start timestamp: %s", raw)
+	}
+	if !strings.Contains(string(raw), `"end_time_unix_nano":"1764547200987654321"`) {
+		t.Errorf("v3 log does not carry a decimal-string end timestamp: %s", raw)
+	}
 
 	acc := chain.NewAccumulator(signer, 0, chain.ZeroPrevCheckpointHash)
 	acc.AddTip(fixtureTraceID, chain.TipHash(entries), len(entries))
@@ -450,9 +456,109 @@ func TestVerifyLog_HappyPath_V1Log(t *testing.T) {
 
 	report, err := verify.VerifyLog(logPath, checkpointPath, []byte(pubKey))
 	if err != nil {
-		t.Fatalf("VerifyLog v1 log: %v", err)
+		t.Fatalf("VerifyLog v3 log: %v", err)
 	}
 	if len(report.Errors) != 0 {
-		t.Errorf("expected zero errors for valid v1 log, got %d: %v", len(report.Errors), report.Errors)
+		t.Errorf("expected zero errors for a valid v3 log, got %d: %v", len(report.Errors), report.Errors)
+	}
+}
+
+// TestVerifyLog_HappyPath_LegacySchemaLog is an integration test for the
+// version-aware genesis-seed path: for each legacy schema version it builds a
+// log on disk (records pinned to that version, chain built with
+// GenesisSeedForSchema(traceID, version)), then calls VerifyLog and asserts
+// zero errors. This ensures the verifier reads SchemaVersion from
+// entries[0].Record.SchemaVersion rather than always using record.SchemaVersion.
+//
+// Since v3 the version also selects the timestamp encoding, so this doubles as
+// the end-to-end check that a current binary re-derives the numeric-timestamp
+// canonical bytes of a legacy log rather than its own decimal-string form.
+// The timestamps here exceed 2^53 deliberately: legacy logs really do contain
+// such values, and they must keep verifying byte-for-byte.
+//
+// Note: the checkpoint is built with chain.NewAccumulator, which stamps the
+// current record.SchemaVersion on the checkpoint's schema_version field. This
+// is an intentional simplification — the verifier does not enforce that log and
+// checkpoint schema_version values agree, so the mismatch is harmless here.
+func TestVerifyLog_HappyPath_LegacySchemaLog(t *testing.T) {
+	for _, schemaVersion := range []string{"v1", "v2"} {
+		t.Run(schemaVersion, func(t *testing.T) {
+			priv, pubKey, err := sign.GenerateEd25519Key()
+			if err != nil {
+				t.Fatalf("GenerateEd25519Key: %v", err)
+			}
+			signer := sign.NewEd25519Signer(priv)
+
+			recs := []record.AuditRecord{
+				{
+					SchemaVersion:     schemaVersion,
+					TraceID:           fixtureTraceID,
+					SpanID:            "0102030405060708",
+					ParentSpanID:      "0000000000000000",
+					SeqInTrace:        0,
+					StartTimeUnixNano: 1764547200123456789,
+					EndTimeUnixNano:   1764547200987654321,
+					SpanName:          schemaVersion + "-root",
+					OtelKind:          "Internal",
+					AuditKind:         record.AuditKindTask,
+					Status:            "Ok",
+				},
+			}
+
+			genesisSeed, err := chain.GenesisSeedForSchema(fixtureTraceID, schemaVersion)
+			if err != nil {
+				t.Fatalf("GenesisSeedForSchema %s: %v", schemaVersion, err)
+			}
+			entries, err := chain.BuildChain(recs, genesisSeed, signer)
+			if err != nil {
+				t.Fatalf("BuildChain: %v", err)
+			}
+
+			dir := t.TempDir()
+			logPath := filepath.Join(dir, "audit.jsonl")
+			checkpointPath := filepath.Join(dir, "checkpoint.jsonl")
+
+			lf, err := os.Create(logPath)
+			if err != nil {
+				t.Fatalf("create log: %v", err)
+			}
+			for _, e := range chain.ToLogEntries(entries) {
+				line, _ := json.Marshal(e)
+				_, _ = lf.Write(append(line, '\n'))
+			}
+			_ = lf.Close()
+
+			// The log on disk must carry the legacy numeric encoding.
+			raw, err := os.ReadFile(logPath)
+			if err != nil {
+				t.Fatalf("read log: %v", err)
+			}
+			if !strings.Contains(string(raw), `"start_time_unix_nano":1764547200123456789`) {
+				t.Errorf("%s log is not numerically encoded: %s", schemaVersion, raw)
+			}
+
+			acc := chain.NewAccumulator(signer, 0, chain.ZeroPrevCheckpointHash)
+			acc.AddTip(fixtureTraceID, chain.TipHash(entries), len(entries))
+			cp, err := acc.Build(time.Now())
+			if err != nil {
+				t.Fatalf("Build checkpoint: %v", err)
+			}
+			cf, err := os.Create(checkpointPath)
+			if err != nil {
+				t.Fatalf("create checkpoint: %v", err)
+			}
+			cpLine, _ := json.Marshal(cp)
+			_, _ = cf.Write(append(cpLine, '\n'))
+			_ = cf.Close()
+
+			report, err := verify.VerifyLog(logPath, checkpointPath, []byte(pubKey))
+			if err != nil {
+				t.Fatalf("VerifyLog %s log: %v", schemaVersion, err)
+			}
+			if len(report.Errors) != 0 {
+				t.Errorf("expected zero errors for a valid %s log, got %d: %v",
+					schemaVersion, len(report.Errors), report.Errors)
+			}
+		})
 	}
 }

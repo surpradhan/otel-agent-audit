@@ -6,6 +6,7 @@ import (
 	"encoding/base64"
 	"encoding/hex"
 	"os"
+	"strings"
 	"testing"
 
 	"github.com/surpradhan/otel-agent-audit/exporter/agentauditexporter/internal/canonical"
@@ -16,6 +17,21 @@ import (
 
 // knownTraceID is a fixed trace ID used for reproducible genesis-seed tests.
 const knownTraceID = "01010101010101010101010101010101"
+
+// v3 fixture timestamps. They exceed 2^53, which is what makes the v3
+// decimal-string encoding load-bearing rather than cosmetic.
+const (
+	v3FixtureStartNano   record.UnixNano = 1764547200123456789
+	v3FixtureEndNano     record.UnixNano = 1764547200987654321
+	v3FixtureSeq1EndNano record.UnixNano = 1764547201123456789
+)
+
+// v3 fixture entry hashes, mirrored in testdata/v3_two_span_chain_fixture.json
+// and committed to by testdata/v3_checkpoint_fixture.json.
+const (
+	v3FixtureEntryHash0 = "eaf594c4ec71327cb5574337714089e15f7bb660dd6a6dcfc7f0f040d14581ec"
+	v3FixtureEntryHash1 = "fe7cb7a264d7e80e370d6333dc797361a34d8b86f0af009cbc24380ed047d3bb"
+)
 
 // makeTestSigner generates a determinism-safe Ed25519 signer for tests.
 func makeTestSigner(t *testing.T) (sign.Signer, sign.SignedEntry) {
@@ -28,7 +44,7 @@ func makeTestSigner(t *testing.T) (sign.Signer, sign.SignedEntry) {
 	return s, sign.SignedEntry{}
 }
 
-func makeRecord(traceID, spanID, parentSpanID string, startNano uint64, seq int) record.AuditRecord {
+func makeRecord(traceID, spanID, parentSpanID string, startNano record.UnixNano, seq int) record.AuditRecord {
 	return record.AuditRecord{
 		SchemaVersion:     record.SchemaVersion,
 		TraceID:           traceID,
@@ -437,44 +453,81 @@ func TestGenesisSeedForSchema(t *testing.T) {
 	}
 }
 
-// TestTwoSpanChainFixture is the v2 cross-impl lock: BuildChain on the fixture
-// records must produce the hardcoded v2 entry hashes. Any change to canonical
-// serialisation, genesis-seed computation, or record fields that appears in the
-// hash path requires a schema_version bump.
-func TestTwoSpanChainFixture(t *testing.T) {
-	const traceID = "01010101010101010101010101010101"
-
-	genesisSeed, err := chain.GenesisSeed(traceID) // uses record.SchemaVersion ("v2")
-	if err != nil {
-		t.Fatalf("GenesisSeed: %v", err)
+// twoSpanFixtureRecords builds the two records the chain fixtures are minted
+// from, at the given schema version. v3 uses realistic nanosecond timestamps
+// (> 2^53) because the decimal-string encoding exists precisely for those; v1
+// and v2 keep the small timestamps their frozen fixtures were minted with.
+func twoSpanFixtureRecords(schemaVersion string) (record.AuditRecord, record.AuditRecord) {
+	var start0, end0, start1, end1 record.UnixNano = 1000000000, 2000000000, 2000000000, 3000000000
+	if !record.UsesNumericTimestamps(schemaVersion) {
+		start0, end0 = v3FixtureStartNano, v3FixtureEndNano
+		start1, end1 = v3FixtureEndNano, v3FixtureSeq1EndNano
 	}
-
 	rec0 := record.AuditRecord{
-		SchemaVersion:     record.SchemaVersion,
-		TraceID:           traceID,
+		SchemaVersion:     schemaVersion,
+		TraceID:           knownTraceID,
 		SpanID:            "aaaaaaaaaaaaaaaa",
 		ParentSpanID:      "bbbbbbbbbbbbbbbb",
 		SeqInTrace:        0,
-		StartTimeUnixNano: 1000000000,
-		EndTimeUnixNano:   2000000000,
+		StartTimeUnixNano: start0,
+		EndTimeUnixNano:   end0,
 		SpanName:          "child.span",
 		OtelKind:          "Client",
 		AuditKind:         record.AuditKindTask,
 		Status:            "Ok",
 	}
 	rec1 := record.AuditRecord{
-		SchemaVersion:     record.SchemaVersion,
-		TraceID:           traceID,
+		SchemaVersion:     schemaVersion,
+		TraceID:           knownTraceID,
 		SpanID:            "bbbbbbbbbbbbbbbb",
 		ParentSpanID:      "",
 		SeqInTrace:        1,
-		StartTimeUnixNano: 2000000000,
-		EndTimeUnixNano:   3000000000,
+		StartTimeUnixNano: start1,
+		EndTimeUnixNano:   end1,
 		SpanName:          "root.span",
 		OtelKind:          "Client",
 		AuditKind:         record.AuditKindTask,
 		Status:            "Ok",
 	}
+	return rec0, rec1
+}
+
+// TestTwoSpanChainFixture is the v3 cross-impl lock: BuildChain on the fixture
+// records must produce the hardcoded v3 entry hashes. Any change to canonical
+// serialisation, genesis-seed computation, or record fields that appears in the
+// hash path requires a schema_version bump.
+func TestTwoSpanChainFixture(t *testing.T) {
+	genesisSeed, err := chain.GenesisSeed(knownTraceID) // uses record.SchemaVersion ("v3")
+	if err != nil {
+		t.Fatalf("GenesisSeed: %v", err)
+	}
+
+	rec0, rec1 := twoSpanFixtureRecords(record.SchemaVersion)
+
+	signer, _ := makeTestSigner(t)
+	entries, err := chain.BuildChain([]record.AuditRecord{rec0, rec1}, genesisSeed, signer)
+	if err != nil {
+		t.Fatalf("BuildChain: %v", err)
+	}
+
+	if entries[0].EntryHash != v3FixtureEntryHash0 {
+		t.Errorf("v3 fixture entry[0].EntryHash:\n  got  %s\n  want %s", entries[0].EntryHash, v3FixtureEntryHash0)
+	}
+	if entries[1].EntryHash != v3FixtureEntryHash1 {
+		t.Errorf("v3 fixture entry[1].EntryHash:\n  got  %s\n  want %s", entries[1].EntryHash, v3FixtureEntryHash1)
+	}
+}
+
+// TestTwoSpanChainFixture_V2Regression locks the v2 entry hashes. Like the v1
+// hashes below they must never change: v2 logs exist and must stay reproducible
+// for verifiers that pass "v2" to GenesisSeedForSchema.
+func TestTwoSpanChainFixture_V2Regression(t *testing.T) {
+	genesisSeed, err := chain.GenesisSeedForSchema(knownTraceID, "v2")
+	if err != nil {
+		t.Fatalf("GenesisSeedForSchema v2: %v", err)
+	}
+
+	rec0, rec1 := twoSpanFixtureRecords("v2")
 
 	signer, _ := makeTestSigner(t)
 	entries, err := chain.BuildChain([]record.AuditRecord{rec0, rec1}, genesisSeed, signer)
@@ -486,10 +539,10 @@ func TestTwoSpanChainFixture(t *testing.T) {
 	const wantHash1 = "3e5adf011183ce2128aeca9d337ddf60ea867dbd96f47c16c77e876b36fbc63c"
 
 	if entries[0].EntryHash != wantHash0 {
-		t.Errorf("v2 fixture entry[0].EntryHash:\n  got  %s\n  want %s", entries[0].EntryHash, wantHash0)
+		t.Errorf("v2 regression entry[0].EntryHash:\n  got  %s\n  want %s", entries[0].EntryHash, wantHash0)
 	}
 	if entries[1].EntryHash != wantHash1 {
-		t.Errorf("v2 fixture entry[1].EntryHash:\n  got  %s\n  want %s", entries[1].EntryHash, wantHash1)
+		t.Errorf("v2 regression entry[1].EntryHash:\n  got  %s\n  want %s", entries[1].EntryHash, wantHash1)
 	}
 }
 
@@ -497,39 +550,12 @@ func TestTwoSpanChainFixture(t *testing.T) {
 // must never change — v1 logs already exist in production and their hashes must
 // remain reproducible for verifiers that pass "v1" to GenesisSeedForSchema.
 func TestTwoSpanChainFixture_V1Regression(t *testing.T) {
-	const traceID = "01010101010101010101010101010101"
-
-	genesisSeed, err := chain.GenesisSeedForSchema(traceID, "v1")
+	genesisSeed, err := chain.GenesisSeedForSchema(knownTraceID, "v1")
 	if err != nil {
 		t.Fatalf("GenesisSeedForSchema v1: %v", err)
 	}
 
-	rec0 := record.AuditRecord{
-		SchemaVersion:     "v1",
-		TraceID:           traceID,
-		SpanID:            "aaaaaaaaaaaaaaaa",
-		ParentSpanID:      "bbbbbbbbbbbbbbbb",
-		SeqInTrace:        0,
-		StartTimeUnixNano: 1000000000,
-		EndTimeUnixNano:   2000000000,
-		SpanName:          "child.span",
-		OtelKind:          "Client",
-		AuditKind:         record.AuditKindTask,
-		Status:            "Ok",
-	}
-	rec1 := record.AuditRecord{
-		SchemaVersion:     "v1",
-		TraceID:           traceID,
-		SpanID:            "bbbbbbbbbbbbbbbb",
-		ParentSpanID:      "",
-		SeqInTrace:        1,
-		StartTimeUnixNano: 2000000000,
-		EndTimeUnixNano:   3000000000,
-		SpanName:          "root.span",
-		OtelKind:          "Client",
-		AuditKind:         record.AuditKindTask,
-		Status:            "Ok",
-	}
+	rec0, rec1 := twoSpanFixtureRecords("v1")
 
 	signer, _ := makeTestSigner(t)
 	entries, err := chain.BuildChain([]record.AuditRecord{rec0, rec1}, genesisSeed, signer)
@@ -558,54 +584,89 @@ func TestGenesisSeedForSchema_EmptySchemaVersion(t *testing.T) {
 	}
 }
 
-// TestTwoSpanChainFixture_FromFile is the file-backed cross-impl lock: it reads
-// testdata/v2_two_span_chain_fixture.json, re-computes the entry hashes from
-// the stored records, and asserts they match the stored entry_hash values.
-// An external Python verifier should be able to reproduce the same hashes from
-// the same file.
-func TestTwoSpanChainFixture_FromFile(t *testing.T) {
-	const fixturePath = "testdata/v2_two_span_chain_fixture.json"
-	f, err := os.Open(fixturePath)
-	if err != nil {
-		t.Fatalf("open %s: %v", fixturePath, err)
-	}
-	defer func() { _ = f.Close() }()
+// TestTwoSpanChainFixtures_FromFile is the file-backed cross-impl lock: for
+// every stored chain fixture it re-computes the entry hashes from the stored
+// records and asserts they match the stored entry_hash values. An external
+// verifier — in Python, or in a language whose JSON numbers are float64 — should
+// be able to reproduce the same hashes from the same files.
+//
+// Running it across v1, v2 and v3 is the point: one code path must reproduce
+// the numeric-timestamp encoding of the legacy files and the decimal-string
+// encoding of the v3 file, chosen from each entry's own schema_version.
+func TestTwoSpanChainFixtures_FromFile(t *testing.T) {
+	for _, fixturePath := range []string{
+		"testdata/v1_two_span_chain_fixture.json",
+		"testdata/v2_two_span_chain_fixture.json",
+		"testdata/v3_two_span_chain_fixture.json",
+	} {
+		t.Run(fixturePath, func(t *testing.T) {
+			f, err := os.Open(fixturePath)
+			if err != nil {
+				t.Fatalf("open %s: %v", fixturePath, err)
+			}
+			defer func() { _ = f.Close() }()
 
-	var logEntries []chain.LogEntry
-	sc := bufio.NewScanner(f)
-	for sc.Scan() {
-		le, err := chain.UnmarshalLogEntry(sc.Bytes())
-		if err != nil {
-			t.Fatalf("UnmarshalLogEntry: %v", err)
-		}
-		logEntries = append(logEntries, le)
-	}
-	if err := sc.Err(); err != nil {
-		t.Fatalf("scanner: %v", err)
-	}
-	if len(logEntries) != 2 {
-		t.Fatalf("expected 2 entries in fixture, got %d", len(logEntries))
-	}
+			var logEntries []chain.LogEntry
+			sc := bufio.NewScanner(f)
+			for sc.Scan() {
+				le, err := chain.UnmarshalLogEntry(sc.Bytes())
+				if err != nil {
+					t.Fatalf("UnmarshalLogEntry: %v", err)
+				}
+				logEntries = append(logEntries, le)
+			}
+			if err := sc.Err(); err != nil {
+				t.Fatalf("scanner: %v", err)
+			}
+			if len(logEntries) != 2 {
+				t.Fatalf("expected 2 entries in fixture, got %d", len(logEntries))
+			}
 
-	traceID := logEntries[0].Record.TraceID
-	schemaVersion := logEntries[0].Record.SchemaVersion
-	genesisSeed, err := chain.GenesisSeedForSchema(traceID, schemaVersion)
-	if err != nil {
-		t.Fatalf("GenesisSeedForSchema: %v", err)
-	}
+			traceID := logEntries[0].Record.TraceID
+			schemaVersion := logEntries[0].Record.SchemaVersion
+			genesisSeed, err := chain.GenesisSeedForSchema(traceID, schemaVersion)
+			if err != nil {
+				t.Fatalf("GenesisSeedForSchema: %v", err)
+			}
 
-	signer, _ := makeTestSigner(t)
-	recs := []record.AuditRecord{logEntries[0].Record, logEntries[1].Record}
-	computed, err := chain.BuildChain(recs, genesisSeed, signer)
-	if err != nil {
-		t.Fatalf("BuildChain: %v", err)
-	}
+			signer, _ := makeTestSigner(t)
+			recs := []record.AuditRecord{logEntries[0].Record, logEntries[1].Record}
+			computed, err := chain.BuildChain(recs, genesisSeed, signer)
+			if err != nil {
+				t.Fatalf("BuildChain: %v", err)
+			}
 
-	for i, le := range logEntries {
-		if computed[i].EntryHash != le.Signed.EntryHash {
-			t.Errorf("entry[%d] entry_hash mismatch:\n  computed %s\n  fixture  %s",
-				i, computed[i].EntryHash, le.Signed.EntryHash)
-		}
+			for i, le := range logEntries {
+				if computed[i].EntryHash != le.Signed.EntryHash {
+					t.Errorf("entry[%d] entry_hash mismatch:\n  computed %s\n  fixture  %s",
+						i, computed[i].EntryHash, le.Signed.EntryHash)
+				}
+			}
+		})
 	}
 }
 
+// TestV3ChainFixture_TimestampsAreStrings guards the actual wire shape of the
+// v3 chain fixture: the two timestamp fields must be JSON strings on disk, not
+// numbers. A regression that re-minted this file with numeric timestamps would
+// still hash consistently within Go and slip past the hash assertions above,
+// while remaining unreproducible for a float64-based verifier.
+func TestV3ChainFixture_TimestampsAreStrings(t *testing.T) {
+	raw, err := os.ReadFile("testdata/v3_two_span_chain_fixture.json")
+	if err != nil {
+		t.Fatalf("read fixture: %v", err)
+	}
+	for _, want := range []string{
+		`"start_time_unix_nano":"1764547200123456789"`,
+		`"end_time_unix_nano":"1764547200987654321"`,
+		`"start_time_unix_nano":"1764547200987654321"`,
+		`"end_time_unix_nano":"1764547201123456789"`,
+	} {
+		if !strings.Contains(string(raw), want) {
+			t.Errorf("v3 chain fixture does not contain %s", want)
+		}
+	}
+	if strings.Contains(string(raw), `_unix_nano":1`) {
+		t.Error("v3 chain fixture contains a numerically encoded timestamp")
+	}
+}

@@ -10,7 +10,7 @@ import (
 	"github.com/surpradhan/otel-agent-audit/exporter/agentauditexporter/internal/wal"
 )
 
-func makeRecord(traceID, spanID string, startNano uint64) record.AuditRecord {
+func makeRecord(traceID, spanID string, startNano record.UnixNano) record.AuditRecord {
 	return record.AuditRecord{
 		SchemaVersion:     record.SchemaVersion,
 		TraceID:           traceID,
@@ -134,7 +134,7 @@ func TestWAL_CompactSafe_Concurrent(t *testing.T) {
 
 	// Seed some initial data.
 	for i := 0; i < 5; i++ {
-		rec := makeRecord("trace001", "span001", uint64(i*1000))
+		rec := makeRecord("trace001", "span001", record.UnixNano(i*1000))
 		_ = w.AppendSpan("trace001", rec)
 	}
 
@@ -148,7 +148,7 @@ func TestWAL_CompactSafe_Concurrent(t *testing.T) {
 			if i%3 == 0 {
 				_ = w.Compact()
 			} else {
-				rec := makeRecord("trace002", "span002", uint64(i*1000))
+				rec := makeRecord("trace002", "span002", record.UnixNano(i*1000))
 				_ = w.AppendSpan("trace002", rec)
 			}
 		}()
@@ -268,5 +268,46 @@ func TestWAL_ReplayTolerantPartialLine(t *testing.T) {
 	}
 	if _, ok := buffers["trace002"]; ok {
 		t.Error("trace002 partial line should have been skipped")
+	}
+}
+
+// TestWAL_ReplayAcceptsLegacyNumericTimestamps covers the upgrade path: a WAL
+// left behind by a v2-era binary encodes start/end timestamps as JSON numbers.
+// A v3 binary must replay those entries unchanged — same values, still pinned to
+// their own schema_version — so an in-flight trace survives the upgrade and
+// seals into a chain the verifier can still reproduce.
+func TestWAL_ReplayAcceptsLegacyNumericTimestamps(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "legacy.wal")
+	const legacyLine = `{"type":"span","trace_id":"trace001","record":` +
+		`{"schema_version":"v2","trace_id":"trace001","span_id":"span001","parent_span_id":"",` +
+		`"seq_in_trace":0,"start_time_unix_nano":1764547200123456789,` +
+		`"end_time_unix_nano":1764547200987654321,"span_name":"test.span","otel_kind":"Client",` +
+		`"gen_ai_operation":"","audit_kind":"task","selected_attributes":null,"status":"Ok"}}` + "\n"
+	if err := os.WriteFile(path, []byte(legacyLine), 0o644); err != nil {
+		t.Fatalf("write legacy wal: %v", err)
+	}
+
+	w, err := wal.Open(path)
+	if err != nil {
+		t.Fatalf("wal.Open: %v", err)
+	}
+	defer func() { _ = w.Close() }()
+
+	buffers, err := w.Replay()
+	if err != nil {
+		t.Fatalf("Replay: %v", err)
+	}
+	recs, ok := buffers["trace001"]
+	if !ok || len(recs) != 1 {
+		t.Fatalf("expected 1 replayed record for trace001, got %v", buffers)
+	}
+	if recs[0].SchemaVersion != "v2" {
+		t.Errorf("SchemaVersion: got %q, want %q — a replayed record keeps its own version", recs[0].SchemaVersion, "v2")
+	}
+	if got := uint64(recs[0].StartTimeUnixNano); got != 1764547200123456789 {
+		t.Errorf("StartTimeUnixNano: got %d, want 1764547200123456789", got)
+	}
+	if got := uint64(recs[0].EndTimeUnixNano); got != 1764547200987654321 {
+		t.Errorf("EndTimeUnixNano: got %d, want 1764547200987654321", got)
 	}
 }

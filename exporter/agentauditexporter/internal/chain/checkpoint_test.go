@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/surpradhan/otel-agent-audit/exporter/agentauditexporter/internal/chain"
+	"github.com/surpradhan/otel-agent-audit/exporter/agentauditexporter/internal/record"
 	"github.com/surpradhan/otel-agent-audit/exporter/agentauditexporter/internal/sign"
 )
 
@@ -53,8 +54,8 @@ func TestAccumulator_BuildEmpty(t *testing.T) {
 	if cp.PrevCheckpointHash != chain.ZeroPrevCheckpointHash {
 		t.Errorf("PrevCheckpointHash: got %q, want ZeroPrevCheckpointHash", cp.PrevCheckpointHash)
 	}
-	if cp.SchemaVersion != "v2" {
-		t.Errorf("SchemaVersion: got %q, want %q", cp.SchemaVersion, "v2")
+	if cp.SchemaVersion != record.SchemaVersion {
+		t.Errorf("SchemaVersion: got %q, want %q", cp.SchemaVersion, record.SchemaVersion)
 	}
 	if cp.Algorithm != "ed25519" {
 		t.Errorf("Algorithm: got %q, want %q", cp.Algorithm, "ed25519")
@@ -251,10 +252,9 @@ func TestCheckpointSigningPayloadFixture_V1Regression(t *testing.T) {
 	}
 }
 
-// TestCheckpointSigningPayloadFixture_V2 is the v2 cross-impl lock: the compact
-// JSON of checkpointForSigning for the v2 fixture inputs must match
-// testdata/v2_checkpoint_fixture.json byte-for-byte.
-func TestCheckpointSigningPayloadFixture_V2(t *testing.T) {
+// TestCheckpointSigningPayloadFixture_V2Regression is the frozen v2 cross-impl
+// lock for the checkpoint signing payload, alongside the v1 one above.
+func TestCheckpointSigningPayloadFixture_V2Regression(t *testing.T) {
 	cfs := checkpointForSigning{
 		SchemaVersion:      "v2",
 		CheckpointSeq:      1,
@@ -283,7 +283,46 @@ func TestCheckpointSigningPayloadFixture_V2(t *testing.T) {
 	gotStr := strings.TrimRight(string(got), "\n\r ")
 	wantStr := strings.TrimRight(string(want), "\n\r ")
 	if gotStr != wantStr {
-		t.Errorf("v2 checkpoint payload diverges from golden fixture.\ngot:  %s\nwant: %s", got, want)
+		t.Errorf("v2 checkpoint payload diverges from frozen fixture.\ngot:  %s\nwant: %s", got, want)
+	}
+}
+
+// TestCheckpointSigningPayloadFixture_V3 is the v3 cross-impl lock: the compact
+// JSON of checkpointForSigning for the v3 fixture inputs must match
+// testdata/v3_checkpoint_fixture.json byte-for-byte. The checkpoint payload
+// carries no nanosecond timestamps of its own — its timestamp is RFC3339 and
+// its counters are small — so v3 changes only the schema_version string and the
+// tip hash it commits to.
+func TestCheckpointSigningPayloadFixture_V3(t *testing.T) {
+	cfs := checkpointForSigning{
+		SchemaVersion:      "v3",
+		CheckpointSeq:      1,
+		Timestamp:          "2026-06-22T00:00:00Z",
+		PrevCheckpointHash: chain.ZeroPrevCheckpointHash,
+		TraceTips: []chain.TraceTip{{
+			TraceID:    "01010101010101010101010101010101",
+			TipHash:    "fe7cb7a264d7e80e370d6333dc797361a34d8b86f0af009cbc24380ed047d3bb",
+			EntryCount: 2,
+		}},
+		KeyID:     "PLACEHOLDER",
+		Algorithm: "ed25519",
+	}
+
+	got, err := json.Marshal(cfs)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+
+	const fixturePath = "testdata/v3_checkpoint_fixture.json"
+	want, err := os.ReadFile(fixturePath)
+	if err != nil {
+		t.Fatalf("reading fixture %s: %v", fixturePath, err)
+	}
+
+	gotStr := strings.TrimRight(string(got), "\n\r ")
+	wantStr := strings.TrimRight(string(want), "\n\r ")
+	if gotStr != wantStr {
+		t.Errorf("v3 checkpoint payload diverges from golden fixture.\ngot:  %s\nwant: %s", got, want)
 	}
 }
 
