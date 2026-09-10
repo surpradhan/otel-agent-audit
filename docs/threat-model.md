@@ -127,6 +127,33 @@ the `tips_dropped_for_pending_cap` count at `Shutdown` — both indicate degrade
 coverage, not a crash. Size `max_pending_tips` for the outage duration an
 operator is willing to tolerate before accepting additional loss.
 
+### 3d. Sealed trace tip survives a crash before its checkpoint
+
+Sealing a trace and covering it with a checkpoint are two separate steps —
+the audit log write happens immediately, the checkpoint that attests to it
+happens at the next `checkpoint_interval` boundary (§3a). A crash in between
+those two steps does not lose the trace's checkpoint coverage: the WAL
+retains a lightweight marker (the trace's tip hash and entry count, not its
+full span records) for as long as the accumulator reports the tip as
+pending. On restart, the marker is restored directly to the accumulator —
+never by re-sealing the trace, which would duplicate its already-durable log
+entries — so the next checkpoint covers it exactly as if the process had
+never stopped.
+
+This closes the gap whether the tip was pending because the checkpoint
+interval simply hadn't been reached yet, or because the checkpoint write was
+actively failing (§3c) — both leave the tip in the same recoverable state.
+
+**What this does not change:** the two cases that were already a *deliberate*
+trade rather than an accident. A poisoned checkpoint file
+(`errCheckpointPoisoned`) still permanently drops every subsequent tip, since
+no future checkpoint can ever be written to cover it. A pending-tip cap
+(§3c) still drops the *oldest* tips once exceeded, since retaining them
+indefinitely during a sustained outage is the unbounded-memory risk the cap
+exists to prevent. In both cases the trace's entries remain durably in the
+audit log and `VerifyLog` does not flag the gap as an error, matching §3a
+and §3c.
+
 ---
 
 ## 4. Single-replica constraint

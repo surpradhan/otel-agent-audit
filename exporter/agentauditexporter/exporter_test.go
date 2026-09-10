@@ -1954,6 +1954,129 @@ func TestCheckpointWriteFailure_RetriesTipsAndKeepsChainContiguous(t *testing.T)
 	}
 }
 
+// TestRestart_AfterCheckpointFailureRecoversTipWithoutDuplicating is the
+// acceptance test for the gap where sealTrace ran WAL.MarkSealed and scheduled
+// WAL.Compact regardless of whether that same call's checkpoint attempt
+// actually covered the tip. A crash before the next successful checkpoint
+// then lost the trace's coverage forever: its entries stayed durably in the
+// audit log, but the WAL no longer remembered the trace existed, so no future
+// checkpoint could ever claim it either. The naive fix — skip MarkSealed when
+// the checkpoint fails — was rejected because it replays the trace and
+// duplicates its already-durable log entries; this test pins both halves of
+// the contract at once.
+//
+// It fails the checkpoint write, seals a trace under that failure, crashes
+// without a clean shutdown, restarts, and asserts: the trace's tip is
+// restored to the accumulator, a subsequent checkpoint after restart covers
+// it, no log entries were duplicated, and VerifyLog is clean.
+func TestRestart_AfterCheckpointFailureRecoversTipWithoutDuplicating(t *testing.T) {
+	env := newTestEnv(t)
+	cfg := env.cfg
+	cfg.CheckpointInterval = 1 // attempt a checkpoint on every sealed trace
+
+	exp1 := startExporter(t, cfg)
+
+	// Make the checkpoint write fail, the same way
+	// TestCheckpointWriteFailure_RetriesTipsAndKeepsChainContiguous does.
+	exp1.mu.Lock()
+	closeErr := exp1.checkFile.Close()
+	exp1.mu.Unlock()
+	if closeErr != nil {
+		t.Fatalf("closing checkpoint file: %v", closeErr)
+	}
+
+	traceA := [16]byte{0xA1}
+	if err := exp1.ConsumeTraces(context.Background(),
+		makeSpan(traceA, [8]byte{0x01}, zeroParentID, "op-a", 1_000_000, 2_000_000)); err != nil {
+		t.Fatalf("ConsumeTraces A: %v", err)
+	}
+
+	// Sanity check the premise: the checkpoint write failed, so the tip is
+	// only pending in memory and nothing durable covers it yet.
+	if got := exp1.accumulator.PendingCount(); got != 1 {
+		t.Fatalf("pending tips before crash: got %d, want 1", got)
+	}
+	if got := len(readCheckpoints(t, cfg.CheckpointPath)); got != 0 {
+		t.Fatalf("persisted checkpoints before crash: got %d, want 0", got)
+	}
+
+	// Crash simulation: stop the background goroutine and close every file
+	// directly, WITHOUT going through Shutdown's force-seal-and-checkpoint path.
+	close(exp1.stopCh)
+	<-exp1.doneCh
+	if exp1.logFile != nil {
+		_ = exp1.logFile.Close()
+	}
+	if exp1.checkFile != nil {
+		_ = exp1.checkFile.Close()
+	}
+	if exp1.wal != nil {
+		_ = exp1.wal.Close()
+	}
+
+	// Restart against the same paths.
+	exp2 := startExporter(t, cfg)
+
+	// The crashed trace's tip must have survived the restart: before the fix,
+	// sealedPending had no way to reach the new accumulator and this was 0.
+	if got := exp2.accumulator.PendingCount(); got != 1 {
+		t.Fatalf("pending tips after restart: got %d, want 1 (trace A's tip must survive the crash)", got)
+	}
+
+	// Seal a second trace against a healthy checkpoint file; with
+	// CheckpointInterval=1 this checkpoint should succeed and cover both
+	// the rehydrated tip and the new trace.
+	traceB := [16]byte{0xB2}
+	if err := exp2.ConsumeTraces(context.Background(),
+		makeSpan(traceB, [8]byte{0x02}, zeroParentID, "op-b", 3_000_000, 4_000_000)); err != nil {
+		t.Fatalf("ConsumeTraces B: %v", err)
+	}
+	if err := exp2.Shutdown(context.Background()); err != nil {
+		t.Fatalf("Shutdown: %v", err)
+	}
+
+	cps := readCheckpoints(t, cfg.CheckpointPath)
+	if len(cps) != 1 {
+		t.Fatalf("expected exactly 1 persisted checkpoint, got %d", len(cps))
+	}
+	covered := make(map[string]bool, len(cps[0].TraceTips))
+	for _, tip := range cps[0].TraceTips {
+		covered[tip.TraceID] = true
+	}
+	traceAHex := hex.EncodeToString(traceA[:])
+	traceBHex := hex.EncodeToString(traceB[:])
+	for _, want := range []string{traceAHex, traceBHex} {
+		if !covered[want] {
+			t.Errorf("trace %s not covered by the post-restart checkpoint (tip lost)", want)
+		}
+	}
+
+	// No duplicate log entries: trace A's entries were written before the
+	// crash and must not be re-sealed on replay.
+	entries := readLogEntries(t, cfg.LogPath)
+	if len(entries) != 2 {
+		t.Fatalf("expected exactly 2 log entries (1 per trace, no duplicates), got %d", len(entries))
+	}
+	byTrace := map[string]int{}
+	for _, e := range entries {
+		byTrace[e.Record.TraceID]++
+	}
+	if byTrace[traceAHex] != 1 {
+		t.Errorf("trace A log entry count: got %d, want 1 (no duplicate reseal)", byTrace[traceAHex])
+	}
+	if byTrace[traceBHex] != 1 {
+		t.Errorf("trace B log entry count: got %d, want 1", byTrace[traceBHex])
+	}
+
+	report, err := verify.VerifyLog(cfg.LogPath, cfg.CheckpointPath, env.pubKey)
+	if err != nil {
+		t.Fatalf("VerifyLog: %v", err)
+	}
+	if len(report.Errors) != 0 {
+		t.Errorf("expected no verifier errors; got %v", report.Errors)
+	}
+}
+
 // TestCheckpointSyncFailure_RollsBackAndRetriesTips covers the other half of the
 // durable-commit contract: the checkpoint line is written but Sync fails. The
 // file must be truncated back to its pre-write size (an unsynced line must not

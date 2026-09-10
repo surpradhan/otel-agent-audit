@@ -95,6 +95,21 @@ func (a *Accumulator) PendingCount() int {
 	return len(a.pending)
 }
 
+// PendingTraceIDs returns the trace IDs currently awaiting a checkpoint. A
+// trace leaves this set only by a Commit that covers it or by a deliberate
+// abandonment (TrimPending, DropPending) — both settle its fate for good, so
+// the WAL uses this set to decide which sealed-trace markers must still be
+// retained across a Compact to survive a crash before the next checkpoint.
+func (a *Accumulator) PendingTraceIDs() map[string]struct{} {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	ids := make(map[string]struct{}, len(a.pending))
+	for _, tip := range a.pending {
+		ids[tip.TraceID] = struct{}{}
+	}
+	return ids
+}
+
 // DropPending discards every pending tip and returns how many were dropped.
 // seq and prevHash are left untouched, so the persisted chain is unaffected and
 // remains verifiable; only the coverage of those traces is given up.

@@ -48,7 +48,7 @@ func TestWAL_AppendAndReplay(t *testing.T) {
 		t.Fatalf("AppendSpan 1: %v", err)
 	}
 
-	buffers, err := w.Replay()
+	buffers, _, err := w.Replay()
 	if err != nil {
 		t.Fatalf("Replay: %v", err)
 	}
@@ -74,11 +74,11 @@ func TestWAL_ReplaySkipsSealed(t *testing.T) {
 	if err := w.AppendSpan("trace001", rec1); err != nil {
 		t.Fatalf("AppendSpan 1: %v", err)
 	}
-	if err := w.MarkSealed("trace001"); err != nil {
+	if err := w.MarkSealed("trace001", "", 0); err != nil {
 		t.Fatalf("MarkSealed: %v", err)
 	}
 
-	buffers, err := w.Replay()
+	buffers, _, err := w.Replay()
 	if err != nil {
 		t.Fatalf("Replay: %v", err)
 	}
@@ -106,15 +106,15 @@ func TestWAL_CompactDropsSealed(t *testing.T) {
 		t.Fatalf("AppendSpan trace002 span2: %v", err)
 	}
 	// Seal trace001; trace002 remains open.
-	if err := w.MarkSealed("trace001"); err != nil {
+	if err := w.MarkSealed("trace001", "", 0); err != nil {
 		t.Fatalf("MarkSealed trace001: %v", err)
 	}
 
-	if err := w.Compact(); err != nil {
+	if err := w.Compact(nil); err != nil {
 		t.Fatalf("Compact: %v", err)
 	}
 
-	buffers, err := w.Replay()
+	buffers, _, err := w.Replay()
 	if err != nil {
 		t.Fatalf("Replay after compact: %v", err)
 	}
@@ -125,6 +125,138 @@ func TestWAL_CompactDropsSealed(t *testing.T) {
 	recs2, ok2 := buffers["trace002"]
 	if !ok2 || len(recs2) != 2 {
 		t.Errorf("trace002: expected 2 records, got %d (ok=%v)", len(buffers["trace002"]), ok2)
+	}
+}
+
+// TestWAL_Replay_ReturnsSealedPendingTip verifies that a sealed entry carrying
+// a tip hash and entry count surfaces via Replay's sealedPending result, with
+// the trace still excluded from the in-progress buffers.
+func TestWAL_Replay_ReturnsSealedPendingTip(t *testing.T) {
+	w, _ := openWAL(t)
+
+	rec := makeRecord("trace001", "span001", 1000)
+	if err := w.AppendSpan("trace001", rec); err != nil {
+		t.Fatalf("AppendSpan: %v", err)
+	}
+	if err := w.MarkSealed("trace001", "deadbeef", 1); err != nil {
+		t.Fatalf("MarkSealed: %v", err)
+	}
+
+	buffers, sealedPending, err := w.Replay()
+	if err != nil {
+		t.Fatalf("Replay: %v", err)
+	}
+	if _, ok := buffers["trace001"]; ok {
+		t.Error("trace001 must not appear as an in-progress buffer once sealed")
+	}
+	if len(sealedPending) != 1 {
+		t.Fatalf("sealedPending: got %d entries, want 1", len(sealedPending))
+	}
+	got := sealedPending[0]
+	want := wal.SealedTip{TraceID: "trace001", TipHash: "deadbeef", EntryCount: 1}
+	if got != want {
+		t.Errorf("sealedPending[0] = %+v, want %+v", got, want)
+	}
+}
+
+// TestWAL_Replay_OmitsSealedTipWithoutTipHash verifies that a sealed marker
+// with no tip payload (a quarantined or unsealable trace — see
+// agentAuditExporter.markWALSealed) is not surfaced as a pending tip: there is
+// nothing to restore for a trace that was never added to the accumulator.
+func TestWAL_Replay_OmitsSealedTipWithoutTipHash(t *testing.T) {
+	w, _ := openWAL(t)
+
+	if err := w.MarkSealed("trace001", "", 0); err != nil {
+		t.Fatalf("MarkSealed: %v", err)
+	}
+
+	_, sealedPending, err := w.Replay()
+	if err != nil {
+		t.Fatalf("Replay: %v", err)
+	}
+	if len(sealedPending) != 0 {
+		t.Errorf("sealedPending: got %d entries, want 0 for a tip-less seal", len(sealedPending))
+	}
+}
+
+// TestWAL_Compact_RetainsSealedMarkerForPendingTip verifies that Compact keeps
+// a sealed trace's marker (and its tip payload) when the caller says that
+// trace is still pending a checkpoint — the crash-durability guarantee the
+// naive "just skip MarkSealed on checkpoint failure" fix cannot provide
+// without either losing the tip on a crash or re-sealing and duplicating the
+// trace's already-durable log entries.
+func TestWAL_Compact_RetainsSealedMarkerForPendingTip(t *testing.T) {
+	w, path := openWAL(t)
+
+	rec := makeRecord("trace001", "span001", 1000)
+	if err := w.AppendSpan("trace001", rec); err != nil {
+		t.Fatalf("AppendSpan: %v", err)
+	}
+	if err := w.MarkSealed("trace001", "deadbeef", 1); err != nil {
+		t.Fatalf("MarkSealed: %v", err)
+	}
+
+	pending := map[string]struct{}{"trace001": {}}
+	if err := w.Compact(pending); err != nil {
+		t.Fatalf("Compact: %v", err)
+	}
+
+	// The span itself must still be gone — only the lightweight marker survives.
+	buffers, sealedPending, err := w.Replay()
+	if err != nil {
+		t.Fatalf("Replay after compact: %v", err)
+	}
+	if _, ok := buffers["trace001"]; ok {
+		t.Error("trace001's span entries should not be resurrected by a retained sealed marker")
+	}
+	if len(sealedPending) != 1 || sealedPending[0].TraceID != "trace001" || sealedPending[0].TipHash != "deadbeef" {
+		t.Errorf("sealedPending after compact = %+v, want [{trace001 deadbeef 1}]", sealedPending)
+	}
+
+	// Simulate a second restart with the SAME on-disk WAL (no further writes):
+	// re-opening it must still find the retained marker, proving it survived
+	// Compact's rewrite rather than merely surviving in the live fd's buffer.
+	w2, err := wal.Open(path)
+	if err != nil {
+		t.Fatalf("re-opening WAL: %v", err)
+	}
+	defer func() { _ = w2.Close() }()
+	_, sealedPending2, err := w2.Replay()
+	if err != nil {
+		t.Fatalf("Replay on reopened WAL: %v", err)
+	}
+	if len(sealedPending2) != 1 || sealedPending2[0].TipHash != "deadbeef" {
+		t.Errorf("sealedPending after reopen = %+v, want the retained tip to survive on disk", sealedPending2)
+	}
+}
+
+// TestWAL_Compact_DropsSealedMarkerOnceNotPending verifies that once the
+// caller reports a trace is no longer pending (checkpointed, or deliberately
+// abandoned), Compact stops carrying its marker forward — otherwise the WAL
+// would retain a sealed-pending entry forever.
+func TestWAL_Compact_DropsSealedMarkerOnceNotPending(t *testing.T) {
+	w, _ := openWAL(t)
+
+	rec := makeRecord("trace001", "span001", 1000)
+	if err := w.AppendSpan("trace001", rec); err != nil {
+		t.Fatalf("AppendSpan: %v", err)
+	}
+	if err := w.MarkSealed("trace001", "deadbeef", 1); err != nil {
+		t.Fatalf("MarkSealed: %v", err)
+	}
+
+	// Empty pending set: trace001's tip has already been committed by a
+	// checkpoint (or deliberately dropped) by the time Compact runs.
+	if err := w.Compact(map[string]struct{}{}); err != nil {
+		t.Fatalf("Compact: %v", err)
+	}
+
+	_, sealedPending, err := w.Replay()
+	if err != nil {
+		t.Fatalf("Replay after compact: %v", err)
+	}
+	if len(sealedPending) != 0 {
+		t.Errorf("sealedPending after compact = %+v, want none once the tip is no longer pending", sealedPending)
 	}
 }
 
@@ -147,7 +279,7 @@ func TestWAL_CompactSafe_Concurrent(t *testing.T) {
 		go func() {
 			defer wg.Done()
 			if i%3 == 0 {
-				_ = w.Compact()
+				_ = w.Compact(nil)
 			} else {
 				rec := makeRecord("trace002", "span002", record.UnixNano(i*1000))
 				_ = w.AppendSpan("trace002", rec)
@@ -199,7 +331,7 @@ func TestWAL_Replay_UnlinkedFile(t *testing.T) {
 		t.Fatalf("os.Remove: %v", err)
 	}
 
-	buffers, err := w.Replay()
+	buffers, _, err := w.Replay()
 	if err != nil {
 		t.Fatalf("Replay on unlinked file: %v", err)
 	}
@@ -223,7 +355,7 @@ func TestWAL_Compact_UnlinkedFile(t *testing.T) {
 		t.Fatalf("os.Remove: %v", err)
 	}
 
-	if err := w.Compact(); err != nil {
+	if err := w.Compact(nil); err != nil {
 		t.Fatalf("Compact on unlinked file: %v", err)
 	}
 }
@@ -259,7 +391,7 @@ func TestWAL_ReplayTolerantPartialLine(t *testing.T) {
 	}
 	defer func() { _ = w2.Close() }()
 
-	buffers, err := w2.Replay()
+	buffers, _, err := w2.Replay()
 	if err != nil {
 		t.Fatalf("Replay with partial line: %v", err)
 	}
@@ -298,7 +430,7 @@ func TestWAL_ReplayAcceptsLegacyNumericTimestamps(t *testing.T) {
 	}
 	defer func() { _ = w.Close() }()
 
-	buffers, err := w.Replay()
+	buffers, _, err := w.Replay()
 	if err != nil {
 		t.Fatalf("Replay: %v", err)
 	}
@@ -340,10 +472,10 @@ func TestWAL_CompactPreservesStoredSchemaVersion(t *testing.T) {
 	}
 	defer func() { _ = w.Close() }()
 
-	if _, err := w.Replay(); err != nil {
+	if _, _, err := w.Replay(); err != nil {
 		t.Fatalf("Replay: %v", err)
 	}
-	if err := w.Compact(); err != nil {
+	if err := w.Compact(nil); err != nil {
 		t.Fatalf("Compact: %v", err)
 	}
 
