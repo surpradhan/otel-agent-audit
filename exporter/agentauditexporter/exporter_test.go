@@ -12,6 +12,7 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -2581,4 +2582,357 @@ func TestNextCheckpointRetryAt(t *testing.T) {
 			t.Errorf("retry gap at pending=%d: got %d, want <= %d", pending, gap, maxCheckpointRetryGap)
 		}
 	}
+}
+
+// TestRestart_TornCheckpointLine_Fusion reproduces issue #24: a torn checkpoint
+// line (a partial write with no trailing newline) left behind by a crash must not
+// fuse onto the next checkpoint appended after a restart.
+//
+// This differs from TestRestart_CheckpointContinuity_PartialLine, whose truncated
+// line ends in '\n' and so never fuses. Here the line ends mid-token, which is what
+// an interrupted write actually leaves, and the assertion is end-to-end: after two
+// further checkpoints the whole file must still verify.
+func TestRestart_TornCheckpointLine_Fusion(t *testing.T) {
+	env := newTestEnv(t)
+	env.cfg.CheckpointInterval = 1
+
+	// Phase 1: one clean checkpoint.
+	exp1 := startExporter(t, env.cfg)
+	_ = exp1.ConsumeTraces(context.Background(), makeSpan([16]byte{0xE5}, [8]byte{0x01}, zeroParentID, "t1", 1000, 2000))
+	if err := exp1.Shutdown(context.Background()); err != nil {
+		t.Fatalf("Shutdown phase 1: %v", err)
+	}
+
+	// Simulate a crash mid-write: a partial JSON line with NO trailing newline.
+	f, err := os.OpenFile(env.cfg.CheckpointPath, os.O_APPEND|os.O_WRONLY, 0600)
+	if err != nil {
+		t.Fatalf("open checkpoint for torn append: %v", err)
+	}
+	if _, err := f.Write([]byte(`{"schema_version":"v1","checkpoint_seq":2,"timestamp":"`)); err != nil {
+		t.Fatalf("write torn line: %v", err)
+	}
+	_ = f.Close()
+
+	// Phase 2: restart and write two further checkpoints, so the fused line is
+	// no longer the final line of the file.
+	exp2 := startExporter(t, env.cfg)
+	_ = exp2.ConsumeTraces(context.Background(), makeSpan([16]byte{0xE6}, [8]byte{0x02}, zeroParentID, "t2", 3000, 4000))
+	_ = exp2.ConsumeTraces(context.Background(), makeSpan([16]byte{0xE7}, [8]byte{0x03}, zeroParentID, "t3", 5000, 6000))
+	if err := exp2.Shutdown(context.Background()); err != nil {
+		t.Fatalf("Shutdown phase 2: %v", err)
+	}
+
+	report, err := verify.VerifyLog(env.cfg.LogPath, env.cfg.CheckpointPath, env.pubKey)
+	if err != nil {
+		t.Fatalf("VerifyLog hard error: %v", err)
+	}
+	if len(report.Errors) != 0 {
+		t.Errorf("VerifyLog reported %d error(s): %v", len(report.Errors), report.Errors)
+	}
+}
+
+// TestRepairTrailingPartialLine covers repairTrailingPartialLine directly: it must
+// drop only an unterminated tail, and must never touch a complete line — including
+// a complete line that fails to parse, which is evidence the verifier has to see.
+func TestRepairTrailingPartialLine(t *testing.T) {
+	tests := []struct {
+		name           string
+		content        string
+		wantContent    string
+		wantDropped    int64
+		wantTerminated int64
+	}{
+		{
+			name:           "durable record missing only its newline is terminated",
+			content:        "{\"a\":1}\n{\"b\":2}",
+			wantContent:    "{\"a\":1}\n{\"b\":2}\n",
+			wantTerminated: 7,
+		},
+		{
+			name:        "torn tail is dropped",
+			content:     "{\"a\":1}\n{\"b\":2}\n{\"c\":",
+			wantContent: "{\"a\":1}\n{\"b\":2}\n",
+			wantDropped: 5,
+		},
+		{
+			name:        "file ending in newline is untouched",
+			content:     "{\"a\":1}\n{\"b\":2}\n",
+			wantContent: "{\"a\":1}\n{\"b\":2}\n",
+			wantDropped: 0,
+		},
+		{
+			name:        "complete but unparseable line is preserved",
+			content:     "{\"a\":1}\n{\"torn\":\n",
+			wantContent: "{\"a\":1}\n{\"torn\":\n",
+			wantDropped: 0,
+		},
+		{
+			name:        "corrupt complete line is kept while the torn tail is dropped",
+			content:     "{\"a\":1}\n{\"bad\"\n{\"c\":3}\n{\"d\":",
+			wantContent: "{\"a\":1}\n{\"bad\"\n{\"c\":3}\n",
+			wantDropped: 5,
+		},
+		{
+			name:        "single unterminated line truncates to empty",
+			content:     "{\"a\":",
+			wantContent: "",
+			wantDropped: 5,
+		},
+		{
+			name:        "empty file is untouched",
+			content:     "",
+			wantContent: "",
+			wantDropped: 0,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "f.jsonl")
+			if err := os.WriteFile(path, []byte(tc.content), 0600); err != nil {
+				t.Fatalf("WriteFile: %v", err)
+			}
+			rep, err := repairTrailingPartialLine(path)
+			if err != nil {
+				t.Fatalf("repairTrailingPartialLine: %v", err)
+			}
+			if rep.Dropped != tc.wantDropped {
+				t.Errorf("dropped: got %d, want %d", rep.Dropped, tc.wantDropped)
+			}
+			if rep.Terminated != tc.wantTerminated {
+				t.Errorf("terminated: got %d, want %d", rep.Terminated, tc.wantTerminated)
+			}
+			got, err := os.ReadFile(path)
+			if err != nil {
+				t.Fatalf("ReadFile: %v", err)
+			}
+			if string(got) != tc.wantContent {
+				t.Errorf("content:\n  got  %q\n  want %q", got, tc.wantContent)
+			}
+			// Repair must be idempotent: a second pass changes nothing.
+			againRep, err := repairTrailingPartialLine(path)
+			if err != nil {
+				t.Fatalf("repairTrailingPartialLine (second pass): %v", err)
+			}
+			if againRep.Dropped != 0 {
+				t.Errorf("second pass dropped %d bytes, want 0", againRep.Dropped)
+			}
+			if againRep.Terminated != 0 {
+				t.Errorf("second pass terminated %d bytes, want 0", againRep.Terminated)
+			}
+		})
+	}
+}
+
+// TestRepairTrailingPartialLine_MissingFile confirms a not-yet-created file is a
+// no-op rather than an error, since Start runs the repair before O_CREATE.
+func TestRepairTrailingPartialLine_MissingFile(t *testing.T) {
+	rep, err := repairTrailingPartialLine(filepath.Join(t.TempDir(), "absent.jsonl"))
+	if err != nil {
+		t.Fatalf("repairTrailingPartialLine on missing file: %v", err)
+	}
+	if rep.Dropped != 0 {
+		t.Errorf("dropped: got %d, want 0", rep.Dropped)
+	}
+}
+
+// TestRestart_TornAuditLogLine_Fusion is the audit-log counterpart of
+// TestRestart_TornCheckpointLine_Fusion. The log file is opened O_APPEND too, so a
+// torn entry left by a crash would otherwise fuse onto the next entry written after
+// a restart, and readLogEntries rejects any unparseable line at all.
+func TestRestart_TornAuditLogLine_Fusion(t *testing.T) {
+	env := newTestEnv(t)
+	env.cfg.CheckpointInterval = 1
+
+	exp1 := startExporter(t, env.cfg)
+	_ = exp1.ConsumeTraces(context.Background(), makeSpan([16]byte{0xE8}, [8]byte{0x01}, zeroParentID, "t1", 1000, 2000))
+	if err := exp1.Shutdown(context.Background()); err != nil {
+		t.Fatalf("Shutdown phase 1: %v", err)
+	}
+
+	f, err := os.OpenFile(env.cfg.LogPath, os.O_APPEND|os.O_WRONLY, 0600)
+	if err != nil {
+		t.Fatalf("open log for torn append: %v", err)
+	}
+	if _, err := f.Write([]byte(`{"record":{"schema_version":"v2","trace_id":"`)); err != nil {
+		t.Fatalf("write torn line: %v", err)
+	}
+	_ = f.Close()
+
+	exp2 := startExporter(t, env.cfg)
+	_ = exp2.ConsumeTraces(context.Background(), makeSpan([16]byte{0xE9}, [8]byte{0x02}, zeroParentID, "t2", 3000, 4000))
+	if err := exp2.Shutdown(context.Background()); err != nil {
+		t.Fatalf("Shutdown phase 2: %v", err)
+	}
+
+	report, err := verify.VerifyLog(env.cfg.LogPath, env.cfg.CheckpointPath, env.pubKey)
+	if err != nil {
+		t.Fatalf("VerifyLog hard error: %v", err)
+	}
+	if len(report.Errors) != 0 {
+		t.Errorf("VerifyLog reported %d error(s): %v", len(report.Errors), report.Errors)
+	}
+}
+
+// TestRepairTrailingPartialLine_BoundedScan pins the one repair path that hard-fails
+// Start. A tail longer than one maximum-size line is not a partial write, so the
+// repair must refuse rather than truncate on that assumption.
+func TestRepairTrailingPartialLine_BoundedScan(t *testing.T) {
+	head := []byte("{\"a\":1}\n")
+
+	t.Run("tail one byte under the cap is truncated", func(t *testing.T) {
+		path := filepath.Join(t.TempDir(), "f.jsonl")
+		content := append(append([]byte{}, head...), bytes.Repeat([]byte("x"), maxScanTokenSize-1)...)
+		if err := os.WriteFile(path, content, 0600); err != nil {
+			t.Fatalf("WriteFile: %v", err)
+		}
+		rep, err := repairTrailingPartialLine(path)
+		if err != nil {
+			t.Fatalf("repairTrailingPartialLine: %v", err)
+		}
+		if rep.Dropped != maxScanTokenSize-1 {
+			t.Errorf("dropped: got %d, want %d", rep.Dropped, maxScanTokenSize-1)
+		}
+		got, _ := os.ReadFile(path)
+		if !bytes.Equal(got, head) {
+			t.Errorf("content: got %d bytes, want the %d-byte head", len(got), len(head))
+		}
+	})
+
+	t.Run("tail at the cap is refused", func(t *testing.T) {
+		path := filepath.Join(t.TempDir(), "f.jsonl")
+		content := append(append([]byte{}, head...), bytes.Repeat([]byte("x"), maxScanTokenSize)...)
+		if err := os.WriteFile(path, content, 0600); err != nil {
+			t.Fatalf("WriteFile: %v", err)
+		}
+		before, _ := os.ReadFile(path)
+		rep, err := repairTrailingPartialLine(path)
+		if err == nil {
+			t.Fatal("expected a refusal, got nil error")
+		}
+		if rep.Dropped != 0 {
+			t.Errorf("dropped: got %d, want 0", rep.Dropped)
+		}
+		after, _ := os.ReadFile(path)
+		if !bytes.Equal(before, after) {
+			t.Error("file was modified despite the refusal")
+		}
+	})
+}
+
+// TestStart_TornTailRefusal_IsFatal confirms Start propagates a refusal rather than
+// starting on a file it could see but could not repair.
+func TestStart_TornTailRefusal_IsFatal(t *testing.T) {
+	env := newTestEnv(t)
+	content := append([]byte("{\"a\":1}\n"), bytes.Repeat([]byte("x"), maxScanTokenSize)...)
+	if err := os.WriteFile(env.cfg.LogPath, content, 0600); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+	exp := newAgentAuditExporter(env.cfg, nil)
+	err := exp.Start(context.Background(), nil)
+	if err == nil {
+		_ = exp.Shutdown(context.Background())
+		t.Fatal("Start succeeded on an unrepairable audit log; want an error")
+	}
+	if !strings.Contains(err.Error(), "refusing to truncate") {
+		t.Errorf("Start error = %v, want it to mention refusing to truncate", err)
+	}
+}
+
+// TestStart_UninspectableFile_IsNotFatal is the counterpart: when the file cannot be
+// opened for inspection at all, nothing is known to be torn and the append-only open
+// may still succeed, so Start must not deny a configuration that worked before this
+// check existed. An append-only audit log (chattr +a / uappnd) is the motivating
+// case; a write-only mode reproduces the same class portably.
+func TestStart_UninspectableFile_IsNotFatal(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("running as root; file mode does not restrict access")
+	}
+	env := newTestEnv(t)
+	if err := os.WriteFile(env.cfg.LogPath, []byte("{\"a\":1}\n"), 0600); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+	// Write-only: the O_RDWR repair open is refused, the O_APPEND|O_WRONLY open is not.
+	if err := os.Chmod(env.cfg.LogPath, 0200); err != nil {
+		t.Fatalf("Chmod: %v", err)
+	}
+	t.Cleanup(func() { _ = os.Chmod(env.cfg.LogPath, 0600) })
+
+	if _, err := os.OpenFile(env.cfg.LogPath, os.O_RDWR, 0); err == nil {
+		t.Skip("O_RDWR unexpectedly permitted; cannot exercise the degraded path here")
+	}
+
+	exp := newAgentAuditExporter(env.cfg, nil)
+	if err := exp.Start(context.Background(), nil); err != nil {
+		t.Fatalf("Start failed on an uninspectable audit log: %v", err)
+	}
+	if err := exp.Shutdown(context.Background()); err != nil {
+		t.Fatalf("Shutdown: %v", err)
+	}
+}
+
+// TestRestart_DurableRecordMissingNewline_IsPreserved covers the case where a
+// complete, signed record reached disk but its terminating newline did not —
+// reachable with fsync_log disabled, where nothing orders the record's bytes
+// against the newline.
+//
+// The fragment is a complete record, so truncating it would destroy signed
+// evidence and turn a log that verified cleanly into an entry_count_mismatch.
+// The repair must terminate the line instead. A strict prefix of a
+// one-object-per-line record can never parse, so valid JSON is an exact
+// discriminator between this case and an interrupted write.
+func TestRestart_DurableRecordMissingNewline_IsPreserved(t *testing.T) {
+	env := newTestEnv(t)
+	env.cfg.CheckpointInterval = 1
+
+	exp1 := startExporter(t, env.cfg)
+	_ = exp1.ConsumeTraces(context.Background(), makeSpan([16]byte{0xEA}, [8]byte{0x01}, zeroParentID, "t1", 1000, 2000))
+	_ = exp1.ConsumeTraces(context.Background(), makeSpan([16]byte{0xEB}, [8]byte{0x02}, zeroParentID, "t2", 3000, 4000))
+	if err := exp1.Shutdown(context.Background()); err != nil {
+		t.Fatalf("Shutdown phase 1: %v", err)
+	}
+
+	// Baseline: the log verifies cleanly, and we record how many entries it holds.
+	if report, err := verify.VerifyLog(env.cfg.LogPath, env.cfg.CheckpointPath, env.pubKey); err != nil {
+		t.Fatalf("baseline VerifyLog hard error: %v", err)
+	} else if len(report.Errors) != 0 {
+		t.Fatalf("baseline VerifyLog reported errors: %v", report.Errors)
+	}
+	entriesBefore := len(readLogEntries(t, env.cfg.LogPath))
+
+	// Drop only the terminating newline: every record byte is still durable.
+	data, err := os.ReadFile(env.cfg.LogPath)
+	if err != nil {
+		t.Fatalf("ReadFile: %v", err)
+	}
+	if len(data) == 0 || data[len(data)-1] != '\n' {
+		t.Fatalf("expected the log to end in a newline, got %q", tailOf(data))
+	}
+	if err := os.WriteFile(env.cfg.LogPath, data[:len(data)-1], 0600); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+
+	exp2 := startExporter(t, env.cfg)
+	if err := exp2.Shutdown(context.Background()); err != nil {
+		t.Fatalf("Shutdown phase 2: %v", err)
+	}
+
+	if got := len(readLogEntries(t, env.cfg.LogPath)); got != entriesBefore {
+		t.Errorf("log entries after restart: got %d, want %d — a durable record was destroyed", got, entriesBefore)
+	}
+	report, err := verify.VerifyLog(env.cfg.LogPath, env.cfg.CheckpointPath, env.pubKey)
+	if err != nil {
+		t.Fatalf("VerifyLog hard error: %v", err)
+	}
+	if len(report.Errors) != 0 {
+		t.Errorf("VerifyLog reported %d error(s): %v", len(report.Errors), report.Errors)
+	}
+}
+
+// tailOf returns a short printable tail of b for failure messages.
+func tailOf(b []byte) []byte {
+	if len(b) > 32 {
+		return b[len(b)-32:]
+	}
+	return b
 }
