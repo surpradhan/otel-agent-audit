@@ -2077,6 +2077,92 @@ func TestRestart_AfterCheckpointFailureRecoversTipWithoutDuplicating(t *testing.
 	}
 }
 
+// TestRestart_SecondSegmentSpanSurvivesCrashAfterRetainedEarlierMarker covers
+// a gap the tip-retention fix above opened: once WAL.Compact can retain a
+// sealed marker while its tip is pending, sealedTraces still clears in full
+// on that same successful Compact (see sealTrace's step 8), so a
+// duplicate_trace_segment re-seal of the SAME trace_id can start buffering a
+// second, independent segment while the first segment's marker is still in
+// the WAL. wal.Replay's internal sealed-trace latch used to treat any span
+// entry for a trace_id as belonging to whichever segment it saw sealed
+// first, so the second segment's still-open span would be silently excluded
+// from the replayed buffers after a crash — lost with no verifier signal at
+// all, unlike the accepted duplicate_trace_segment trade-off in
+// docs/threat-model.md §5, which assumes the second segment eventually
+// completes and gets flagged.
+//
+// This seals segment 1, lets its Compact clear sealedTraces, buffers a
+// non-root child span for a duplicate second segment (left open, not
+// sealed), crashes without a clean shutdown, and restarts: both segment 1's
+// tip AND segment 2's in-progress span must survive.
+func TestRestart_SecondSegmentSpanSurvivesCrashAfterRetainedEarlierMarker(t *testing.T) {
+	env := newTestEnv(t)
+	cfg := env.cfg
+	cfg.CheckpointInterval = 1000 // large enough that sealing segment 1 alone does not trigger a checkpoint
+
+	exp1 := startExporter(t, cfg)
+
+	traceID := [16]byte{0xC1}
+
+	// Segment 1 seals via its root span. Its tip stays pending (checkpoint
+	// interval is large), so the Compact this dispatches retains its marker.
+	if err := exp1.ConsumeTraces(context.Background(),
+		makeSpan(traceID, [8]byte{0x01}, zeroParentID, "seg1-root", 1_000_000, 2_000_000)); err != nil {
+		t.Fatalf("ConsumeTraces (segment 1 root): %v", err)
+	}
+	exp1.compactWG.Wait() // let sealedTraces clear so the re-delivered root below reseals rather than being dropped
+
+	if got := exp1.accumulator.PendingCount(); got != 1 {
+		t.Fatalf("pending tips after segment 1 seal: got %d, want 1", got)
+	}
+
+	// A duplicate_trace_segment: a non-root child arrives for the SAME
+	// trace_id. sealedTraces no longer guards it, so it is buffered as the
+	// start of an independent second segment rather than dropped. It is
+	// deliberately left open (no root span) so it is still in-progress, not
+	// yet sealed, at crash time.
+	if err := exp1.ConsumeTraces(context.Background(),
+		makeSpan(traceID, [8]byte{0x02}, [8]byte{0x01}, "seg2-child", 3_000_000, 4_000_000)); err != nil {
+		t.Fatalf("ConsumeTraces (segment 2 child): %v", err)
+	}
+	exp1.mu.Lock()
+	_, buffered := exp1.buffers[pcommon.TraceID(traceID).String()]
+	exp1.mu.Unlock()
+	if !buffered {
+		t.Fatal("segment 2's child span must be buffered as in-progress before the crash, not dropped")
+	}
+
+	// Crash simulation: stop the background goroutine and close every file
+	// directly, WITHOUT going through Shutdown's force-seal-and-checkpoint path.
+	close(exp1.stopCh)
+	<-exp1.doneCh
+	if exp1.logFile != nil {
+		_ = exp1.logFile.Close()
+	}
+	if exp1.checkFile != nil {
+		_ = exp1.checkFile.Close()
+	}
+	if exp1.wal != nil {
+		_ = exp1.wal.Close()
+	}
+
+	// Restart against the same paths.
+	exp2 := startExporter(t, cfg)
+	defer func() { _ = exp2.Shutdown(context.Background()) }()
+
+	if got := exp2.accumulator.PendingCount(); got != 1 {
+		t.Fatalf("pending tips after restart: got %d, want 1 (segment 1's tip must survive)", got)
+	}
+	exp2.mu.Lock()
+	recs, ok := exp2.buffers[pcommon.TraceID(traceID).String()]
+	exp2.mu.Unlock()
+	if !ok || len(recs.records) != 1 {
+		t.Fatalf("segment 2's in-progress span after restart: got present=%v records=%+v, "+
+			"want it recovered as an open buffer, not silently dropped as if it belonged to sealed segment 1",
+			ok, recs)
+	}
+}
+
 // TestCheckpointSyncFailure_RollsBackAndRetriesTips covers the other half of the
 // durable-commit contract: the checkpoint line is written but Sync fails. The
 // file must be truncated back to its pre-write size (an unsynced line must not

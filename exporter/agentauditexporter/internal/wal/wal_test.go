@@ -300,6 +300,130 @@ func TestWAL_Compact_TracksTraceAndTipHashIndependently(t *testing.T) {
 	}
 }
 
+// TestWAL_Replay_SecondSegmentSpanSurvivesRetainedEarlierMarker pins a gap the
+// tip-hash-retention fix opened: once Compact can retain a sealed marker
+// while its tip is pending, a duplicate_trace_segment re-seal can append a
+// brand new segment's spans for the SAME trace_id AFTER that retained marker
+// in the WAL. Replay's `sealed` map latches permanently once true, so
+// without unlatching on a later span, the new segment's spans would be
+// silently treated as belonging to the old, already-sealed segment and
+// dropped — with no verifier signal, since they were never durably logged at
+// all. This never arose before the retention fix: Compact used to evict a
+// sealed trace's marker unconditionally, so a trace_id's marker and any
+// later segment's spans could never coexist in one file.
+func TestWAL_Replay_SecondSegmentSpanSurvivesRetainedEarlierMarker(t *testing.T) {
+	w, _ := openWAL(t)
+
+	// Segment 1 seals; its tip is still pending, so a Compact retains the marker.
+	if err := w.MarkSealed("trace001", "hash1", 1); err != nil {
+		t.Fatalf("MarkSealed hash1: %v", err)
+	}
+	if err := w.Compact(map[string]map[string]struct{}{"trace001": {"hash1": {}}}); err != nil {
+		t.Fatalf("Compact (retain hash1): %v", err)
+	}
+
+	// Segment 2 (a duplicate_trace_segment re-seal) starts buffering under the
+	// same trace_id, appended after the retained marker.
+	seg2Span := makeRecord("trace001", "span-seg2", 5000)
+	if err := w.AppendSpan("trace001", seg2Span); err != nil {
+		t.Fatalf("AppendSpan (segment 2): %v", err)
+	}
+
+	buffers, sealedPending, err := w.Replay()
+	if err != nil {
+		t.Fatalf("Replay: %v", err)
+	}
+	if len(sealedPending) != 1 || sealedPending[0].TipHash != "hash1" {
+		t.Errorf("sealedPending = %+v, want exactly segment 1's hash1", sealedPending)
+	}
+	recs, ok := buffers["trace001"]
+	if !ok || len(recs) != 1 || recs[0].SpanID != "span-seg2" {
+		t.Errorf("buffers[trace001] = %+v (ok=%v), want segment 2's still-open span, "+
+			"not silently dropped as if it belonged to the sealed segment 1", recs, ok)
+	}
+}
+
+// TestWAL_Compact_DoesNotDropOpenSecondSegmentSpan is
+// TestWAL_Replay_SecondSegmentSpanSurvivesRetainedEarlierMarker's Compact-side
+// counterpart: an ORDINARY subsequent Compact call (no crash at all) must not
+// itself destroy segment 2's open span while rewriting the file.
+func TestWAL_Compact_DoesNotDropOpenSecondSegmentSpan(t *testing.T) {
+	w, _ := openWAL(t)
+
+	if err := w.MarkSealed("trace001", "hash1", 1); err != nil {
+		t.Fatalf("MarkSealed hash1: %v", err)
+	}
+	pending := map[string]map[string]struct{}{"trace001": {"hash1": {}}}
+	if err := w.Compact(pending); err != nil {
+		t.Fatalf("Compact (retain hash1): %v", err)
+	}
+
+	seg2Span := makeRecord("trace001", "span-seg2", 5000)
+	if err := w.AppendSpan("trace001", seg2Span); err != nil {
+		t.Fatalf("AppendSpan (segment 2): %v", err)
+	}
+
+	// A second, ordinary Compact — as any unrelated trace sealing elsewhere
+	// would trigger — with hash1 still pending.
+	if err := w.Compact(pending); err != nil {
+		t.Fatalf("second Compact: %v", err)
+	}
+
+	buffers, sealedPending, err := w.Replay()
+	if err != nil {
+		t.Fatalf("Replay: %v", err)
+	}
+	if len(sealedPending) != 1 || sealedPending[0].TipHash != "hash1" {
+		t.Errorf("sealedPending = %+v, want exactly segment 1's hash1", sealedPending)
+	}
+	recs, ok := buffers["trace001"]
+	if !ok || len(recs) != 1 || recs[0].SpanID != "span-seg2" {
+		t.Errorf("buffers[trace001] = %+v (ok=%v), want segment 2's open span to survive "+
+			"an ordinary Compact call", recs, ok)
+	}
+}
+
+// TestWAL_Compact_StableAcrossRepeatedCyclesWithOpenSecondSegment pins WHY
+// Compact writes retained sealed markers before spans rather than after: a
+// retained marker for an OLDER segment must stay positioned before a NEWER
+// segment's still-open spans for the same trace_id in every rewrite, or a
+// later Compact call — which unlatches on the span, then re-latches and
+// unconditionally evicts on the next sealed-marker line it sees — mis-scopes
+// that eviction onto the wrong segment. This test runs Compact THREE times
+// with segment 2 left open throughout, which the write-order fix must survive
+// (a single-cycle fix that only unlatches on span, without also preserving
+// marker-before-span order, passes one cycle but fails the second).
+func TestWAL_Compact_StableAcrossRepeatedCyclesWithOpenSecondSegment(t *testing.T) {
+	w, _ := openWAL(t)
+
+	if err := w.MarkSealed("trace001", "hash1", 1); err != nil {
+		t.Fatalf("MarkSealed hash1: %v", err)
+	}
+	seg2Span := makeRecord("trace001", "span-seg2", 5000)
+	if err := w.AppendSpan("trace001", seg2Span); err != nil {
+		t.Fatalf("AppendSpan (segment 2): %v", err)
+	}
+
+	pending := map[string]map[string]struct{}{"trace001": {"hash1": {}}}
+	for i := 0; i < 3; i++ {
+		if err := w.Compact(pending); err != nil {
+			t.Fatalf("Compact cycle %d: %v", i+1, err)
+		}
+		buffers, sealedPending, err := w.Replay()
+		if err != nil {
+			t.Fatalf("Replay after cycle %d: %v", i+1, err)
+		}
+		if len(sealedPending) != 1 || sealedPending[0].TipHash != "hash1" {
+			t.Fatalf("cycle %d: sealedPending = %+v, want exactly segment 1's hash1", i+1, sealedPending)
+		}
+		recs, ok := buffers["trace001"]
+		if !ok || len(recs) != 1 || recs[0].SpanID != "span-seg2" {
+			t.Fatalf("cycle %d: buffers[trace001] = %+v (ok=%v), want segment 2's open span "+
+				"to survive repeated Compact cycles", i+1, recs, ok)
+		}
+	}
+}
+
 // TestWAL_CompactSafe_Concurrent races AppendSpan against Compact to verify
 // the internal RWMutex prevents data races (detected by -race).
 func TestWAL_CompactSafe_Concurrent(t *testing.T) {

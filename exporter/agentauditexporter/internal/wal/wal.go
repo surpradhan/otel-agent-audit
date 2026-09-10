@@ -153,7 +153,19 @@ func (w *WAL) Replay() (buffers map[string][]record.AuditRecord, sealedPending [
 		}
 		switch entry.Type {
 		case entryTypeSpan:
-			if !sealed[entry.TraceID] && entry.Record != nil {
+			if sealed[entry.TraceID] {
+				// A span for a trace_id currently latched sealed can only be
+				// a NEW segment's append: bufferSpan's own guard drops spans
+				// for a trace_id its in-memory sealedTraces/startupSealed
+				// guard still considers sealed, so this must be a
+				// duplicate_trace_segment re-seal that started after the
+				// guard cleared. Un-latch so this and later span entries are
+				// buffered as that new segment's in-progress data, rather
+				// than silently discarded as if they still belonged to the
+				// earlier, already-sealed segment.
+				delete(sealed, entry.TraceID)
+			}
+			if entry.Record != nil {
 				buffers[entry.TraceID] = append(buffers[entry.TraceID], *entry.Record)
 			}
 		case entryTypeSealed:
@@ -227,7 +239,10 @@ func (w *WAL) Compact(pending map[string]map[string]struct{}) error {
 		}
 		switch entry.Type {
 		case entryTypeSpan:
-			if !sealed[entry.TraceID] && entry.Record != nil {
+			if sealed[entry.TraceID] {
+				delete(sealed, entry.TraceID) // see the identical comment in Replay
+			}
+			if entry.Record != nil {
 				spans = append(spans, spanEntry{entry.TraceID, *entry.Record})
 			}
 		case entryTypeSealed:
@@ -259,20 +274,31 @@ func (w *WAL) Compact(pending map[string]map[string]struct{}) error {
 		return fmt.Errorf("wal: compact create temp: %w", err)
 	}
 
+	// Write retained sealed markers BEFORE spans, not after: a retained marker
+	// belongs to an OLDER segment than any still-open spans for the same
+	// trace_id (duplicate_trace_segment can only append new spans for a
+	// trace_id once its earlier segment is sealed), so putting the marker
+	// first preserves that relative order in the rewritten file. Writing
+	// spans first would put the newer segment's spans ahead of the older
+	// segment's marker — and since Compact runs after every seal, a further
+	// Compact or Replay of that file would then see the span line before the
+	// marker line, un-latch on the span as designed, and then mis-scope the
+	// marker's unconditional buffers/spans eviction (meant for the OLD
+	// segment) onto the just-buffered NEW one, silently dropping it.
 	enc := json.NewEncoder(tf)
+	for _, entry := range keepSealed {
+		if err := enc.Encode(entry); err != nil {
+			_ = tf.Close()
+			_ = os.Remove(tmpPath)
+			return fmt.Errorf("wal: compact encode sealed marker: %w", err)
+		}
+	}
 	for _, s := range spans {
 		entry := walEntry{Type: entryTypeSpan, TraceID: s.traceID, Record: &s.rec}
 		if err := enc.Encode(entry); err != nil {
 			_ = tf.Close()
 			_ = os.Remove(tmpPath)
 			return fmt.Errorf("wal: compact encode: %w", err)
-		}
-	}
-	for _, entry := range keepSealed {
-		if err := enc.Encode(entry); err != nil {
-			_ = tf.Close()
-			_ = os.Remove(tmpPath)
-			return fmt.Errorf("wal: compact encode sealed marker: %w", err)
 		}
 	}
 	if err := tf.Sync(); err != nil {

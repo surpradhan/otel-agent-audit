@@ -159,6 +159,15 @@ trace segment (§5) is a second, independent tip under the same `trace_id`, and
 each tip's coverage is tracked and recovered on its own — settling one (by
 checkpoint or by the cases above) never affects the other's pending state.
 
+A later segment's own not-yet-sealed spans are protected the same way. A
+retained marker for an earlier, already-sealed segment can sit in the WAL
+while a duplicate trace segment (§5) is still buffering its own spans under
+the same `trace_id`; Replay and Compact distinguish the earlier segment's
+marker from the later segment's still-open span data rather than treating
+every span for that `trace_id` as settled the moment any marker for it is
+seen, so the later segment's in-progress spans are never mistaken for the
+earlier segment's and silently dropped.
+
 ---
 
 ## 4. Single-replica constraint
