@@ -3148,6 +3148,22 @@ func TestStart_DoesNotRestampDataIncompatibleOrUnknownVersions(t *testing.T) {
 			if got := entries[0].Record.SchemaVersion; got != storedVersion {
 				t.Errorf("schema_version: got %q, want %q — this version must not be re-stamped", got, storedVersion)
 			}
+
+			// The record must also be WRITTEN in its own version's encoding, not
+			// merely labelled with it: v1 is numeric, v99 falls outside the frozen
+			// legacy set and so takes the current string form.
+			raw, err := os.ReadFile(env.cfg.LogPath)
+			if err != nil {
+				t.Fatalf("reading log: %v", err)
+			}
+			wantEncoded := `"start_time_unix_nano":"1764547200123456789"`
+			if record.UsesNumericTimestamps(storedVersion) {
+				wantEncoded = `"start_time_unix_nano":1764547200123456789`
+			}
+			if !bytes.Contains(raw, []byte(wantEncoded)) {
+				t.Errorf("record not written in %q's encoding, want %s in:\n%s", storedVersion, wantEncoded, raw)
+			}
+
 			if err := verify.VerifyChain(entries, env.pubKey); err != nil {
 				t.Errorf("verifying a chain sealed at its stored version %q: %v", storedVersion, err)
 			}
@@ -3185,9 +3201,11 @@ func TestStart_UnrestampableTraceIsSealedNotLeftOpen(t *testing.T) {
 				i, e.Record.SchemaVersion, entries[0].Record.SchemaVersion)
 		}
 	}
-	if len(entries) != 1 || entries[0].Record.SchemaVersion != "v1" {
-		t.Errorf("expected the v1 trace sealed alone at v1, got %d entries at %q",
-			len(entries), entries[0].Record.SchemaVersion)
+	if len(entries) != 1 {
+		t.Fatalf("expected the v1 trace sealed alone, got %d entries", len(entries))
+	}
+	if got := entries[0].Record.SchemaVersion; got != "v1" {
+		t.Errorf("sealed at %q, want v1", got)
 	}
 	if err := verify.VerifyChain(entries, env.pubKey); err != nil {
 		t.Errorf("verifying the sealed v1 chain: %v", err)
@@ -3243,5 +3261,170 @@ func TestStart_RestampSurvivesSameSpanRedelivery(t *testing.T) {
 	}
 	if err := verify.VerifyChain(entries, env.pubKey); err != nil {
 		t.Errorf("verifying the chain after a same-span re-delivery: %v", err)
+	}
+}
+
+// TestStart_MultipleUnrestampableTracesSealSafely covers the concurrency shape
+// the earlier tests missed: sealing more than one trace during Start. sealTrace
+// requires e.mu and dispatches a compaction goroutine that takes the lock
+// itself, so an unlocked seal loop raced that goroutine from the second
+// iteration onward — a concurrent map write that can panic the collector at
+// startup. One unrestampable trace never exposed it; -race catches it here.
+func TestStart_MultipleUnrestampableTracesSealSafely(t *testing.T) {
+	env := newTestEnv(t)
+
+	const traces = 6
+	var walLines string
+	for i := 0; i < traces; i++ {
+		walLines += legacyWALLine("v1",
+			fmt.Sprintf("%032x", 0x1000+i), fmt.Sprintf("%016x", 0x20+i), "", "legacy.root")
+	}
+	if err := os.WriteFile(env.cfg.WalPath, []byte(walLines), 0600); err != nil {
+		t.Fatalf("writing WAL: %v", err)
+	}
+
+	exp := startExporter(t, env.cfg)
+	if err := exp.Shutdown(context.Background()); err != nil {
+		t.Fatalf("Shutdown: %v", err)
+	}
+
+	entries := readLogEntries(t, env.cfg.LogPath)
+	if len(entries) != traces {
+		t.Fatalf("expected %d sealed entries, got %d", traces, len(entries))
+	}
+	for i, e := range entries {
+		if e.Record.SchemaVersion != "v1" {
+			t.Errorf("entry %d: schema_version %q, want v1", i, e.Record.SchemaVersion)
+		}
+	}
+}
+
+// TestStart_TraceSpanningSchemaVersionsIsDropped covers the case a per-record
+// decision got wrong: two crash-and-upgrade cycles on one in-flight trace leave
+// a WAL trace holding records of different versions. No single-version chain can
+// represent it, and a mixed chain is one this project's own verifier rejects —
+// so the trace is dropped loudly rather than sealed into an unverifiable log.
+//
+// The combinations are the four the round-3 validator measured writing a mixed
+// chain: a restampable version paired with a non-restampable one, in both
+// directions, and two non-restampable ones together.
+func TestStart_TraceSpanningSchemaVersionsIsDropped(t *testing.T) {
+	for _, versions := range [][2]string{
+		{"v2", "v1"},
+		{"v1", "v99"},
+		{record.SchemaVersion, "v1"},
+		{"v2", "v99"},
+	} {
+		t.Run(versions[0]+"+"+versions[1], func(t *testing.T) {
+			env := newTestEnv(t)
+			const traceID = "01010101010101010101010101010101"
+			walLines := legacyWALLine(versions[0], traceID, "0102030405060708", "aabbccddeeff0011", "first") +
+				legacyWALLine(versions[1], traceID, "0203040506070809", "aabbccddeeff0011", "second")
+			if err := os.WriteFile(env.cfg.WalPath, []byte(walLines), 0600); err != nil {
+				t.Fatalf("writing WAL: %v", err)
+			}
+
+			exp := startExporter(t, env.cfg)
+			if err := exp.Shutdown(context.Background()); err != nil {
+				t.Fatalf("Shutdown: %v", err)
+			}
+
+			entries := readLogEntries(t, env.cfg.LogPath)
+			if len(entries) != 0 {
+				var got []string
+				for _, e := range entries {
+					got = append(got, e.Record.SchemaVersion)
+				}
+				t.Fatalf("a trace spanning schema versions must not be sealed; got %d entries at %v", len(entries), got)
+			}
+
+			// It must not replay forever either: the WAL is marked sealed, so a
+			// restart does not re-process it.
+			exp2 := startExporter(t, env.cfg)
+			if err := exp2.Shutdown(context.Background()); err != nil {
+				t.Fatalf("Shutdown 2: %v", err)
+			}
+			if entries := readLogEntries(t, env.cfg.LogPath); len(entries) != 0 {
+				t.Errorf("dropped trace replayed on restart: %d entries", len(entries))
+			}
+		})
+	}
+}
+
+// TestSealTrace_UnseedableRecordDoesNotReplayForever pins the other half of the
+// same lesson. sealTrace drops the buffer before deriving the genesis seed, so a
+// record whose schema_version cannot be seeded — empty, as a corrupt WAL line
+// yields — used to vanish from the log while staying in the WAL, re-processed on
+// every restart. It must be recorded as an unrecoverable drop instead.
+func TestSealTrace_UnseedableRecordDoesNotReplayForever(t *testing.T) {
+	env := newTestEnv(t)
+	const traceID = "01010101010101010101010101010101"
+	// schema_version "" is what a zero-value or corrupt record decodes to.
+	if err := os.WriteFile(env.cfg.WalPath,
+		[]byte(legacyWALLine("", traceID, "0102030405060708", "", "corrupt.root")), 0600); err != nil {
+		t.Fatalf("writing WAL: %v", err)
+	}
+
+	exp := startExporter(t, env.cfg)
+	if err := exp.Shutdown(context.Background()); err != nil {
+		t.Fatalf("Shutdown: %v", err)
+	}
+	if entries := readLogEntries(t, env.cfg.LogPath); len(entries) != 0 {
+		t.Fatalf("an unseedable record must not be sealed, got %d entries", len(entries))
+	}
+
+	walAfter, err := os.ReadFile(env.cfg.WalPath)
+	if err != nil {
+		t.Fatalf("reading WAL: %v", err)
+	}
+	if strings.Contains(string(walAfter), "corrupt.root") {
+		t.Errorf("unseedable record still in the WAL after seal; it will replay on every restart:\n%s", walAfter)
+	}
+}
+
+// TestStart_SealedAtOwnVersionSurvivesCompaction closes the window the
+// startup-seal guarantee actually has to hold across. sealTrace dispatches a
+// background Compact whose success handler resets sealedTraces — correct for an
+// ordinary seal, which only needs the guard until the sealed WAL records are
+// gone. A trace sealed during Start at an earlier schema version is different:
+// re-opening it would let a current-version span start a second chain under the
+// same trace_id, seq restarting at 0, which the verifier reports as
+// duplicate_trace_segment forever after.
+//
+// Waiting on the compaction before sending the span is what makes this
+// deterministic: without it the test merely wins a race, which is why the
+// sibling test passes with or without the guard.
+func TestStart_SealedAtOwnVersionSurvivesCompaction(t *testing.T) {
+	env := newTestEnv(t)
+	const traceIDHex = "01010101010101010101010101010101"
+	if err := os.WriteFile(env.cfg.WalPath,
+		[]byte(legacyWALLine("v1", traceIDHex, "0102030405060708", "aabbccddeeff0011", "pre-upgrade.child")), 0600); err != nil {
+		t.Fatalf("writing WAL: %v", err)
+	}
+
+	exp := startExporter(t, env.cfg)
+
+	// Let the compaction dispatched by the startup seal run to completion, so
+	// sealedTraces has been reset by the time the span arrives.
+	exp.compactWG.Wait()
+
+	traceID := [16]byte{1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1}
+	rootID := [8]byte{0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff, 0x00, 0x11}
+	_ = exp.ConsumeTraces(context.Background(),
+		makeSpan(traceID, rootID, zeroParentID, "post-upgrade.root", 1764547200000000000, 1764547201000000000))
+	if err := exp.Shutdown(context.Background()); err != nil {
+		t.Fatalf("Shutdown: %v", err)
+	}
+
+	entries := readLogEntries(t, env.cfg.LogPath)
+	if len(entries) != 1 {
+		var got []string
+		for _, e := range entries {
+			got = append(got, fmt.Sprintf("seq=%d %s %s", e.Record.SeqInTrace, e.Record.SchemaVersion, e.Record.SpanName))
+		}
+		t.Fatalf("the startup-sealed trace must stay closed after compaction; got %d entries: %v", len(entries), got)
+	}
+	if got := entries[0].Record.SchemaVersion; got != "v1" {
+		t.Errorf("sealed at %q, want v1", got)
 	}
 }

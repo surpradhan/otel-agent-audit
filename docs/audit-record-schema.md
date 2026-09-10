@@ -34,6 +34,15 @@ breaking chain-format change and requires:
 2. New cross-impl fixtures in `internal/record/testdata/`,
    `internal/canonical/testdata/` and `internal/chain/testdata/`
 3. A changelog entry and field-table update in this document
+4. **Re-curating `restampableToCurrent`** in `internal/record/record.go`. Unlike
+   `legacyNumericTimestampSchemas`, which is frozen, that set is a claim about
+   the *current* version — every member asserts "a record of this version means
+   the same thing as one of `SchemaVersion`". Bumping the constant re-asserts
+   each member against a version nobody has examined, so the new version must be
+   added **and every existing member re-justified**: if the bump changes what a
+   field means (as v1 → v2 did, by widening the `selected_attributes` allowlist),
+   the older versions must be removed. `TestRestampableToCurrent` pins the
+   literal membership so this cannot pass unnoticed.
 
 ---
 
@@ -428,7 +437,20 @@ fields mean** — it changes how a record is written, never what it asserts:
 | Anything else, including a version newer than the binary | **Not** re-stamped — this binary cannot vouch for a format it does not implement, which is what a rollback leaves behind. Sealed at its stored version, and logged at Error. |
 
 A trace held at its stored version is sealed immediately rather than left open,
-so a span stamped with the current version cannot join it.
+and stays closed for the life of the process, so a span stamped with the current
+version cannot join it or start a second chain under the same `trace_id`.
+
+**A replayed trace spanning more than one stored version is dropped**, loudly, at
+Error, naming the `trace_id` and the versions found. Two crash-and-upgrade cycles
+on one in-flight trace can produce this. A chain carries exactly one
+`schema_version`, so no single-version chain can represent such a trace, and
+emitting a mixed one would produce an audit log that fails its own verification —
+a logged gap is the better failure. Its WAL entries are marked sealed so it does
+not replay on every subsequent restart.
+
+The same applies to a record whose `schema_version` cannot seed a chain at all
+(empty, as a corrupt WAL line decodes to): it is dropped with an Error rather
+than retried forever.
 
 Already-sealed logs are a different matter: never hand-edit a v2 log into v3
 form. Those records have been hashed and signed, so changing their canonical

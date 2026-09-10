@@ -495,3 +495,36 @@ func TestUnixNano_MarshalJSONAllocatesOnce(t *testing.T) {
 		t.Errorf("MarshalJSON allocations per call: got %v, want at most 1", got)
 	}
 }
+
+// TestRestampableToCurrent pins the membership of a set that is a curated claim
+// rather than a frozen fact. Each entry asserts "data-compatible with
+// SchemaVersion" — a claim relative to a constant that moves, so bumping
+// SchemaVersion silently re-asserts every entry against a version nobody
+// re-examined. Nothing else catches that: with SchemaVersion bumped and this set
+// left alone, only the golden fixtures fail, and re-minting them is a step the
+// bump requires anyway.
+//
+// Asserting the literal membership forces a bump author to edit this test
+// deliberately, at which point the question "is v3 data still compatible with
+// v4?" has to be answered rather than assumed. See the schema-bump checklist in
+// docs/audit-record-schema.md §1.
+func TestRestampableToCurrent(t *testing.T) {
+	for _, v := range []string{"v2", "v3"} {
+		if !RestampableToCurrent(v) {
+			t.Errorf("RestampableToCurrent(%q) = false, want true", v)
+		}
+	}
+	// v1 must never be restampable: v2 widened attributeAllowlist, so a v1
+	// record's selected_attributes were captured under narrower rules.
+	for _, v := range []string{"v1", "v99", "v4", "", "V2", "v2 "} {
+		if RestampableToCurrent(v) {
+			t.Errorf("RestampableToCurrent(%q) = true, want false", v)
+		}
+	}
+	// The current version is trivially compatible with itself; a bump that
+	// leaves it out of the set has not been thought through.
+	if !RestampableToCurrent(SchemaVersion) {
+		t.Errorf("the current SchemaVersion %q must be in restampableToCurrent — "+
+			"re-evaluate every other member of the set at the same time", SchemaVersion)
+	}
+}
