@@ -14,8 +14,11 @@
 //
 // WAL: in-progress trace buffers are backed by a write-ahead log so a collector
 // restart does not introduce spurious gaps. Sealed traces are excluded from
-// Replay. Compact is run on Start (after Replay) and after each seal to
-// prevent unbounded WAL growth.
+// Replay's in-progress buffers, but a sealed trace not yet covered by a durable
+// checkpoint has its tip carried forward via Replay's sealedPending result and
+// restored directly to the accumulator, without re-sealing — see
+// wal.WAL.Compact. Compact is run on Start (after Replay) and after each seal
+// to prevent unbounded WAL growth.
 package agentauditexporter
 
 import (
@@ -307,8 +310,10 @@ func (e *agentAuditExporter) Start(_ context.Context, _ component.Host) error {
 	}
 	e.wal = w
 
-	// Replay WAL to rehydrate in-progress buffers.
-	replayed, err := w.Replay()
+	// Replay WAL to rehydrate in-progress buffers, plus any sealed trace's tip
+	// that must be restored to the accumulator below (see the accumulator
+	// construction and its rehydration loop, further down).
+	replayed, sealedPending, err := w.Replay()
 	if err != nil {
 		_ = logF.Close()
 		_ = checkF.Close()
@@ -450,13 +455,13 @@ func (e *agentAuditExporter) Start(_ context.Context, _ component.Host) error {
 		}
 	}
 
-	// Compact WAL after replay to remove any sealed entries from before the crash.
-	if err := w.Compact(); err != nil {
-		e.logger.Warn("agentaudit: WAL compact after replay failed", zap.Error(err))
-	}
-
 	// Reload seq and prevHash from the last persisted checkpoint so the chain
 	// continues correctly across restarts instead of resetting to seq=1.
+	//
+	// This must happen BEFORE the post-replay Compact below: Compact needs the
+	// accumulator's pending set to decide which sealed-but-uncheckpointed WAL
+	// markers are still owed a checkpoint, and sealedPending is rehydrated into
+	// the accumulator right after it is constructed.
 	initialSeq := uint64(0)
 	prevHash := chain.ZeroPrevCheckpointHash
 	if lastCP, ok, cpErr := readLastCheckpoint(e.cfg.CheckpointPath); ok {
@@ -477,6 +482,24 @@ func (e *agentAuditExporter) Start(_ context.Context, _ component.Host) error {
 		e.logger.Warn("agentaudit: could not read last checkpoint on restart", zap.Error(cpErr))
 	}
 	e.accumulator = chain.NewAccumulator(e.signer, initialSeq, prevHash)
+
+	// Re-add tips for traces that were fully sealed to the audit log (and
+	// WAL-marked sealed) but never covered by a durable checkpoint before the
+	// process stopped. Their log entries are already on disk, so this must NOT
+	// re-seal them — only restore the pending tip so the next checkpoint covers
+	// it, the same as if the process had never stopped. See issue #22.
+	for _, tip := range sealedPending {
+		e.accumulator.AddTip(tip.TraceID, tip.TipHash, tip.EntryCount)
+	}
+
+	// Compact WAL after replay to remove any sealed entries from before the
+	// crash whose tip is already durably checkpoint-committed (or was never
+	// added to the accumulator at all, e.g. a quarantined trace). Sealed
+	// markers for the tips just re-added above are retained so a further crash
+	// before the next checkpoint does not lose them again.
+	if err := w.Compact(e.accumulator.PendingTips()); err != nil {
+		e.logger.Warn("agentaudit: WAL compact after replay failed", zap.Error(err))
+	}
 
 	// Seal the traces that must keep their stored schema version, now that the
 	// accumulator sealTrace adds tips to exists. Sealing here costs them the
@@ -623,7 +646,7 @@ func (e *agentAuditExporter) Shutdown(ctx context.Context) error {
 		e.checkFile = nil
 	}
 	if e.wal != nil {
-		if err := e.wal.Compact(); err != nil {
+		if err := e.wal.Compact(e.accumulator.PendingTips()); err != nil {
 			e.logger.Warn("agentaudit: final WAL compact failed", zap.Error(err))
 		} else {
 			// No concurrent goroutines remain at this point (compactWG drained,
@@ -853,6 +876,16 @@ func (e *agentAuditExporter) sealTrace(traceID string, buf *traceBuffer, checkpo
 		}
 	}
 
+	// tipHash is computed regardless of checkpointPoisoned: Step 7 below always
+	// carries it into the WAL's sealed marker, so that if this trace ends up
+	// pending (added to the accumulator, not yet checkpoint-committed), a crash
+	// before the next successful checkpoint does not lose its coverage. A trace
+	// that is never added to the accumulator (poisoned, quarantined, unsealable)
+	// is never pending, so sealedMarkerTip below writes an empty marker for it
+	// immediately, the same as Compact would otherwise drop it on its next
+	// pass — see wal.Compact and sealedMarkerTip.
+	tipHash := chain.TipHash(entries)
+
 	// Step 5: update accumulator.
 	//
 	// Once checkpointing is permanently disabled there is nothing a tip can ever
@@ -862,7 +895,6 @@ func (e *agentAuditExporter) sealTrace(traceID string, buf *traceBuffer, checkpo
 	if e.checkpointPoisoned {
 		e.uncoveredAfterPoison++
 	} else {
-		tipHash := chain.TipHash(entries)
 		e.accumulator.AddTip(traceID, tipHash, len(entries))
 
 		// A sustained but rollback-able checkpoint write failure keeps every tip
@@ -900,9 +932,11 @@ func (e *agentAuditExporter) sealTrace(traceID string, buf *traceBuffer, checkpo
 		}
 	}
 
-	// Step 7: mark WAL sealed (calls Sync).
+	// Step 7: mark WAL sealed (calls Sync), carrying the tip so Compact below
+	// can retain it if the trace is still pending a checkpoint.
 	if e.wal != nil {
-		if err := e.wal.MarkSealed(traceID); err != nil {
+		sealTipHash, sealEntryCount := sealedMarkerTip(e.accumulator, traceID, tipHash, len(entries))
+		if err := e.wal.MarkSealed(traceID, sealTipHash, sealEntryCount); err != nil {
 			e.logger.Error("agentaudit: WAL mark sealed",
 				zap.String("trace_id", traceID), zap.Error(err))
 		}
@@ -915,9 +949,10 @@ func (e *agentAuditExporter) sealTrace(traceID string, buf *traceBuffer, checkpo
 	if e.wal != nil {
 		e.compactWG.Add(1)
 		w := e.wal
+		acc := e.accumulator
 		go func() {
 			defer e.compactWG.Done()
-			if err := w.Compact(); err != nil {
+			if err := w.Compact(acc.PendingTips()); err != nil {
 				e.logger.Warn("agentaudit: background WAL compact failed", zap.Error(err))
 				return
 			}
@@ -1019,17 +1054,38 @@ func (e *agentAuditExporter) quarantineRecords(traceID string, recs []record.Aud
 	return written
 }
 
+// sealedMarkerTip decides what tip payload sealTrace's Step 7 should carry
+// into the WAL's sealed marker: the trace's own tip if it is still awaiting a
+// checkpoint, or an empty marker otherwise. "Otherwise" covers two distinct
+// cases identically: Step 6's checkpoint attempt already committed this exact
+// tip inline on this same seal (the ordinary, common case — see the crash
+// window this closes at exporter.go's sealTrace Step 7), or the trace was
+// never added to the accumulator at all (checkpointPoisoned, quarantined,
+// unsealable — acc.PendingTips()[traceID] is then absent and the lookup is a
+// safe nil-map read). Either way carrying the stale tipHash forward would let
+// a crash before Step 8's Compact resurrect a tip that must not come back:
+// already durably covered in the first case, permanently uncoverable in the
+// second.
+func sealedMarkerTip(acc *chain.Accumulator, traceID, tipHash string, entryCount int) (string, int) {
+	if _, stillPending := acc.PendingTips()[traceID][tipHash]; !stillPending {
+		return "", 0
+	}
+	return tipHash, entryCount
+}
+
 // markWALSealed marks traceID sealed in the WAL, logging rather than returning
 // a failure. Called on the paths where a trace has been removed from the
 // buffers but no chain could be written for it: without this its records
 // replay on every restart, since Compact only drops entries for sealed traces.
+// No tip is carried — these traces (quarantined or unsealable) are never added
+// to the accumulator, so Compact drops the marker on its next pass regardless.
 // Called either under e.mu, or from Start before the goroutine that contends
 // for it exists.
 func (e *agentAuditExporter) markWALSealed(traceID string) {
 	if e.wal == nil {
 		return
 	}
-	if err := e.wal.MarkSealed(traceID); err != nil {
+	if err := e.wal.MarkSealed(traceID, "", 0); err != nil {
 		e.logger.Warn("agentaudit: WAL mark sealed failed",
 			zap.String("trace_id", traceID), zap.Error(err))
 	}

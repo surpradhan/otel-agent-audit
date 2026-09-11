@@ -95,6 +95,38 @@ func (a *Accumulator) PendingCount() int {
 	return len(a.pending)
 }
 
+// PendingTips returns, for each trace ID with a tip currently awaiting a
+// checkpoint, the set of tip hashes still pending for it. A single trace_id
+// can legitimately hold more than one entry here: a re-delivered root span for
+// an already-sealed trace_id starts an independent second chain once the
+// exporter's re-seal guard has cleared (duplicate_trace_segment), producing a
+// second tip before either one has settled. Identity is therefore tracked per
+// (trace_id, tip_hash), not per trace_id alone — collapsing to trace_id would
+// make one tip's settlement (commit or deliberate abandonment) look like the
+// other tip's too, since both share the same key.
+//
+// A given (trace_id, tip_hash) pair leaves this set only by a Commit that
+// covers it or by a deliberate abandonment (TrimPending, DropPending) — both
+// settle its fate for good, so the WAL uses this to decide which sealed-trace
+// markers must still be retained across a Compact to survive a crash before
+// the next checkpoint. Compact's per-call cost scales with how many tips are
+// pending — bounded by the same MaxPendingTips cap that already bounds
+// Accumulator.pending during a sustained checkpoint outage.
+func (a *Accumulator) PendingTips() map[string]map[string]struct{} {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	out := make(map[string]map[string]struct{}, len(a.pending))
+	for _, tip := range a.pending {
+		hashes := out[tip.TraceID]
+		if hashes == nil {
+			hashes = make(map[string]struct{}, 1)
+			out[tip.TraceID] = hashes
+		}
+		hashes[tip.TipHash] = struct{}{}
+	}
+	return out
+}
+
 // DropPending discards every pending tip and returns how many were dropped.
 // seq and prevHash are left untouched, so the persisted chain is unaffected and
 // remains verifiable; only the coverage of those traces is given up.

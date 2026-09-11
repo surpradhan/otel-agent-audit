@@ -29,6 +29,7 @@ import (
 	"github.com/surpradhan/otel-agent-audit/exporter/agentauditexporter/internal/record"
 	"github.com/surpradhan/otel-agent-audit/exporter/agentauditexporter/internal/sign"
 	"github.com/surpradhan/otel-agent-audit/exporter/agentauditexporter/internal/verify"
+	"github.com/surpradhan/otel-agent-audit/exporter/agentauditexporter/internal/wal"
 )
 
 // testSetup sets up a full test environment: writes a key, returns Config and pub key.
@@ -1952,6 +1953,305 @@ func TestCheckpointWriteFailure_RetriesTipsAndKeepsChainContiguous(t *testing.T)
 	if len(report.Errors) != 0 {
 		t.Errorf("expected no verifier errors; got %v", report.Errors)
 	}
+}
+
+// TestRestart_AfterCheckpointFailureRecoversTipWithoutDuplicating is the
+// acceptance test for the gap where sealTrace ran WAL.MarkSealed and scheduled
+// WAL.Compact regardless of whether that same call's checkpoint attempt
+// actually covered the tip. A crash before the next successful checkpoint
+// then lost the trace's coverage forever: its entries stayed durably in the
+// audit log, but the WAL no longer remembered the trace existed, so no future
+// checkpoint could ever claim it either. The naive fix — skip MarkSealed when
+// the checkpoint fails — was rejected because it replays the trace and
+// duplicates its already-durable log entries; this test pins both halves of
+// the contract at once.
+//
+// It fails the checkpoint write, seals a trace under that failure, crashes
+// without a clean shutdown, restarts, and asserts: the trace's tip is
+// restored to the accumulator, a subsequent checkpoint after restart covers
+// it, no log entries were duplicated, and VerifyLog is clean.
+func TestRestart_AfterCheckpointFailureRecoversTipWithoutDuplicating(t *testing.T) {
+	env := newTestEnv(t)
+	cfg := env.cfg
+	cfg.CheckpointInterval = 1 // attempt a checkpoint on every sealed trace
+
+	exp1 := startExporter(t, cfg)
+
+	// Make the checkpoint write fail, the same way
+	// TestCheckpointWriteFailure_RetriesTipsAndKeepsChainContiguous does.
+	exp1.mu.Lock()
+	closeErr := exp1.checkFile.Close()
+	exp1.mu.Unlock()
+	if closeErr != nil {
+		t.Fatalf("closing checkpoint file: %v", closeErr)
+	}
+
+	traceA := [16]byte{0xA1}
+	if err := exp1.ConsumeTraces(context.Background(),
+		makeSpan(traceA, [8]byte{0x01}, zeroParentID, "op-a", 1_000_000, 2_000_000)); err != nil {
+		t.Fatalf("ConsumeTraces A: %v", err)
+	}
+
+	// Sanity check the premise: the checkpoint write failed, so the tip is
+	// only pending in memory and nothing durable covers it yet.
+	if got := exp1.accumulator.PendingCount(); got != 1 {
+		t.Fatalf("pending tips before crash: got %d, want 1", got)
+	}
+	if got := len(readCheckpoints(t, cfg.CheckpointPath)); got != 0 {
+		t.Fatalf("persisted checkpoints before crash: got %d, want 0", got)
+	}
+
+	// Crash simulation: stop the background goroutine and close every file
+	// directly, WITHOUT going through Shutdown's force-seal-and-checkpoint path.
+	close(exp1.stopCh)
+	<-exp1.doneCh
+	if exp1.logFile != nil {
+		_ = exp1.logFile.Close()
+	}
+	if exp1.checkFile != nil {
+		_ = exp1.checkFile.Close()
+	}
+	if exp1.wal != nil {
+		_ = exp1.wal.Close()
+	}
+
+	// Restart against the same paths.
+	exp2 := startExporter(t, cfg)
+
+	// The crashed trace's tip must have survived the restart: before the fix,
+	// sealedPending had no way to reach the new accumulator and this was 0.
+	if got := exp2.accumulator.PendingCount(); got != 1 {
+		t.Fatalf("pending tips after restart: got %d, want 1 (trace A's tip must survive the crash)", got)
+	}
+
+	// Seal a second trace against a healthy checkpoint file; with
+	// CheckpointInterval=1 this checkpoint should succeed and cover both
+	// the rehydrated tip and the new trace.
+	traceB := [16]byte{0xB2}
+	if err := exp2.ConsumeTraces(context.Background(),
+		makeSpan(traceB, [8]byte{0x02}, zeroParentID, "op-b", 3_000_000, 4_000_000)); err != nil {
+		t.Fatalf("ConsumeTraces B: %v", err)
+	}
+	if err := exp2.Shutdown(context.Background()); err != nil {
+		t.Fatalf("Shutdown: %v", err)
+	}
+
+	cps := readCheckpoints(t, cfg.CheckpointPath)
+	if len(cps) != 1 {
+		t.Fatalf("expected exactly 1 persisted checkpoint, got %d", len(cps))
+	}
+	covered := make(map[string]bool, len(cps[0].TraceTips))
+	for _, tip := range cps[0].TraceTips {
+		covered[tip.TraceID] = true
+	}
+	traceAHex := hex.EncodeToString(traceA[:])
+	traceBHex := hex.EncodeToString(traceB[:])
+	for _, want := range []string{traceAHex, traceBHex} {
+		if !covered[want] {
+			t.Errorf("trace %s not covered by the post-restart checkpoint (tip lost)", want)
+		}
+	}
+
+	// No duplicate log entries: trace A's entries were written before the
+	// crash and must not be re-sealed on replay.
+	entries := readLogEntries(t, cfg.LogPath)
+	if len(entries) != 2 {
+		t.Fatalf("expected exactly 2 log entries (1 per trace, no duplicates), got %d", len(entries))
+	}
+	byTrace := map[string]int{}
+	for _, e := range entries {
+		byTrace[e.Record.TraceID]++
+	}
+	if byTrace[traceAHex] != 1 {
+		t.Errorf("trace A log entry count: got %d, want 1 (no duplicate reseal)", byTrace[traceAHex])
+	}
+	if byTrace[traceBHex] != 1 {
+		t.Errorf("trace B log entry count: got %d, want 1", byTrace[traceBHex])
+	}
+
+	report, err := verify.VerifyLog(cfg.LogPath, cfg.CheckpointPath, env.pubKey)
+	if err != nil {
+		t.Fatalf("VerifyLog: %v", err)
+	}
+	if len(report.Errors) != 0 {
+		t.Errorf("expected no verifier errors; got %v", report.Errors)
+	}
+}
+
+// TestRestart_SecondSegmentSpanSurvivesCrashAfterRetainedEarlierMarker covers
+// a gap the tip-retention fix above opened: once WAL.Compact can retain a
+// sealed marker while its tip is pending, sealedTraces still clears in full
+// on that same successful Compact (see sealTrace's step 8), so a
+// duplicate_trace_segment re-seal of the SAME trace_id can start buffering a
+// second, independent segment while the first segment's marker is still in
+// the WAL. wal.Replay's internal sealed-trace latch used to treat any span
+// entry for a trace_id as belonging to whichever segment it saw sealed
+// first, so the second segment's still-open span would be silently excluded
+// from the replayed buffers after a crash — lost with no verifier signal at
+// all, unlike the accepted duplicate_trace_segment trade-off in
+// docs/threat-model.md §5, which assumes the second segment eventually
+// completes and gets flagged.
+//
+// This seals segment 1, lets its Compact clear sealedTraces, buffers a
+// non-root child span for a duplicate second segment (left open, not
+// sealed), crashes without a clean shutdown, and restarts: both segment 1's
+// tip AND segment 2's in-progress span must survive.
+func TestRestart_SecondSegmentSpanSurvivesCrashAfterRetainedEarlierMarker(t *testing.T) {
+	env := newTestEnv(t)
+	cfg := env.cfg
+	cfg.CheckpointInterval = 1000 // large enough that sealing segment 1 alone does not trigger a checkpoint
+
+	exp1 := startExporter(t, cfg)
+
+	traceID := [16]byte{0xC1}
+
+	// Segment 1 seals via its root span. Its tip stays pending (checkpoint
+	// interval is large), so the Compact this dispatches retains its marker.
+	if err := exp1.ConsumeTraces(context.Background(),
+		makeSpan(traceID, [8]byte{0x01}, zeroParentID, "seg1-root", 1_000_000, 2_000_000)); err != nil {
+		t.Fatalf("ConsumeTraces (segment 1 root): %v", err)
+	}
+	exp1.compactWG.Wait() // let sealedTraces clear so the re-delivered root below reseals rather than being dropped
+
+	if got := exp1.accumulator.PendingCount(); got != 1 {
+		t.Fatalf("pending tips after segment 1 seal: got %d, want 1", got)
+	}
+
+	// A duplicate_trace_segment: a non-root child arrives for the SAME
+	// trace_id. sealedTraces no longer guards it, so it is buffered as the
+	// start of an independent second segment rather than dropped. It is
+	// deliberately left open (no root span) so it is still in-progress, not
+	// yet sealed, at crash time.
+	if err := exp1.ConsumeTraces(context.Background(),
+		makeSpan(traceID, [8]byte{0x02}, [8]byte{0x01}, "seg2-child", 3_000_000, 4_000_000)); err != nil {
+		t.Fatalf("ConsumeTraces (segment 2 child): %v", err)
+	}
+	exp1.mu.Lock()
+	_, buffered := exp1.buffers[pcommon.TraceID(traceID).String()]
+	exp1.mu.Unlock()
+	if !buffered {
+		t.Fatal("segment 2's child span must be buffered as in-progress before the crash, not dropped")
+	}
+
+	// Crash simulation: stop the background goroutine and close every file
+	// directly, WITHOUT going through Shutdown's force-seal-and-checkpoint path.
+	close(exp1.stopCh)
+	<-exp1.doneCh
+	if exp1.logFile != nil {
+		_ = exp1.logFile.Close()
+	}
+	if exp1.checkFile != nil {
+		_ = exp1.checkFile.Close()
+	}
+	if exp1.wal != nil {
+		_ = exp1.wal.Close()
+	}
+
+	// Restart against the same paths.
+	exp2 := startExporter(t, cfg)
+	defer func() { _ = exp2.Shutdown(context.Background()) }()
+
+	if got := exp2.accumulator.PendingCount(); got != 1 {
+		t.Fatalf("pending tips after restart: got %d, want 1 (segment 1's tip must survive)", got)
+	}
+	exp2.mu.Lock()
+	recs, ok := exp2.buffers[pcommon.TraceID(traceID).String()]
+	exp2.mu.Unlock()
+	if !ok || len(recs.records) != 1 {
+		t.Fatalf("segment 2's in-progress span after restart: got present=%v records=%+v, "+
+			"want it recovered as an open buffer, not silently dropped as if it belonged to sealed segment 1",
+			ok, recs)
+	}
+}
+
+// TestSealedMarkerTip exercises sealedMarkerTip directly — the real function
+// sealTrace's Step 7 calls, not a copy of its logic — against the real
+// chain.Accumulator, covering both cases where Step 7 must not carry the tip
+// forward: an inline-committed checkpoint, and a trace never added to the
+// accumulator at all (checkpointPoisoned, quarantined, unsealable).
+//
+// This still cannot exercise sealTrace's own call to sealedMarkerTip through
+// the live exporter: the bug this closes is only observable in the narrow
+// window between Step 7's fsynced WAL write and Step 8's async Compact
+// completing, and Compact reads PendingTips() live, so it heals a stale
+// marker exactly as well as sealedMarkerTip writing an empty one from the
+// start would have — the two are indistinguishable by anything checked after
+// Step 8 completes. Racing that goroutine from a black-box test to land
+// inside the window is exactly the non-determinism this file already works
+// around elsewhere via compactWG.Wait() (see TestSealedTraces_EvictedAfterCompact)
+// — and unlike that case, there is no wait-based fix here, since waiting for
+// Step 8 is precisely what erases the difference this test exists to catch.
+// Calling the real sealedMarkerTip (rather than copying its body inline, as
+// an earlier version of this test did) at least means a regression inside
+// that function is still caught; only "sealTrace stopped calling it" would
+// not be.
+func TestSealedMarkerTip(t *testing.T) {
+	priv, _, err := sign.GenerateEd25519Key()
+	if err != nil {
+		t.Fatalf("GenerateEd25519Key: %v", err)
+	}
+
+	t.Run("inline_committed_checkpoint", func(t *testing.T) {
+		acc := chain.NewAccumulator(sign.NewEd25519Signer(priv), 0, chain.ZeroPrevCheckpointHash)
+		const traceID = "01010101010101010101010101010101"
+		const tipHash = "deadbeef"
+
+		// Step 5.
+		acc.AddTip(traceID, tipHash, 1)
+
+		// Step 6, standing in for writeCheckpoint succeeding inline on this
+		// same seal: Stage+Commit removes the tip from pending before Step 7
+		// runs.
+		st, err := acc.Stage(time.Now())
+		if err != nil {
+			t.Fatalf("Stage: %v", err)
+		}
+		if err := acc.Commit(st); err != nil {
+			t.Fatalf("Commit: %v", err)
+		}
+		if got := acc.PendingCount(); got != 0 {
+			t.Fatalf("PendingCount after inline commit: got %d, want 0", got)
+		}
+
+		sealTipHash, sealEntryCount := sealedMarkerTip(acc, traceID, tipHash, 1)
+		if sealTipHash != "" || sealEntryCount != 0 {
+			t.Fatalf("sealedMarkerTip = (%q, %d), want (\"\", 0) — Step 6 already committed this "+
+				"tip inline; carrying it forward would resurrect it as pending after a crash before "+
+				"Step 8's Compact runs", sealTipHash, sealEntryCount)
+		}
+
+		// Confirm this actually matters at the WAL layer: MarkSealed with the
+		// re-checked values must not surface as a restorable pending tip.
+		w, err := wal.Open(filepath.Join(t.TempDir(), "test.wal"))
+		if err != nil {
+			t.Fatalf("wal.Open: %v", err)
+		}
+		defer func() { _ = w.Close() }()
+		if err := w.MarkSealed(traceID, sealTipHash, sealEntryCount); err != nil {
+			t.Fatalf("MarkSealed: %v", err)
+		}
+		_, sealedPending, err := w.Replay()
+		if err != nil {
+			t.Fatalf("Replay: %v", err)
+		}
+		if len(sealedPending) != 0 {
+			t.Errorf("sealedPending after replay = %+v, want none — the tip was already checkpoint-committed", sealedPending)
+		}
+	})
+
+	t.Run("never_added_to_accumulator", func(t *testing.T) {
+		// Mirrors the checkpointPoisoned (and quarantined/unsealable) path:
+		// AddTip is skipped entirely, so the trace was never pending in the
+		// first place.
+		acc := chain.NewAccumulator(sign.NewEd25519Signer(priv), 0, chain.ZeroPrevCheckpointHash)
+		const traceID = "02020202020202020202020202020202"
+
+		sealTipHash, sealEntryCount := sealedMarkerTip(acc, traceID, "somehash", 3)
+		if sealTipHash != "" || sealEntryCount != 0 {
+			t.Errorf("sealedMarkerTip = (%q, %d), want (\"\", 0) for a trace never added to the accumulator",
+				sealTipHash, sealEntryCount)
+		}
+	})
 }
 
 // TestCheckpointSyncFailure_RollsBackAndRetriesTips covers the other half of the
