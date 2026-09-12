@@ -1122,6 +1122,15 @@ func (e *agentAuditExporter) quarantineRecords(traceID string, recs []record.Aud
 	}
 	defer func() { _ = f.Close() }()
 
+	// Unlike the audit log, checkpoint file, and WAL — created eagerly at a
+	// single point in Start — this file is created lazily, on whichever call
+	// first fails to seal a trace. There is no "start of day" to hook a
+	// one-time fsync into, so it is repeated on every call instead: cheap and
+	// idempotent once the directory entry is already durable, and the only
+	// way to cover the actual first-creation run without tracking extra state
+	// to detect it. See issue #33.
+	e.warnIfParentDirSyncFails("quarantine sidecar", path)
+
 	written := 0
 	for _, spanID := range spanIDs {
 		line, err := json.Marshal(quarantineEntry{

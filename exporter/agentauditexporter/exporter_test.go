@@ -4381,6 +4381,83 @@ func TestQuarantine_TornTrailingLineIsRepaired(t *testing.T) {
 	}
 }
 
+// TestQuarantine_ParentDirSyncFailureIsNonFatal verifies that quarantineRecords
+// logs and continues, rather than dropping the record, when the quarantine
+// sidecar's parent directory cannot be fsynced (e.g. a restrictive directory
+// mode) — the same non-fatal treatment TestStart_ParentDirSyncFailureIsNonFatal
+// already covers for the audit log, checkpoint file, and WAL. Unlike those
+// three (created eagerly at a single point in Start), the sidecar is created
+// lazily here, on the first unsealable record, exercising
+// warnIfParentDirSyncFails's other call site. See issue #33.
+//
+// Uses TWO independently-unsealable traces, not one, and asserts the warning
+// fires at least twice: the fix deliberately re-syncs on every
+// quarantineRecords call rather than only a detected first creation (see the
+// comment at its call site), and a single-event test cannot distinguish that
+// from a regression to a first-call-only guard — both would pass with only
+// one trace to quarantine.
+func TestQuarantine_ParentDirSyncFailureIsNonFatal(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("directory permission bits do not model this on Windows")
+	}
+	if os.Geteuid() == 0 {
+		t.Skip("running as root: directory read permission is not enforced")
+	}
+
+	env := newTestEnv(t)
+	restricted := filepath.Join(t.TempDir(), "restricted")
+	if err := os.Mkdir(restricted, 0700); err != nil {
+		t.Fatalf("Mkdir: %v", err)
+	}
+	env.cfg.WalPath = filepath.Join(restricted, "wal.jsonl")
+	quarantinePath := env.cfg.WalPath + quarantineSuffix
+
+	// An empty parent_span_id marks each a root span, so WAL replay seals
+	// (and, with an empty schema_version, immediately quarantines) both
+	// synchronously during Start — same technique as
+	// TestSealTrace_UnsealableRecordsAreQuarantined, doubled.
+	const traceID1 = "01010101010101010101010101010101"
+	const traceID2 = "02020202020202020202020202020202"
+	walLines := legacyWALLine("", traceID1, "0102030405060708", "", "corrupt.root.1") +
+		legacyWALLine("", traceID2, "0203040506070809", "", "corrupt.root.2")
+	if err := os.WriteFile(env.cfg.WalPath, []byte(walLines), 0600); err != nil {
+		t.Fatalf("writing WAL: %v", err)
+	}
+
+	// Write+execute lets OpenFile create the sidecar inside restricted; no
+	// read bit means opening restricted itself (to fsync it) fails — same
+	// technique as TestStart_ParentDirSyncFailureIsNonFatal.
+	if err := os.Chmod(restricted, 0300); err != nil {
+		t.Fatalf("Chmod: %v", err)
+	}
+	t.Cleanup(func() { _ = os.Chmod(restricted, 0700) })
+
+	core, logs := observer.New(zap.WarnLevel)
+	exp := newAgentAuditExporter(env.cfg, zap.New(core))
+	if err := exp.Start(context.Background(), nil); err != nil {
+		t.Fatalf("Start should tolerate a parent-dir sync failure, got: %v", err)
+	}
+	if err := exp.Shutdown(context.Background()); err != nil {
+		t.Fatalf("Shutdown: %v", err)
+	}
+
+	if got := logs.FilterMessageSnippet("quarantine sidecar").Len(); got < 2 {
+		t.Errorf("expected the quarantine-sidecar parent-dir warning at least twice (once per quarantine event), got %d: %v", got, logs.All())
+	}
+
+	// Both quarantine writes must still have succeeded — the sync failure is
+	// a hardening step, not a reason to deny the write.
+	quarantined, err := os.ReadFile(quarantinePath)
+	if err != nil {
+		t.Fatalf("reading quarantine sidecar: %v", err)
+	}
+	for _, name := range []string{"corrupt.root.1", "corrupt.root.2"} {
+		if !bytes.Contains(quarantined, []byte(`"span_name":"`+name+`"`)) {
+			t.Errorf("expected %q still quarantined despite the parent-dir sync failure:\n%s", name, quarantined)
+		}
+	}
+}
+
 // TestConfig_Validate_QuarantineSidecarCollision covers the one audit path that
 // is derived rather than configured. Config.Validate already requires log_path,
 // wal_path and checkpoint_path to be distinct, but the quarantine sidecar is
