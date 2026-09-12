@@ -168,6 +168,39 @@ every span for that `trace_id` as settled the moment any marker for it is
 seen, so the later segment's in-progress spans are never mistaken for the
 earlier segment's and silently dropped.
 
+### 3e. Parent-directory durability on first file creation
+
+`fsync` on a file's descriptor makes its *data* durable; it says nothing about
+the *directory entry* that names the file. The first time the audit log,
+checkpoint file, or WAL is created at a given path, that directory entry is
+not itself durable until the containing directory is also fsynced — so a
+crash between file creation and that directory fsync can lose the file
+entirely, even though every byte written to it was separately synced.
+
+`Start` fsyncs each file's parent directory immediately after creating it, for
+the audit log, the checkpoint file, and the WAL. The sync is best-effort: if
+it fails — directory fsync is not supported on every platform, notably
+Windows — `Start` logs a warning and continues rather than refusing to start
+over a hardening step, unlike a failure to open or write the file itself,
+which is fatal. This only matters for a path's first-ever run; every
+subsequent restart reopens an already-durable directory entry. See issue #23.
+
+This repo's CI runs `ubuntu-latest` only, so whether directory fsync actually
+fails on Windows is unverified — if it does, every `Start` there logs one
+warning per file, indefinitely, with no operator remedy. That trade-off is
+deliberate rather than special-cased away: guessing wrong on `runtime.GOOS`
+without evidence would trade a real durability improvement on an entire
+platform for an assumed one.
+
+**What this does not change:** the quarantine sidecar (the WAL path's sibling
+`*.quarantine.jsonl` file) is created lazily, on the first record that cannot
+be sealed into a chain, rather than at `Start`. It has the same gap on its own
+first-creation run; tracked separately as issue #33 rather than folded in here,
+since there is no single fixed point in `Start` to hook a lazily-created
+file's fix into. `WAL.Compact`'s atomic rename over the live WAL file has the
+same directory-durability property on an ongoing operation rather than a
+first creation — a related but distinct gap, tracked as issue #36.
+
 ---
 
 ## 4. Single-replica constraint

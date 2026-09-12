@@ -32,6 +32,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"path/filepath"
 	"sort"
 	"sync"
 	"time"
@@ -292,6 +293,7 @@ func (e *agentAuditExporter) Start(_ context.Context, _ component.Host) error {
 		return fmt.Errorf("agentaudit: opening audit log %q: %w", e.cfg.LogPath, err)
 	}
 	e.logFile = logF
+	e.warnIfParentDirSyncFails("audit log", e.cfg.LogPath)
 
 	// Open checkpoint file.
 	checkF, err := os.OpenFile(e.cfg.CheckpointPath, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0600)
@@ -300,6 +302,7 @@ func (e *agentAuditExporter) Start(_ context.Context, _ component.Host) error {
 		return fmt.Errorf("agentaudit: opening checkpoint file %q: %w", e.cfg.CheckpointPath, err)
 	}
 	e.checkFile = checkF
+	e.warnIfParentDirSyncFails("checkpoint file", e.cfg.CheckpointPath)
 
 	// Open WAL.
 	w, err := wal.Open(e.cfg.WalPath)
@@ -309,6 +312,7 @@ func (e *agentAuditExporter) Start(_ context.Context, _ component.Host) error {
 		return fmt.Errorf("agentaudit: opening WAL %q: %w", e.cfg.WalPath, err)
 	}
 	e.wal = w
+	e.warnIfParentDirSyncFails("WAL", e.cfg.WalPath)
 
 	// Replay WAL to rehydrate in-progress buffers, plus any sealed trace's tip
 	// that must be restored to the accumulator below (see the accumulator
@@ -1105,6 +1109,44 @@ func (e *agentAuditExporter) writeLogEntry(le chain.LogEntry) error {
 		return fmt.Errorf("agentaudit: write log entry: %w", err)
 	}
 	return nil
+}
+
+// syncParentDir fsyncs the directory containing path. A file's own contents
+// being fsynced does not make the directory entry that names it durable: on
+// the run that *creates* path, a crash before this returns can lose the file
+// entirely even though its data separately reached disk. See issue #23.
+//
+// Only the os.Open-fails branch is exercised by tests (TestSyncParentDir_
+// MissingParent, TestStart_ParentDirSyncFailureIsNonFatal); forcing Open to
+// succeed and the subsequent Sync to fail is not portably reachable from
+// package os without a fault-injection seam this package does not have, so
+// that branch's correctness rests on d.Sync() simply forwarding the OS error,
+// not on a dedicated test.
+//
+// This repo's CI (.github/workflows/ci.yml) runs ubuntu-latest only, so the
+// Windows behavior this comment describes is unverified: on a platform where
+// directory fsync is unsupported, every Start would log the warning below
+// once per file, forever, with no operator remedy. That's deliberately not
+// special-cased on runtime.GOOS without evidence — guessing wrong would trade
+// a real durability improvement on an entire platform for an assumed one.
+func syncParentDir(path string) error {
+	d, err := os.Open(filepath.Dir(path))
+	if err != nil {
+		return err
+	}
+	defer func() { _ = d.Close() }()
+	return d.Sync()
+}
+
+// warnIfParentDirSyncFails fsyncs path's parent directory, logging (rather
+// than failing Start) if that does not succeed — see syncParentDir. The what
+// parameter names the file for the log line, e.g. "audit log".
+func (e *agentAuditExporter) warnIfParentDirSyncFails(what, path string) {
+	if err := syncParentDir(path); err != nil {
+		e.logger.Warn("agentaudit: syncing "+what+"'s parent directory; "+
+			"a crash before this succeeds could lose a freshly created file",
+			zap.String("path", path), zap.Error(err))
+	}
 }
 
 // tornTailRepair reports what repairTrailingPartialLine did to a file.
