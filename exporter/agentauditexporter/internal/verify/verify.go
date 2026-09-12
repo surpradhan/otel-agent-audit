@@ -10,6 +10,7 @@ import (
 	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"sort"
@@ -34,6 +35,14 @@ type VerifyError struct {
 func (e VerifyError) Error() string {
 	return fmt.Sprintf("verify[%s]: %s: %s", e.TraceID, e.Kind, e.Detail)
 }
+
+// KindTornTrailingLine is the VerifyError.Kind for a torn final audit-log
+// line (see VerifyLog's doc comment). Exported as a constant, unlike this
+// package's other Kind strings, because it is the only one a caller outside
+// this package needs to pattern-match on today: the CLI's human-readable
+// output must label it differently from a checkpoint-level error, since both
+// share an empty TraceID (see cmd/otel-agent-audit-verify's errorLabel).
+const KindTornTrailingLine = "torn_trailing_line"
 
 // Report summarizes a VerifyLog run.
 // TracesProcessed and CheckpointsProcessed count all entries seen (including
@@ -207,12 +216,12 @@ func VerifyLog(logPath, checkpointPath string, pubKey ed25519.PublicKey) (Report
 			ids = append(ids, id)
 		}
 		sort.Strings(ids)
-		if tornTailDetail != "" {
-			return report, fmt.Errorf("multi-epoch log: %d distinct key_ids found; re-run per epoch with the matching key (found: %s); the final line was also unparseable: %s",
-				len(ids), strings.Join(ids, ", "), tornTailDetail)
-		}
-		return report, fmt.Errorf("multi-epoch log: %d distinct key_ids found; re-run per epoch with the matching key (found: %s)",
+		msg := fmt.Sprintf("multi-epoch log: %d distinct key_ids found; re-run per epoch with the matching key (found: %s)",
 			len(ids), strings.Join(ids, ", "))
+		if tornTailDetail != "" {
+			msg += fmt.Sprintf("; the final line was also unparseable: %s", tornTailDetail)
+		}
+		return report, errors.New(msg)
 	}
 
 	// Single key_id check: if the log has exactly one key_id and it doesn't
@@ -249,7 +258,7 @@ func VerifyLog(logPath, checkpointPath string, pubKey ed25519.PublicKey) (Report
 				report.CheckpointsProcessed++
 			}
 			if tornTailDetail != "" {
-				verifyErrs = append(verifyErrs, VerifyError{Kind: "torn_trailing_line", Detail: tornTailDetail})
+				verifyErrs = append(verifyErrs, VerifyError{Kind: KindTornTrailingLine, Detail: tornTailDetail})
 			}
 			report.Errors = verifyErrs
 			return report, nil
@@ -363,7 +372,7 @@ func VerifyLog(logPath, checkpointPath string, pubKey ed25519.PublicKey) (Report
 	}
 
 	if tornTailDetail != "" {
-		verifyErrs = append(verifyErrs, VerifyError{Kind: "torn_trailing_line", Detail: tornTailDetail})
+		verifyErrs = append(verifyErrs, VerifyError{Kind: KindTornTrailingLine, Detail: tornTailDetail})
 	}
 	report.Errors = verifyErrs
 	return report, nil

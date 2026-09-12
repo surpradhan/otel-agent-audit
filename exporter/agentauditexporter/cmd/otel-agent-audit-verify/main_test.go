@@ -32,7 +32,7 @@ func TestErrorLabel(t *testing.T) {
 		},
 		{
 			name: "torn trailing audit-log line",
-			err:  verify.VerifyError{TraceID: "", Kind: "torn_trailing_line"},
+			err:  verify.VerifyError{TraceID: "", Kind: verify.KindTornTrailingLine},
 			want: "audit log",
 		},
 	}

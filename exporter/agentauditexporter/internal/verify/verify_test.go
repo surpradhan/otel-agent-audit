@@ -477,7 +477,7 @@ func TestVerifyLog_PartialLastLogLine(t *testing.T) {
 		if e.Kind == "chain" {
 			t.Errorf("got misleading chain error for torn trailing line: %v", e)
 		}
-		if e.Kind == "torn_trailing_line" {
+		if e.Kind == verify.KindTornTrailingLine {
 			found = true
 		}
 	}
@@ -538,7 +538,7 @@ func TestVerifyLog_OnlyLogLineIsTorn(t *testing.T) {
 	var sawTornTail, sawEntryCountMismatch bool
 	for _, e := range report.Errors {
 		switch e.Kind {
-		case "torn_trailing_line":
+		case verify.KindTornTrailingLine:
 			sawTornTail = true
 		case "entry_count_mismatch":
 			sawEntryCountMismatch = true
@@ -583,7 +583,7 @@ func TestVerifyLog_WrongKeyWithTornTrailingLine(t *testing.T) {
 		switch e.Kind {
 		case "key_id_mismatch":
 			sawMismatch = true
-		case "torn_trailing_line":
+		case verify.KindTornTrailingLine:
 			sawTornTail = true
 		}
 	}

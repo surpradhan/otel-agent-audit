@@ -113,7 +113,7 @@ func errorLabel(e verify.VerifyError) string {
 	switch {
 	case e.TraceID != "":
 		return e.TraceID
-	case e.Kind == "torn_trailing_line":
+	case e.Kind == verify.KindTornTrailingLine:
 		return "audit log"
 	default:
 		return "checkpoint"
