@@ -192,14 +192,24 @@ deliberate rather than special-cased away: guessing wrong on `runtime.GOOS`
 without evidence would trade a real durability improvement on an entire
 platform for an assumed one.
 
-**What this does not change:** the quarantine sidecar (the WAL path's sibling
-`*.quarantine.jsonl` file) is created lazily, on the first record that cannot
-be sealed into a chain, rather than at `Start`. It has the same gap on its own
-first-creation run; tracked separately as issue #33 rather than folded in here,
-since there is no single fixed point in `Start` to hook a lazily-created
-file's fix into. `WAL.Compact`'s atomic rename over the live WAL file has the
-same directory-durability property on an ongoing operation rather than a
-first creation — a related but distinct gap, tracked as issue #36.
+**The quarantine sidecar** (the WAL path's sibling `*.quarantine.jsonl` file)
+is created lazily, on the first record that cannot be sealed into a chain,
+rather than at `Start` — so it was originally tracked as a separate gap
+(issue #33) rather than folded in here, since there is no single fixed point
+in `Start` to hook a lazily-created file's fix into. It gets the same
+best-effort parent-directory fsync, just applied differently: every call to
+`quarantineRecords` repeats it, rather than running once at a known
+first-creation point. Repeating it is deliberate, not a missed optimization —
+`os.OpenFile`'s `O_CREATE` doesn't report whether it just created the file or
+opened an existing one, so there is no cheap way to run this only on the
+actual first-creation call; fsyncing an already-durable directory on every
+later call is a harmless, idempotent no-op, and quarantine events are rare
+enough by design that the extra syscall per event is immaterial. See
+issue #33.
+
+**What this does not change:** `WAL.Compact`'s atomic rename over the live WAL
+file has the same directory-durability property on an ongoing operation rather
+than a first creation — a related but distinct gap, tracked as issue #36.
 
 ### 3f. Torn audit-log line within a single process lifetime
 
