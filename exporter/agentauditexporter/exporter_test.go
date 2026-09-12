@@ -5163,21 +5163,31 @@ func TestLogMultiSpanTrace_PoisonsRatherThanKeepFirstEntry_NewlineBoundaryFailur
 	}
 }
 
-// failWriteFileZeroBytes fails every targeted Write without writing anything
-// at all — a "clean" failure (e.g. ENOSPC before a single byte lands) that
-// leaves the file completely unchanged, unlike failWriteFile's half-written
-// fragment. Used to probe poisonLog's marker specifically: without it, this
-// failure shape leaves nothing at all for repairTrailingPartialLine or the
-// verifier to notice as torn, even though the trace is genuinely incomplete.
+// failWriteFileZeroBytes lets the first passThrough Write calls succeed
+// unmodified, then fails the next one without writing anything at all — a
+// "clean" failure (e.g. ENOSPC before a single byte lands) that leaves the
+// file completely unchanged by that call, unlike failWriteFile's half-written
+// fragment or failNthWriteFile's half-written targeted entry. Mirrors
+// failNthWriteFile's passThrough pattern (used elsewhere in this file) so a
+// specific entry — not just the first one the fake happens to see — can be
+// made to fail cleanly. Used to probe poisonLog's marker specifically:
+// without it, this failure shape leaves nothing at all for
+// repairTrailingPartialLine or the verifier to notice as torn, even though
+// the trace is genuinely incomplete.
 type failWriteFileZeroBytes struct {
 	logSyncer
-	writeErr error
-	count    int
+	passThrough int
+	writeErr    error
+	failed      bool
 }
 
 func (f *failWriteFileZeroBytes) Write(p []byte) (int, error) {
-	if f.count > 0 {
-		f.count--
+	if f.passThrough > 0 {
+		f.passThrough--
+		return f.logSyncer.Write(p)
+	}
+	if !f.failed {
+		f.failed = true
 		return 0, f.writeErr
 	}
 	return f.logSyncer.Write(p)
@@ -5191,6 +5201,16 @@ func (f *failWriteFileZeroBytes) Write(p []byte) (int, error) {
 // complete, chain-valid single entry with no torn tail at all. Without
 // poisonLog's marker, VerifyLog would report zero errors despite the trace
 // being incomplete. This proves the marker closes that gap.
+//
+// passThrough: 1 on the fake below is load-bearing, not incidental — without
+// it this fake fails the FIRST Write call it sees, which is the child's
+// (entry 0, sorts first by start_time), not the root's. An earlier version of
+// this test got this backwards (round 3 review caught it): it still exercised
+// a real, non-vacuous case (an empty file, poisoned, with nothing durable of
+// this trace at all) but not the harder, more important one this test is
+// actually named for — a later entry failing cleanly while an EARLIER entry
+// is already durable on disk. The precondition check below guards against
+// silently regressing back to the easier case.
 func TestLogPoisonMarker_ForcesDetectionOfAnOtherwiseCleanFailure(t *testing.T) {
 	env := newTestEnv(t)
 	exp := startExporter(t, env.cfg)
@@ -5209,9 +5229,9 @@ func TestLogPoisonMarker_ForcesDetectionOfAnOtherwiseCleanFailure(t *testing.T) 
 	exp.mu.Lock()
 	exp.logFile = &failTruncateFile{
 		logSyncer: &failWriteFileZeroBytes{
-			logSyncer: exp.logFile,
-			writeErr:  fmt.Errorf("simulated EIO"),
-			count:     1,
+			logSyncer:   exp.logFile,
+			passThrough: 1,
+			writeErr:    fmt.Errorf("simulated EIO"),
 		},
 		truncErr: fmt.Errorf("simulated truncate EIO"),
 	}
@@ -5229,12 +5249,20 @@ func TestLogPoisonMarker_ForcesDetectionOfAnOtherwiseCleanFailure(t *testing.T) 
 		t.Fatal("expected poisoning after a zero-byte write failure with a failed rollback")
 	}
 
-	// Without the marker, the file's last byte would be the child's own
-	// clean newline — indistinguishable from an ordinary, complete trace.
+	// Precondition: the child's complete, valid, newline-terminated entry
+	// must actually be on disk before the marker, or the assertions below
+	// would pass just as easily against an empty file — see the doc comment
+	// above.
 	raw, err := os.ReadFile(env.cfg.LogPath)
 	if err != nil {
 		t.Fatalf("reading log: %v", err)
 	}
+	if !bytes.Contains(raw, []byte(`"span_name":"child"`)) {
+		t.Fatalf("expected the child's entry durably on disk before the marker; the harder scenario this test targets did not occur:\n%s", raw)
+	}
+
+	// Without the marker, the file's last byte would be the child's own
+	// clean newline — indistinguishable from an ordinary, complete trace.
 	if bytes.HasSuffix(bytes.TrimRight(raw, "\n"), []byte("}")) {
 		t.Fatalf("expected the poison marker to make the file's tail visibly non-JSON, got a clean-looking tail:\n%s", raw)
 	}

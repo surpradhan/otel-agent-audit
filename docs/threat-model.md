@@ -249,7 +249,14 @@ logged, not escalated further, since the process already knows to stop
 trusting the file regardless): a `\x00` byte can never start or follow a
 JSON value, so it forces the file's true final line to fail parsing — tolerated
 as `torn_trailing_line`, not silently absent, whatever the triggering failure
-actually left behind. See issue #28.
+actually left behind.
+
+The one remaining gap is a triple fault: the original write fails, the full
+rollback's `Truncate` also fails, **and** the marker write itself lands zero
+bytes too. At that point nothing further is attempted — three independent
+operations on the same file failing in immediate succession is treated as
+evidence the underlying storage itself is unusable, not a case worth a fourth
+layer of fallback. See issue #28.
 
 **What this does not change:** the audit log's own hard-failure behavior in
 `VerifyLog` (`torn_trailing_line`, §7) is unaffected — this section is about
