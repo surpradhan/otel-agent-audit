@@ -10,6 +10,7 @@ import (
 	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"sort"
@@ -34,6 +35,14 @@ type VerifyError struct {
 func (e VerifyError) Error() string {
 	return fmt.Sprintf("verify[%s]: %s: %s", e.TraceID, e.Kind, e.Detail)
 }
+
+// KindTornTrailingLine is the VerifyError.Kind for a torn final audit-log
+// line (see VerifyLog's doc comment). Exported as a constant, unlike this
+// package's other Kind strings, because it is the only one a caller outside
+// this package needs to pattern-match on today: the CLI's human-readable
+// output must label it differently from a checkpoint-level error, since both
+// share an empty TraceID (see cmd/otel-agent-audit-verify's errorLabel).
+const KindTornTrailingLine = "torn_trailing_line"
 
 // Report summarizes a VerifyLog run.
 // TracesProcessed and CheckpointsProcessed count all entries seen (including
@@ -154,11 +163,20 @@ func VerifyCheckpoint(cp chain.Checkpoint, prevSignPayloadHash string, pubKey ed
 // but not reported as errors (they are "unchecked-by-checkpoint"). Rationale:
 // the final batch before a crash may be in the log before the checkpoint was
 // persisted; treating this as an error would produce false positives on restarts.
+//
+// Policy for a torn trailing line in the audit log: the final line is
+// tolerated if unparseable (a single write(2) can be interrupted mid-line by
+// a crash) and reported as a "torn_trailing_line" entry in Report.Errors
+// rather than silently dropped or hard-failed — entries before it are still
+// fully verified. An unparseable line anywhere earlier remains a hard Go
+// error, since only the last line can plausibly be an interrupted write.
 func VerifyLog(logPath, checkpointPath string, pubKey ed25519.PublicKey) (Report, error) {
 	var report Report
 
-	// Parse the log file, grouping by trace_id.
-	traceEntries, duplicateTraces, err := readLogEntries(logPath)
+	// Parse the log file, grouping by trace_id. tornTailDetail is non-empty when
+	// the log's final line was unparseable and tolerated as an interrupted write
+	// rather than a hard error — see readLogEntries.
+	traceEntries, duplicateTraces, tornTailDetail, err := readLogEntries(logPath)
 	if err != nil {
 		return report, err
 	}
@@ -198,8 +216,12 @@ func VerifyLog(logPath, checkpointPath string, pubKey ed25519.PublicKey) (Report
 			ids = append(ids, id)
 		}
 		sort.Strings(ids)
-		return report, fmt.Errorf("multi-epoch log: %d distinct key_ids found; re-run per epoch with the matching key (found: %s)",
+		msg := fmt.Sprintf("multi-epoch log: %d distinct key_ids found; re-run per epoch with the matching key (found: %s)",
 			len(ids), strings.Join(ids, ", "))
+		if tornTailDetail != "" {
+			msg += fmt.Sprintf("; the final line was also unparseable: %s", tornTailDetail)
+		}
+		return report, errors.New(msg)
 	}
 
 	// Single key_id check: if the log has exactly one key_id and it doesn't
@@ -234,6 +256,9 @@ func VerifyLog(logPath, checkpointPath string, pubKey ed25519.PublicKey) (Report
 					Detail:  fmt.Sprintf("checkpoint seq %d: %s", cp.CheckpointSeq, detail),
 				})
 				report.CheckpointsProcessed++
+			}
+			if tornTailDetail != "" {
+				verifyErrs = append(verifyErrs, VerifyError{Kind: KindTornTrailingLine, Detail: tornTailDetail})
 			}
 			report.Errors = verifyErrs
 			return report, nil
@@ -346,6 +371,9 @@ func VerifyLog(logPath, checkpointPath string, pubKey ed25519.PublicKey) (Report
 		}
 	}
 
+	if tornTailDetail != "" {
+		verifyErrs = append(verifyErrs, VerifyError{Kind: KindTornTrailingLine, Detail: tornTailDetail})
+	}
 	report.Errors = verifyErrs
 	return report, nil
 }
@@ -353,18 +381,23 @@ func VerifyLog(logPath, checkpointPath string, pubKey ed25519.PublicKey) (Report
 // readLogEntries reads and parses all JSONL log entries, grouped by trace_id and
 // sorted by seq_in_trace. The second return value is the set of trace IDs that
 // have duplicate seq_in_trace values (a sign of at-least-once re-delivery after
-// WAL compaction).
-func readLogEntries(logPath string) (map[string][]chain.LogEntry, map[string]struct{}, error) {
+// WAL compaction). The third return value is non-empty when the final line was
+// unparseable and was tolerated as an interrupted write rather than a hard
+// error; it describes the failure for inclusion in the caller's Report. Line
+// numbers in both this detail and the hard-error path count only non-blank
+// lines, matching readCheckpoints, not raw physical file lines.
+func readLogEntries(logPath string) (map[string][]chain.LogEntry, map[string]struct{}, string, error) {
 	f, err := os.Open(logPath)
 	if err != nil {
 		if os.IsNotExist(err) {
-			return map[string][]chain.LogEntry{}, map[string]struct{}{}, nil
+			return map[string][]chain.LogEntry{}, map[string]struct{}{}, "", nil
 		}
-		return nil, nil, fmt.Errorf("verify: open log %q: %w", logPath, err)
+		return nil, nil, "", fmt.Errorf("verify: open log %q: %w", logPath, err)
 	}
 	defer func() { _ = f.Close() }()
 
-	result := map[string][]chain.LogEntry{}
+	// Collect all non-empty lines first so we can tell which one is last.
+	var rawLines [][]byte
 	scanner := bufio.NewScanner(f)
 	scanner.Buffer(make([]byte, 64*1024), maxScanTokenSize)
 	for scanner.Scan() {
@@ -372,14 +405,36 @@ func readLogEntries(logPath string) (map[string][]chain.LogEntry, map[string]str
 		if len(line) == 0 {
 			continue
 		}
-		e, err := chain.UnmarshalLogEntry(line)
-		if err != nil {
-			return nil, nil, fmt.Errorf("verify: unmarshal log entry: %w", err)
-		}
-		result[e.Record.TraceID] = append(result[e.Record.TraceID], e)
+		cp := make([]byte, len(line))
+		copy(cp, line)
+		rawLines = append(rawLines, cp)
 	}
 	if err := scanner.Err(); err != nil {
-		return nil, nil, err
+		return nil, nil, "", err
+	}
+
+	result := map[string][]chain.LogEntry{}
+	var tornTail string
+	for i, line := range rawLines {
+		e, err := chain.UnmarshalLogEntry(line)
+		if err != nil {
+			// The final line may be a partial write from a crash — a single
+			// write(2) of a JSONL line is not atomic, the same reason
+			// readCheckpoints tolerates a torn final checkpoint line (see
+			// repairTrailingPartialLine in exporter.go and issue #24). Unlike
+			// the checkpoint case, this is reported rather than silently
+			// dropped: the audit log is the evidence itself, and hiding
+			// exactly this line is what an attacker who could truncate the
+			// file would want. Any earlier line failing to parse is
+			// corruption or tampering, not an interrupted write, and remains
+			// a hard error.
+			if i == len(rawLines)-1 {
+				tornTail = fmt.Sprintf("line %d: unparseable, likely a partial write from a crash: %v", i+1, err)
+				break
+			}
+			return nil, nil, "", fmt.Errorf("verify: unmarshal log entry at line %d: %w", i+1, err)
+		}
+		result[e.Record.TraceID] = append(result[e.Record.TraceID], e)
 	}
 
 	// Sort each trace's entries by seq_in_trace and detect duplicates.
@@ -398,7 +453,7 @@ func readLogEntries(logPath string) (map[string][]chain.LogEntry, map[string]str
 		}
 		result[id] = entries
 	}
-	return result, duplicates, nil
+	return result, duplicates, tornTail, nil
 }
 
 func readCheckpoints(checkPath string) ([]chain.Checkpoint, error) {

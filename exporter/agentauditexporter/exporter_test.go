@@ -3391,7 +3391,10 @@ func TestRepairTrailingPartialLine_MissingFile(t *testing.T) {
 // TestRestart_TornAuditLogLine_Fusion is the audit-log counterpart of
 // TestRestart_TornCheckpointLine_Fusion. The log file is opened O_APPEND too, so a
 // torn entry left by a crash would otherwise fuse onto the next entry written after
-// a restart, and readLogEntries rejects any unparseable line at all.
+// a restart, producing a corrupt line that VerifyLog would still flag — as a hard
+// error, or (since fusion here would leave it as the final line) as a reportable
+// torn_trailing_line finding; either way this test expects neither, because repair
+// should have prevented the fusion in the first place.
 func TestRestart_TornAuditLogLine_Fusion(t *testing.T) {
 	env := newTestEnv(t)
 	env.cfg.CheckpointInterval = 1
