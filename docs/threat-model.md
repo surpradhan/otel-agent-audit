@@ -168,6 +168,30 @@ every span for that `trace_id` as settled the moment any marker for it is
 seen, so the later segment's in-progress spans are never mistaken for the
 earlier segment's and silently dropped.
 
+### 3e. Parent-directory durability on first file creation
+
+`fsync` on a file's descriptor makes its *data* durable; it says nothing about
+the *directory entry* that names the file. The first time the audit log,
+checkpoint file, or WAL is created at a given path, that directory entry is
+not itself durable until the containing directory is also fsynced — so a
+crash between file creation and that directory fsync can lose the file
+entirely, even though every byte written to it was separately synced.
+
+`Start` fsyncs each file's parent directory immediately after creating it, for
+the audit log, the checkpoint file, and the WAL. The sync is best-effort: if
+it fails — directory fsync is not supported on every platform, notably
+Windows — `Start` logs a warning and continues rather than refusing to start
+over a hardening step, unlike a failure to open or write the file itself,
+which is fatal. This only matters for a path's first-ever run; every
+subsequent restart reopens an already-durable directory entry. See issue #23.
+
+**What this does not change:** the quarantine sidecar (the WAL path's sibling
+`*.quarantine.jsonl` file) is created lazily, on the first record that cannot
+be sealed into a chain, rather than at `Start`. It has the same gap on its own
+first-creation run; tracked separately as issue #33 rather than folded in here,
+since there is no single fixed point in `Start` to hook a lazily-created
+file's fix into.
+
 ---
 
 ## 4. Single-replica constraint

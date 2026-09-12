@@ -12,6 +12,7 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"runtime"
 	"slices"
 	"strings"
 	"sync"
@@ -1609,6 +1610,83 @@ func TestStart_BadWalPath(t *testing.T) {
 	if err := exp.Start(context.Background(), nil); err == nil {
 		t.Error("expected error when wal_path parent dir does not exist")
 		_ = exp.Shutdown(context.Background())
+	}
+}
+
+// TestSyncParentDir verifies the happy path: fsyncing the parent directory of
+// an existing file succeeds.
+func TestSyncParentDir(t *testing.T) {
+	dir := t.TempDir()
+	p := filepath.Join(dir, "file.txt")
+	if err := os.WriteFile(p, []byte("x"), 0600); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+	if err := syncParentDir(p); err != nil {
+		t.Fatalf("syncParentDir: %v", err)
+	}
+}
+
+// TestSyncParentDir_MissingParent verifies that syncParentDir reports an
+// error when the parent directory does not exist, rather than silently
+// succeeding.
+func TestSyncParentDir_MissingParent(t *testing.T) {
+	p := filepath.Join(t.TempDir(), "missing", "file.txt")
+	if err := syncParentDir(p); err == nil {
+		t.Fatal("expected an error when the parent directory does not exist")
+	}
+}
+
+// TestStart_ParentDirSyncFailureIsNonFatal verifies that Start logs and
+// continues, rather than failing outright, when the freshly created audit
+// log, checkpoint, or WAL file's parent directory cannot be fsynced (e.g. a
+// restrictive directory mode). Refusing to start over this hardening step
+// would deny a configuration that worked before the check existed — same
+// rationale as errRepairUnavailable above. See issue #23.
+func TestStart_ParentDirSyncFailureIsNonFatal(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("directory permission bits do not model this on Windows")
+	}
+	if os.Geteuid() == 0 {
+		t.Skip("running as root: directory read permission is not enforced")
+	}
+
+	tests := []struct {
+		name      string
+		setPath   func(cfg *Config, path string)
+		wantInLog string
+	}{
+		{"log path", func(cfg *Config, p string) { cfg.LogPath = p }, "audit log"},
+		{"checkpoint path", func(cfg *Config, p string) { cfg.CheckpointPath = p }, "checkpoint file"},
+		{"wal path", func(cfg *Config, p string) { cfg.WalPath = p }, "WAL"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			env := newTestEnv(t)
+			restricted := filepath.Join(t.TempDir(), "restricted")
+			if err := os.Mkdir(restricted, 0700); err != nil {
+				t.Fatalf("Mkdir: %v", err)
+			}
+			tt.setPath(env.cfg, filepath.Join(restricted, "target.jsonl"))
+
+			// Write+execute lets OpenFile create the file inside restricted;
+			// no read bit means opening restricted itself (to fsync it) fails.
+			if err := os.Chmod(restricted, 0300); err != nil {
+				t.Fatalf("Chmod: %v", err)
+			}
+			t.Cleanup(func() { _ = os.Chmod(restricted, 0700) })
+
+			core, logs := observer.New(zap.WarnLevel)
+			exp := newAgentAuditExporter(env.cfg, zap.New(core))
+			if err := exp.Start(context.Background(), nil); err != nil {
+				t.Fatalf("Start should tolerate a parent-dir sync failure, got: %v", err)
+			}
+			t.Cleanup(func() { _ = exp.Shutdown(context.Background()) })
+
+			if logs.FilterMessageSnippet(tt.wantInLog).Len() == 0 {
+				t.Errorf("expected a warning log mentioning %q, got: %v", tt.wantInLog, logs.All())
+			}
+		})
 	}
 }
 

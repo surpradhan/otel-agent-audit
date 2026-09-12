@@ -32,6 +32,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"path/filepath"
 	"sort"
 	"sync"
 	"time"
@@ -292,6 +293,11 @@ func (e *agentAuditExporter) Start(_ context.Context, _ component.Host) error {
 		return fmt.Errorf("agentaudit: opening audit log %q: %w", e.cfg.LogPath, err)
 	}
 	e.logFile = logF
+	if syncErr := syncParentDir(e.cfg.LogPath); syncErr != nil {
+		e.logger.Warn("agentaudit: syncing audit log's parent directory; "+
+			"a crash before this succeeds could lose a freshly created file",
+			zap.String("path", e.cfg.LogPath), zap.Error(syncErr))
+	}
 
 	// Open checkpoint file.
 	checkF, err := os.OpenFile(e.cfg.CheckpointPath, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0600)
@@ -300,6 +306,11 @@ func (e *agentAuditExporter) Start(_ context.Context, _ component.Host) error {
 		return fmt.Errorf("agentaudit: opening checkpoint file %q: %w", e.cfg.CheckpointPath, err)
 	}
 	e.checkFile = checkF
+	if syncErr := syncParentDir(e.cfg.CheckpointPath); syncErr != nil {
+		e.logger.Warn("agentaudit: syncing checkpoint file's parent directory; "+
+			"a crash before this succeeds could lose a freshly created file",
+			zap.String("path", e.cfg.CheckpointPath), zap.Error(syncErr))
+	}
 
 	// Open WAL.
 	w, err := wal.Open(e.cfg.WalPath)
@@ -309,6 +320,11 @@ func (e *agentAuditExporter) Start(_ context.Context, _ component.Host) error {
 		return fmt.Errorf("agentaudit: opening WAL %q: %w", e.cfg.WalPath, err)
 	}
 	e.wal = w
+	if syncErr := syncParentDir(e.cfg.WalPath); syncErr != nil {
+		e.logger.Warn("agentaudit: syncing WAL's parent directory; "+
+			"a crash before this succeeds could lose a freshly created file",
+			zap.String("path", e.cfg.WalPath), zap.Error(syncErr))
+	}
 
 	// Replay WAL to rehydrate in-progress buffers, plus any sealed trace's tip
 	// that must be restored to the accumulator below (see the accumulator
@@ -1105,6 +1121,25 @@ func (e *agentAuditExporter) writeLogEntry(le chain.LogEntry) error {
 		return fmt.Errorf("agentaudit: write log entry: %w", err)
 	}
 	return nil
+}
+
+// syncParentDir fsyncs the directory containing path. A file's own contents
+// being fsynced does not make the directory entry that names it durable: on
+// the run that *creates* path, a crash before this returns can lose the file
+// entirely even though its data separately reached disk. See issue #23.
+//
+// Failure is deliberately non-fatal — callers log and continue rather than
+// fail Start. Directory fsync is not universally supported (notably on
+// Windows), and refusing to start over a hardening step would deny a
+// configuration that worked before this check existed, the same rationale as
+// errRepairUnavailable below.
+func syncParentDir(path string) error {
+	d, err := os.Open(filepath.Dir(path))
+	if err != nil {
+		return err
+	}
+	defer func() { _ = d.Close() }()
+	return d.Sync()
 }
 
 // tornTailRepair reports what repairTrailingPartialLine did to a file.
