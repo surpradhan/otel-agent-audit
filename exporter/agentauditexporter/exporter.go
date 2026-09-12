@@ -1139,8 +1139,8 @@ func syncParentDir(path string) error {
 }
 
 // warnIfParentDirSyncFails fsyncs path's parent directory, logging (rather
-// than failing Start) if that does not succeed — see syncParentDir. what
-// names the file for the log line, e.g. "audit log".
+// than failing Start) if that does not succeed — see syncParentDir. The what
+// parameter names the file for the log line, e.g. "audit log".
 func (e *agentAuditExporter) warnIfParentDirSyncFails(what, path string) {
 	if err := syncParentDir(path); err != nil {
 		e.logger.Warn("agentaudit: syncing "+what+"'s parent directory; "+

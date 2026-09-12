@@ -197,7 +197,9 @@ platform for an assumed one.
 be sealed into a chain, rather than at `Start`. It has the same gap on its own
 first-creation run; tracked separately as issue #33 rather than folded in here,
 since there is no single fixed point in `Start` to hook a lazily-created
-file's fix into.
+file's fix into. `WAL.Compact`'s atomic rename over the live WAL file has the
+same directory-durability property on an ongoing operation rather than a
+first creation — a related but distinct gap, tracked as issue #36.
 
 ---
 
