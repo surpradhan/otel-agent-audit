@@ -850,6 +850,7 @@ func (e *agentAuditExporter) sealTrace(traceID string, buf *traceBuffer, checkpo
 		if e.quarantineRecords(traceID, recs, nil, "schema_version cannot seed a chain") == len(recs) {
 			e.markWALSealed(traceID)
 		}
+		e.scheduleWALCompact()
 		return
 	}
 
@@ -860,6 +861,7 @@ func (e *agentAuditExporter) sealTrace(traceID string, buf *traceBuffer, checkpo
 		if e.quarantineRecords(traceID, recs, nil, "chain could not be built") == len(recs) {
 			e.markWALSealed(traceID)
 		}
+		e.scheduleWALCompact()
 		return
 	}
 
@@ -1040,15 +1042,21 @@ func (e *agentAuditExporter) sealTrace(traceID string, buf *traceBuffer, checkpo
 // (compactWG.Add(1) happens here, while the lock is held, so it is observed
 // by Shutdown's compactWG.Wait()). On success, clears sealedTraces: entries
 // only need to persist until Compact removes the sealed WAL records; after
-// that the map can grow again from scratch. Called under e.mu, at the end of
-// an ordinary seal (Step 8) and also from the logPoisoned early-return: once
-// poisoning is permanent, every future seal takes that same early-return
-// branch, so without scheduling Compact there too it would never run again
-// for the rest of the process's lifetime. (The other quarantine early-returns
-// in sealTrace — schema_version/chain-build failures — don't need this: they
-// are one-off failures for a single malformed trace, not a permanent state,
-// so a later trace's ordinary seal still reaches Step 8 and compacts them
-// away same as anything else.) See issue #28.
+// that the map can grow again from scratch. Called under e.mu, from every
+// early-return branch in sealTrace that marks a trace sealed without
+// reaching the ordinary Step 8 at the bottom — the schema_version/chain-build
+// quarantine branches and the logPoisoned branch alike.
+//
+// The permanent, sustained case is what makes this load-bearing: once
+// logPoisoned is set it never clears, so every future seal keeps taking that
+// same early return, and without scheduling Compact there too it would never
+// run again for the rest of the process's lifetime (see issue #28). The
+// schema_version/chain-build branches are one-off failures for a single
+// malformed trace, not a permanent state, so a later trace's ordinary seal
+// would eventually reach Step 8 and compact them away regardless — but
+// calling this uniformly from every such branch, rather than reasoning about
+// which ones strictly need it, is simpler and removes the "one-off in
+// practice" judgment call as a place a future change could get wrong.
 func (e *agentAuditExporter) scheduleWALCompact() {
 	if e.wal == nil {
 		return
