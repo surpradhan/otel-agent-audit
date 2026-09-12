@@ -4243,6 +4243,98 @@ func TestSealTrace_UnsealableRecordsAreQuarantined(t *testing.T) {
 	}
 }
 
+// TestSealTrace_UnseedableQuarantineStillSchedulesCompact verifies that the
+// schema_version-cannot-seed-a-chain quarantine branch INSIDE sealTrace
+// schedules WAL.Compact like every other path that marks a trace sealed, not
+// just the ordinary Step 8 and the (permanent, sustained) logPoisoned branch.
+//
+// Delivers a child span normally via ConsumeTraces (so the WAL gets a real,
+// consistent AppendSpan entry for it — a hand-built buffer with no matching
+// WAL entry made wal.Compact itself error out in an earlier version of this
+// test, which silently swallowed the error as a Warn log and never cleared
+// sealedTraces, passing vacuously for a reason unrelated to the fix under
+// test), then corrupts its SchemaVersion to empty directly on the in-memory
+// buffer before the root span arrives and triggers the seal.
+//
+// This is also why the trigger can't be a corrupt WAL line replayed at
+// Start: an empty or unimplemented schema version there is intercepted by
+// Start's OWN replay-classification switch before sealTrace is ever reached
+// for it — that switch quarantines through a different call site entirely,
+// using the startupSealed map rather than sealedTraces, with its own
+// pre-existing Compact call. Corrupting the buffer directly, mid-process,
+// after WAL replay has nothing to do with it, is what actually reaches
+// chain.GenesisSeedForSchema's error path inside sealTrace itself.
+//
+// Checked mid-process, before Shutdown — Shutdown runs its own final Compact
+// unconditionally, which would otherwise make this indistinguishable from the
+// fix not being there at all.
+func TestSealTrace_UnseedableQuarantineStillSchedulesCompact(t *testing.T) {
+	env := newTestEnv(t)
+	core, logs := observer.New(zap.WarnLevel)
+	exp := newAgentAuditExporter(env.cfg, zap.New(core))
+	if err := exp.Start(context.Background(), nil); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	t.Cleanup(func() { _ = exp.Shutdown(context.Background()) })
+
+	traceID := [16]byte{0x77}
+	childID := [8]byte{0x01}
+	rootID := [8]byte{0x02}
+	traceIDHex := hex.EncodeToString(traceID[:])
+
+	// Child first (earlier start_time, so it sorts as recs[0] — the record
+	// sealTrace's genesis-seed check actually reads) — buffered and
+	// WAL-appended normally, not yet sealed (no root yet).
+	if err := exp.ConsumeTraces(context.Background(),
+		makeSpan(traceID, childID, rootID, "unseedable", 1000, 2000)); err != nil {
+		t.Fatalf("ConsumeTraces child: %v", err)
+	}
+
+	exp.mu.Lock()
+	buf := exp.buffers[traceIDHex]
+	if buf == nil {
+		exp.mu.Unlock()
+		t.Fatal("expected the child span buffered under its hex trace ID")
+	}
+	for spanID, rec := range buf.records {
+		rec.SchemaVersion = ""
+		buf.records[spanID] = rec
+	}
+	exp.mu.Unlock()
+
+	// Root triggers the seal; its own SchemaVersion is untouched (stamped
+	// current by SpanToRecord) — recs[0] is still the corrupted child after
+	// sorting, since its start_time is earlier.
+	if err := exp.ConsumeTraces(context.Background(),
+		makeSpan(traceID, rootID, zeroParentID, "root", 3000, 4000)); err != nil {
+		t.Fatalf("ConsumeTraces root: %v", err)
+	}
+
+	// The quarantine (and its scheduleWALCompact call) happens synchronously
+	// inside sealTrace, but Compact itself runs in a background goroutine —
+	// wait for it before asserting on its effect.
+	exp.compactWG.Wait()
+
+	if logs.FilterMessageSnippet("background WAL compact failed").Len() != 0 {
+		t.Errorf("Compact failed unexpectedly: %v", logs.All())
+	}
+
+	exp.mu.Lock()
+	remaining := len(exp.sealedTraces)
+	exp.mu.Unlock()
+	if remaining != 0 {
+		t.Errorf("expected sealedTraces cleared by a scheduled Compact, got %d entries still present", remaining)
+	}
+
+	quarantined, err := os.ReadFile(env.cfg.WalPath + quarantineSuffix)
+	if err != nil {
+		t.Fatalf("reading quarantine sidecar: %v", err)
+	}
+	if !bytes.Contains(quarantined, []byte(`"span_name":"unseedable"`)) {
+		t.Errorf("expected the record quarantined via sealTrace's genesis-seed-failure branch specifically:\n%s", quarantined)
+	}
+}
+
 // TestQuarantine_OpenFailureLeavesRecordsInWAL covers the one path where this
 // component would otherwise destroy audit data outright. When the sidecar
 // cannot be written, the records must stay in the WAL rather than being marked
