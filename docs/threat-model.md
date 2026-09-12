@@ -201,6 +201,69 @@ file's fix into. `WAL.Compact`'s atomic rename over the live WAL file has the
 same directory-durability property on an ongoing operation rather than a
 first creation — a related but distinct gap, tracked as issue #36.
 
+### 3f. Torn audit-log line within a single process lifetime
+
+`Start` repairs a torn trailing line left by a crash before reopening the
+audit log (§3e's sibling guarantee, via `repairTrailingPartialLine`) — but two
+failure paths can leave the *live* file torn **without** a restart:
+
+- A write that fails with `fsync_log: false` used to have no rollback to fall
+  back on at all: `preWritePos` was only captured when fsync was enabled,
+  since the rollback's own truncate-and-resync depended on it.
+- A rollback's own `Truncate` can itself fail (e.g. the same fault that broke
+  the original write).
+
+`preWritePos` is now captured unconditionally, before a trace's first entry
+is written, regardless of `fsync_log` — so either failure first attempts a
+full `Truncate(preWritePos)`, atomically undoing every entry this trace wrote
+in the current seal attempt, not just the one that failed. This matters for a
+multi-span trace: a mid-loop failure on any entry but the first would
+otherwise leave an *earlier*, already-durable sibling entry in the log with
+no way to undo it later.
+
+Only when that full rollback also fails does the exporter fall back to the
+same narrower, trailing-line-only repair `Start` applies to a crash-torn file
+— and only when doing so cannot leave the trace only partially represented: a
+fragment that is valid JSON missing only its newline is terminated in place,
+since it is a durable, signed record that simply lost its trailing byte (the
+same reasoning issue #24 already established for the checkpoint file); any
+other fragment is not a complete record and is truncated away. Both outcomes
+are safe only when the trace has exactly one entry (either outcome then
+unambiguously decides the whole trace's fate) or every entry already wrote
+successfully this attempt (the trailing bytes are then structurally complete
+regardless of entry count). A **multi**-entry trace failing mid-write — on any
+entry, including the first — is unsafe either way: keeping a lone complete
+fragment is exactly as dangerous as leaving an untouched earlier sibling,
+since every later entry was never even attempted once the write loop returns.
+
+In every unsafe case the log is marked **poisoned** instead (`errLogPoisoned`,
+mirroring `errCheckpointPoisoned` — see §3c/§3d): no further trace is appended
+to it, each subsequent one is quarantined instead (the same sidecar §3e
+describes), and the failure is reported once at `Shutdown` with a running
+count, not per trace. Poisoning alone does not guarantee anything is visibly
+wrong on disk, though — a failure that deposits zero bytes, or a kept fragment
+that happens to be valid JSON on its own, can leave the file looking
+completely ordinary. So poisoning also appends a short, deliberately
+unparseable marker to the file's current tail (best-effort; a failure here is
+logged, not escalated further, since the process already knows to stop
+trusting the file regardless): a `\x00` byte can never start or follow a
+JSON value, so it forces the file's true final line to fail parsing — tolerated
+as `torn_trailing_line`, not silently absent, whatever the triggering failure
+actually left behind.
+
+The one remaining gap is a triple fault: the original write fails, the full
+rollback's `Truncate` also fails, **and** the marker write itself lands zero
+bytes too. At that point nothing further is attempted — three independent
+operations on the same file failing in immediate succession is treated as
+evidence the underlying storage itself is unusable, not a case worth a fourth
+layer of fallback. See issue #28.
+
+**What this does not change:** the audit log's own hard-failure behavior in
+`VerifyLog` (`torn_trailing_line`, §7) is unaffected — this section is about
+*preventing* a torn line from reaching a state `VerifyLog` cannot tolerate
+(anything but the log's own final line), not about relaxing what the verifier
+accepts.
+
 ---
 
 ## 4. Single-replica constraint
