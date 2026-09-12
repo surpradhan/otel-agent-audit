@@ -140,6 +140,19 @@ type agentAuditExporter struct {
 	// by no checkpoint. Reported once at Shutdown rather than per trace.
 	uncoveredAfterPoison int // guarded by mu
 
+	// logPoisoned is set when an audit-log write failure could not be rolled
+	// back, and the same torn-tail repair Start applies before reopening the
+	// file (repairTrailingPartialLine) could not clean it up either. Further
+	// audit-log writes are refused: appending onto an unrepairable torn tail
+	// would fuse a new record onto the wreckage, corrupting it too. See
+	// sealTrace's logPoisoned check, repairOrPoisonLog, and issue #28.
+	logPoisoned bool // guarded by mu
+
+	// quarantinedAfterLogPoison counts records quarantined after the audit log
+	// was poisoned. Reported once at Shutdown rather than per trace — the same
+	// rationale as uncoveredAfterPoison.
+	quarantinedAfterLogPoison int // guarded by mu
+
 	// pendingCapDropped counts pending trace tips dropped by TrimPending because
 	// the pending-tip cap (effectiveMaxPendingTips) was exceeded during a
 	// sustained but rollback-able checkpoint write failure. Unlike
@@ -622,6 +635,13 @@ func (e *agentAuditExporter) Shutdown(ctx context.Context) error {
 			"%d pending trace tip(s) were dropped after exceeding the pending-tip cap during a sustained checkpoint write failure",
 			e.pendingCapDropped))
 	}
+	if e.logPoisoned {
+		e.logger.Error("agentaudit: shutting down with the audit log disabled",
+			zap.Int("records_quarantined_after_log_poison", e.quarantinedAfterLogPoison))
+		shutdownErrs = append(shutdownErrs, fmt.Errorf(
+			"%w (%d record(s) quarantined after the audit log was poisoned)",
+			errLogPoisoned, e.quarantinedAfterLogPoison))
+	}
 
 	// Step 6.
 	e.mu.Unlock()
@@ -777,6 +797,20 @@ func (e *agentAuditExporter) sealTrace(traceID string, buf *traceBuffer, checkpo
 		return
 	}
 
+	// If the audit log is poisoned, no further write to it can be trusted —
+	// route straight to quarantine instead of building a chain that could
+	// never be durably logged, and never add the trace's tip to the
+	// accumulator: there would be nothing in the log for a future checkpoint
+	// to be committing to. See issue #28.
+	if e.logPoisoned {
+		written := e.quarantineRecords(traceID, recs, nil, "audit log poisoned; cannot append")
+		e.quarantinedAfterLogPoison += written
+		if written == len(recs) {
+			e.markWALSealed(traceID)
+		}
+		return
+	}
+
 	// Step 1: sort in-place.
 	chain.SortRecords(recs)
 
@@ -841,11 +875,18 @@ func (e *agentAuditExporter) sealTrace(traceID string, buf *traceBuffer, checkpo
 	rollbackLog := func(cause string, causeErr error) {
 		e.logger.Error(cause, zap.String("trace_id", traceID), zap.Error(causeErr))
 		if terr := e.logFile.Truncate(preWritePos); terr != nil {
-			e.logger.Error("agentaudit: rollback log truncate failed — log may be ahead of checkpoint",
-				zap.String("trace_id", traceID), zap.Error(terr))
+			// The truncate itself failed: the file's bytes are torn right now,
+			// not just at risk after some future crash. Repair (or, if that
+			// also fails, poison) rather than leaving it for the next trace's
+			// write to fuse onto. See issue #28.
+			e.repairOrPoisonLog(traceID, "agentaudit: rollback log truncate failed — log may be ahead of checkpoint", terr)
 			return
 		}
 		// Fsync the truncation so a crash cannot recover the removed entries.
+		// If this fails, the file is already byte-correct for any read within
+		// this process — only crash durability is at risk, which Start's
+		// repairTrailingPartialLine independently covers on the next restart —
+		// so this does not escalate to repairOrPoisonLog.
 		if serr := e.logFile.Sync(); serr != nil {
 			e.logger.Error("agentaudit: rollback log sync failed — log may be ahead of checkpoint",
 				zap.String("trace_id", traceID), zap.Error(serr))
@@ -858,8 +899,12 @@ func (e *agentAuditExporter) sealTrace(traceID string, buf *traceBuffer, checkpo
 			if e.fsyncLog() {
 				rollbackLog("agentaudit: write log entry", err)
 			} else {
-				e.logger.Error("agentaudit: write log entry",
-					zap.String("trace_id", traceID), zap.Error(err))
+				// No preWritePos was captured above (fsyncLog is false), so
+				// there is nothing to roll back to. A partial write here
+				// leaves an unterminated line with no rollback in sight —
+				// repair it the same way Start does for a crash-torn tail, so
+				// the next trace's write does not fuse onto it. See issue #28.
+				e.repairOrPoisonLog(traceID, "agentaudit: write log entry", err)
 			}
 			return
 		}
@@ -1297,6 +1342,60 @@ func repairTrailingPartialLine(path string) (tornTailRepair, error) {
 	return tornTailRepair{Dropped: size - cut, Prefix: prefix}, nil
 }
 
+// repairOrPoisonLog attempts to clear a torn trailing line left by a log write
+// that failed and could not be rolled back, reusing the exact repair Start
+// applies to a crash-torn file (repairTrailingPartialLine) so the next
+// trace's write does not fuse onto the wreckage. Escalates to poisonLog only
+// if the repair itself fails — at that point there is no way to guarantee
+// where a further write would land, which is exactly the state poisonLog
+// exists to stop. Called under e.mu. See issue #28.
+func (e *agentAuditExporter) repairOrPoisonLog(traceID, cause string, causeErr error) {
+	e.logger.Error(cause, zap.String("trace_id", traceID), zap.Error(causeErr))
+	rep, repairErr := repairTrailingPartialLine(e.cfg.LogPath)
+	if repairErr != nil {
+		e.poisonLog("agentaudit: repairing the audit log after a failed write", repairErr, causeErr)
+		return
+	}
+	switch {
+	case rep.Dropped > 0:
+		e.logger.Error("agentaudit: dropped a torn trailing line after a failed write",
+			zap.String("trace_id", traceID),
+			zap.Int64("bytes", rep.Dropped),
+			zap.ByteString("dropped_prefix", rep.Prefix))
+	case rep.Terminated > 0:
+		e.logger.Warn("agentaudit: terminated an unterminated line after a failed write; "+
+			"the fragment was syntactically complete, so it was not an interrupted write",
+			zap.String("trace_id", traceID),
+			zap.Int64("bytes", rep.Terminated),
+			zap.ByteString("terminated_prefix", rep.Prefix))
+	}
+}
+
+// poisonLog permanently disables further audit-log writes for this process.
+// Called once a log write failure cannot be rolled back and the inline repair
+// repairOrPoisonLog attempts also fails: at that point neither the exact torn
+// bytes nor a safe append point are known, so any further write risks fusing
+// onto wreckage and corrupting a second record. Future traces are quarantined
+// instead — see sealTrace's logPoisoned check. Called under e.mu.
+//
+// What is already durably in the log still verifies for the lifetime of this
+// process, and a restart resumes cleanly: repairTrailingPartialLine repairs
+// or drops whatever the failed write left behind before the file is reopened.
+// See issue #28.
+func (e *agentAuditExporter) poisonLog(msg string, err, cause error) {
+	if e.logPoisoned {
+		return
+	}
+	e.logPoisoned = true
+	fields := []zap.Field{zap.Error(err)}
+	if cause != nil {
+		fields = append(fields, zap.NamedError("cause", cause))
+	}
+	e.logger.Error(msg+" — audit-log writes are now permanently disabled for this process; "+
+		"further sealed traces will be quarantined instead of logged",
+		fields...)
+}
+
 // readLastCheckpoint opens path for reading and returns the last valid Checkpoint
 // found in the JSONL file. Returns (_, false, nil) when the file is empty or absent.
 // Partial/corrupt lines are silently skipped (same tolerance as WAL replay).
@@ -1337,6 +1436,12 @@ func readLastCheckpoint(path string) (chain.Checkpoint, bool, error) {
 var errCheckpointPoisoned = errors.New(
 	"agentaudit: checkpoint file may contain an uncommitted checkpoint after a failed rollback; " +
 		"refusing to append a checkpoint the verifier could never validate")
+
+// errLogPoisoned is returned once an audit-log write failure could not be
+// rolled back or repaired. See agentAuditExporter.logPoisoned.
+var errLogPoisoned = errors.New(
+	"agentaudit: audit-log write failed and the torn tail it left could not be repaired; " +
+		"further traces are quarantined instead of logged")
 
 // maxCheckpointRetryGap caps how many additional pending tips the backoff will
 // wait for before retrying. Without a cap, recovery latency after a healed

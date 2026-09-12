@@ -201,6 +201,36 @@ file's fix into. `WAL.Compact`'s atomic rename over the live WAL file has the
 same directory-durability property on an ongoing operation rather than a
 first creation — a related but distinct gap, tracked as issue #36.
 
+### 3f. Torn audit-log line within a single process lifetime
+
+`Start` repairs a torn trailing line left by a crash before reopening the
+audit log (§3e's sibling guarantee, via `repairTrailingPartialLine`) — but two
+failure paths can leave the *live* file torn **without** a restart:
+
+- A write that fails with `fsync_log: false` has no rollback to fall back on:
+  `preWritePos` is only captured when fsync is enabled, since the rollback's
+  own truncate-and-resync depends on it.
+- A rollback's own `Truncate` can itself fail (e.g. the same fault that broke
+  the original write).
+
+Both paths now run the same inline repair `Start` applies to a crash-torn
+file, immediately, rather than leaving the torn bytes for the next trace's
+write to fuse onto: a fragment that is valid JSON missing only its newline is
+terminated in place, since it is a durable, signed record that simply lost
+its trailing byte (the same reasoning issue #24 already established for the
+checkpoint file); any other fragment is not a complete record and is
+truncated away. If the repair itself fails, the log is marked **poisoned**
+(`errLogPoisoned`, mirroring `errCheckpointPoisoned` — see §3c/§3d): no
+further trace is appended to it, each subsequent one is quarantined instead
+(the same sidecar §3e describes), and the failure is reported once at
+`Shutdown` with a running count, not per trace. See issue #28.
+
+**What this does not change:** the audit log's own hard-failure behavior in
+`VerifyLog` (`torn_trailing_line`, §7) is unaffected — this section is about
+*preventing* a torn line from reaching a state `VerifyLog` cannot tolerate
+(anything but the log's own final line), not about relaxing what the verifier
+accepts.
+
 ---
 
 ## 4. Single-replica constraint
