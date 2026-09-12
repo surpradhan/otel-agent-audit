@@ -91,7 +91,8 @@ Status: FAILED (1 error(s))
 - Traces not covered by any checkpoint are counted but not flagged as errors
   (the last batch before a crash may have been written before the final checkpoint).
 - A missing log or checkpoint file is treated as empty — no error is returned.
-- An unparseable line in the log or checkpoint file (e.g. a truncated line from a crash) causes the verifier to return an I/O error (exit 2). The WAL, not the audit log, absorbs crash-partial writes; the audit log only receives complete JSONL entries.
+- An unparseable **final** line in either file is tolerated rather than treated as corruption: a single `write(2)` is not atomic, so a crash can tear the last line of any append-only file this exporter writes (see `Start`'s torn-tail repair and issue #24). A torn **checkpoint** line is silently dropped, matching the exporter's own restart-time repair. A torn **audit-log** line is instead recorded as a `torn_trailing_line` finding in `Report.Errors` (see [docs/threat-model.md §7](threat-model.md#7-what-the-verifier-can-and-cannot-conclude)) rather than silently dropped or hard-failed — entries before it are still fully verified, but the log is the evidence itself, and a silent drop there would hide exactly what an attacker who could truncate the file would want hidden.
+- An unparseable line anywhere **other than the final line** of either file is always a hard error (I/O error, exit 2): only the last line can plausibly be an interrupted write, so an earlier one is corruption or tampering.
 
 ## Schema versions in a log
 

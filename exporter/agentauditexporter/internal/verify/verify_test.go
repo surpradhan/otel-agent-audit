@@ -380,6 +380,99 @@ func TestVerifyLog_PartialLastCheckpointLine(t *testing.T) {
 	}
 }
 
+// TestVerifyLog_PartialLastLogLine covers issue #27: a crash can tear the
+// final line of the audit log itself, not just the checkpoint file, since a
+// single write(2) is not atomic. Unlike the checkpoint case, entries before
+// the torn line are still verified, and the torn line is reported as a
+// torn_trailing_line finding rather than silently dropped or hard-failed —
+// the audit log is the evidence, so a silent drop would hide exactly what an
+// attacker who could truncate the file would want hidden.
+func TestVerifyLog_PartialLastLogLine(t *testing.T) {
+	logPath, checkpointPath, pub := makeVerifyFixture(t)
+
+	// Append a truncated JSON object that cannot be parsed.
+	lf, err := os.OpenFile(logPath, os.O_APPEND|os.O_WRONLY, 0600)
+	if err != nil {
+		t.Fatalf("open log for append: %v", err)
+	}
+	_, _ = lf.WriteString(`{"record":{"trace_id":"broken"` + "\n")
+	_ = lf.Close()
+
+	report, err := verify.VerifyLog(logPath, checkpointPath, pub)
+	if err != nil {
+		t.Fatalf("VerifyLog with partial last log line: %v", err)
+	}
+	if report.TracesProcessed != 1 {
+		t.Errorf("want 1 trace verified (the entry before the torn line); got %d", report.TracesProcessed)
+	}
+	var found bool
+	for _, e := range report.Errors {
+		if e.Kind == "chain" {
+			t.Errorf("got misleading chain error for torn trailing line: %v", e)
+		}
+		if e.Kind == "torn_trailing_line" {
+			found = true
+		}
+	}
+	if !found {
+		t.Errorf("expected torn_trailing_line error; got: %v", report.Errors)
+	}
+	if len(report.Errors) != 1 {
+		t.Errorf("expected exactly 1 error; got %v", report.Errors)
+	}
+}
+
+// TestVerifyLog_UnparseableNonFinalLogLine ensures the torn-tail tolerance is
+// scoped to the final line only: an unparseable line anywhere earlier is
+// corruption or tampering, not an interrupted write, and must remain a hard
+// error.
+func TestVerifyLog_UnparseableNonFinalLogLine(t *testing.T) {
+	logPath, checkpointPath, pub := makeVerifyFixture(t)
+
+	data, err := os.ReadFile(logPath)
+	if err != nil {
+		t.Fatalf("read log: %v", err)
+	}
+	// Prepend a garbage line so it is first, not last.
+	corrupted := `{"record":{"trace_id":"broken"` + "\n" + string(data)
+	if err := os.WriteFile(logPath, []byte(corrupted), 0600); err != nil {
+		t.Fatalf("write log: %v", err)
+	}
+
+	if _, err := verify.VerifyLog(logPath, checkpointPath, pub); err == nil {
+		t.Error("expected a hard error for an unparseable non-final line; got nil")
+	}
+}
+
+// TestVerifyLog_OnlyLogLineIsTorn covers a crash on the very first write: the
+// log contains nothing but a torn line, which is both first and last. It must
+// be tolerated the same as a torn tail following valid entries, not
+// hard-error just because it is also the only line.
+func TestVerifyLog_OnlyLogLineIsTorn(t *testing.T) {
+	logPath, checkpointPath, pub := makeVerifyFixture(t)
+
+	if err := os.WriteFile(logPath, []byte(`{"record":{"trace_id":"broken"`+"\n"), 0600); err != nil {
+		t.Fatalf("write log: %v", err)
+	}
+
+	report, err := verify.VerifyLog(logPath, checkpointPath, pub)
+	if err != nil {
+		t.Fatalf("VerifyLog with only-line-torn log: %v", err)
+	}
+	if report.TracesProcessed != 0 {
+		t.Errorf("want 0 traces verified; got %d", report.TracesProcessed)
+	}
+	var found bool
+	for _, e := range report.Errors {
+		if e.Kind == "torn_trailing_line" {
+			found = true
+		}
+	}
+	if !found {
+		t.Errorf("expected torn_trailing_line error; got: %v", report.Errors)
+	}
+}
+
 // TestVerifyLog_HappyPath_V3Log is the current-format counterpart of the legacy
 // test below: a log written at record.SchemaVersion must carry decimal-string
 // timestamps on disk — the whole point of v3 — and verify cleanly.
