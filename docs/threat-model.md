@@ -185,6 +185,13 @@ over a hardening step, unlike a failure to open or write the file itself,
 which is fatal. This only matters for a path's first-ever run; every
 subsequent restart reopens an already-durable directory entry. See issue #23.
 
+This repo's CI runs `ubuntu-latest` only, so whether directory fsync actually
+fails on Windows is unverified — if it does, every `Start` there logs one
+warning per file, indefinitely, with no operator remedy. That trade-off is
+deliberate rather than special-cased away: guessing wrong on `runtime.GOOS`
+without evidence would trade a real durability improvement on an entire
+platform for an assumed one.
+
 **What this does not change:** the quarantine sidecar (the WAL path's sibling
 `*.quarantine.jsonl` file) is created lazily, on the first record that cannot
 be sealed into a chain, rather than at `Start`. It has the same gap on its own
