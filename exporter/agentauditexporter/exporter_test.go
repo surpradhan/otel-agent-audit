@@ -4437,12 +4437,48 @@ func (f *failWriteFileUnrepairableTorn) Write(p []byte) (int, error) {
 	return f.logSyncer.Write(p)
 }
 
-// TestLogPartialWriteFailure_RepairsTornTail covers issue #28's Path 1: a
-// writeLogEntry failure with fsync_log disabled has no preWritePos to roll
-// back to (rollbackLog is never even reached). The inline repair must remove
-// the torn tail so the exporter keeps running and a later trace's entry lands
-// cleanly, without fusing onto the wreckage.
-func TestLogPartialWriteFailure_RepairsTornTail(t *testing.T) {
+// failNthWriteFile lets the first passThrough Write calls succeed unmodified,
+// then fails the very next one like failWriteFile (writes half the bytes,
+// then returns writeErr), before passing everything after that through
+// unmodified again. Used to fail one SPECIFIC entry of a multi-entry trace's
+// write loop — e.g. the second of two spans — while an earlier sibling entry
+// lands successfully first, exercising issue #28's multi-entry stranding
+// hazard: repairOrPoisonLog's line-level repair can only ever clean the
+// trailing fragment, so it must never be trusted to also undo an earlier,
+// already-durable sibling.
+type failNthWriteFile struct {
+	logSyncer
+	passThrough int
+	writeErr    error
+	failed      bool
+	wrote       int // bytes emitted by the one failing write, for vacuity checks
+}
+
+func (f *failNthWriteFile) Write(p []byte) (int, error) {
+	if f.passThrough > 0 {
+		f.passThrough--
+		return f.logSyncer.Write(p)
+	}
+	if !f.failed {
+		f.failed = true
+		half := len(p) / 2
+		n, werr := f.logSyncer.Write(p[:half])
+		f.wrote += n
+		if werr != nil {
+			return n, werr
+		}
+		return n, f.writeErr
+	}
+	return f.logSyncer.Write(p)
+}
+
+// TestLogWriteFailure_FullRollbackSucceeds_FsyncDisabled covers the core of
+// issue #28's fix: before it, a writeLogEntry failure with fsync_log disabled
+// had no preWritePos at all, so no rollback was even attempted. preWritePos
+// is now captured unconditionally, so the ordinary, single-fault case gets a
+// full, atomic "this trace's entries or nothing" rollback exactly like the
+// fsync_log:true path always had — not just the narrower line-level repair.
+func TestLogWriteFailure_FullRollbackSucceeds_FsyncDisabled(t *testing.T) {
 	env := newTestEnv(t)
 	falseVal := false
 	env.cfg.FsyncLog = &falseVal
@@ -4452,6 +4488,10 @@ func TestLogPartialWriteFailure_RepairsTornTail(t *testing.T) {
 	if err := exp.ConsumeTraces(context.Background(),
 		makeSpan(traceA, [8]byte{0x01}, zeroParentID, "op-a", 1_000_000, 2_000_000)); err != nil {
 		t.Fatalf("ConsumeTraces A: %v", err)
+	}
+	afterA, err := os.ReadFile(env.cfg.LogPath)
+	if err != nil {
+		t.Fatalf("reading log after A: %v", err)
 	}
 
 	failing := &failWriteFile{
@@ -4468,10 +4508,82 @@ func TestLogPartialWriteFailure_RepairsTornTail(t *testing.T) {
 		makeSpan(traceB, [8]byte{0x02}, zeroParentID, "op-b", 3_000_000, 4_000_000)); err != nil {
 		t.Fatalf("ConsumeTraces B: %v", err)
 	}
-	// Bytes must actually have reached the file, or the repair assertions
-	// below would pass vacuously.
 	if failing.wrote == 0 {
-		t.Fatal("fake wrote no bytes: the repair assertion below would be vacuous")
+		t.Fatal("fake wrote no bytes: the rollback assertion below would be vacuous")
+	}
+
+	exp.mu.Lock()
+	poisoned := exp.logPoisoned
+	exp.mu.Unlock()
+	if poisoned {
+		t.Fatal("a rollback-able write failure must not poison the log")
+	}
+
+	// The file must be back to EXACTLY what it was after A — a full rollback,
+	// not merely a repaired-but-still-present fragment.
+	afterRollback, err := os.ReadFile(env.cfg.LogPath)
+	if err != nil {
+		t.Fatalf("reading log after rollback: %v", err)
+	}
+	if !bytes.Equal(afterA, afterRollback) {
+		t.Fatalf("expected the log truncated back to exactly its post-A state\nafter A:        %q\nafter rollback: %q", afterA, afterRollback)
+	}
+
+	traceC := [16]byte{0xA3}
+	if err := exp.ConsumeTraces(context.Background(),
+		makeSpan(traceC, [8]byte{0x03}, zeroParentID, "op-c", 5_000_000, 6_000_000)); err != nil {
+		t.Fatalf("ConsumeTraces C: %v", err)
+	}
+	if err := exp.Shutdown(context.Background()); err != nil {
+		t.Fatalf("Shutdown: %v", err)
+	}
+
+	entries := readLogEntries(t, env.cfg.LogPath)
+	if len(entries) != 2 {
+		t.Fatalf("expected 2 log entries (A and C; B's write failed), got %d", len(entries))
+	}
+	report, err := verify.VerifyLog(env.cfg.LogPath, env.cfg.CheckpointPath, env.pubKey)
+	if err != nil {
+		t.Fatalf("VerifyLog: %v", err)
+	}
+	if len(report.Errors) != 0 {
+		t.Errorf("rolled-back log must verify cleanly; got %v", report.Errors)
+	}
+}
+
+// TestLogWriteFailure_RepairsTornTail_WhenFullRollbackAlsoFails_FsyncDisabled
+// covers the narrower fallback: fsync_log disabled, the write fails, AND the
+// full rollback's own Truncate also fails. The inline line-level repair must
+// still remove the torn tail so the exporter keeps running and a later
+// trace's entry lands cleanly, without fusing onto the wreckage.
+func TestLogWriteFailure_RepairsTornTail_WhenFullRollbackAlsoFails_FsyncDisabled(t *testing.T) {
+	env := newTestEnv(t)
+	falseVal := false
+	env.cfg.FsyncLog = &falseVal
+	exp := startExporter(t, env.cfg)
+
+	traceA := [16]byte{0xA4}
+	if err := exp.ConsumeTraces(context.Background(),
+		makeSpan(traceA, [8]byte{0x01}, zeroParentID, "op-a", 1_000_000, 2_000_000)); err != nil {
+		t.Fatalf("ConsumeTraces A: %v", err)
+	}
+
+	failing := &failTruncateFile{
+		logSyncer: &failWriteFile{
+			logSyncer: exp.logFile,
+			writeErr:  fmt.Errorf("simulated ENOSPC"),
+			count:     1,
+		},
+		truncErr: fmt.Errorf("simulated truncate EIO"),
+	}
+	exp.mu.Lock()
+	exp.logFile = failing
+	exp.mu.Unlock()
+
+	traceB := [16]byte{0xA5}
+	if err := exp.ConsumeTraces(context.Background(),
+		makeSpan(traceB, [8]byte{0x02}, zeroParentID, "op-b", 3_000_000, 4_000_000)); err != nil {
+		t.Fatalf("ConsumeTraces B: %v", err)
 	}
 
 	exp.mu.Lock()
@@ -4484,7 +4596,7 @@ func TestLogPartialWriteFailure_RepairsTornTail(t *testing.T) {
 	// The exporter must keep working: a further trace has to append cleanly,
 	// which is only possible if the torn tail left by trace B was removed
 	// rather than left for this write to fuse onto.
-	traceC := [16]byte{0xA3}
+	traceC := [16]byte{0xA6}
 	if err := exp.ConsumeTraces(context.Background(),
 		makeSpan(traceC, [8]byte{0x03}, zeroParentID, "op-c", 5_000_000, 6_000_000)); err != nil {
 		t.Fatalf("ConsumeTraces C: %v", err)
@@ -4509,12 +4621,14 @@ func TestLogPartialWriteFailure_RepairsTornTail(t *testing.T) {
 	}
 }
 
-// TestLogPartialWriteFailure_PoisonsLog_WhenRepairFails covers issue #28's
-// fallback: if the inline repair itself cannot clear the torn tail, the log
-// must be poisoned rather than left for the next trace's write to fuse onto.
-// Further traces must be quarantined, not silently dropped or retried
-// forever, and Shutdown must report the poisoning.
-func TestLogPartialWriteFailure_PoisonsLog_WhenRepairFails(t *testing.T) {
+// TestLogWriteFailure_PoisonsLog_WhenRepairAlsoFails_FsyncDisabled covers
+// issue #28's final fallback: fsync_log disabled, the write fails, the full
+// rollback's Truncate also fails, AND the inline repair itself cannot clear
+// the torn tail either. The log must be poisoned rather than left for the
+// next trace's write to fuse onto. Further traces must be quarantined, not
+// silently dropped or retried forever, and Shutdown must report the
+// poisoning.
+func TestLogWriteFailure_PoisonsLog_WhenRepairAlsoFails_FsyncDisabled(t *testing.T) {
 	env := newTestEnv(t)
 	falseVal := false
 	env.cfg.FsyncLog = &falseVal
@@ -4526,10 +4640,13 @@ func TestLogPartialWriteFailure_PoisonsLog_WhenRepairFails(t *testing.T) {
 		t.Fatalf("ConsumeTraces A: %v", err)
 	}
 
-	failing := &failWriteFileUnrepairableTorn{
-		logSyncer: exp.logFile,
-		writeErr:  fmt.Errorf("simulated ENOSPC"),
-		count:     1,
+	failing := &failTruncateFile{
+		logSyncer: &failWriteFileUnrepairableTorn{
+			logSyncer: exp.logFile,
+			writeErr:  fmt.Errorf("simulated ENOSPC"),
+			count:     1,
+		},
+		truncErr: fmt.Errorf("simulated truncate EIO"),
 	}
 	exp.mu.Lock()
 	exp.logFile = failing
@@ -4671,8 +4788,269 @@ func TestLogRollbackTruncateFailure_PoisonsLog_WhenRepairFails(t *testing.T) {
 		t.Fatal("an unrepairable torn tail must poison the log even on the rollback-truncate-failure path")
 	}
 
+	// A further trace must be quarantined rather than attempted against the
+	// poisoned log — mirrors the fsync-disabled poison test's assertion, for
+	// symmetry between the two double-fault triggers.
+	traceC := [16]byte{0xD3}
+	if err := exp.ConsumeTraces(context.Background(),
+		makeSpan(traceC, [8]byte{0x03}, zeroParentID, "op-c", 5_000_000, 6_000_000)); err != nil {
+		t.Fatalf("ConsumeTraces C: %v", err)
+	}
+
 	shutdownErr := exp.Shutdown(context.Background())
 	if !errors.Is(shutdownErr, errLogPoisoned) {
 		t.Errorf("Shutdown error: got %v, want it to wrap errLogPoisoned", shutdownErr)
+	}
+
+	quarantined, err := os.ReadFile(env.cfg.WalPath + quarantineSuffix)
+	if err != nil {
+		t.Fatalf("reading quarantine sidecar: %v", err)
+	}
+	if !bytes.Contains(quarantined, []byte(`"span_name":"op-c"`)) {
+		t.Errorf("trace sealed after log poisoning was not quarantined:\n%s", quarantined)
+	}
+	if !bytes.Contains(quarantined, []byte(`"reason":"audit log poisoned; cannot append"`)) {
+		t.Errorf("quarantine entry missing the log-poisoned reason:\n%s", quarantined)
+	}
+}
+
+// TestLogMultiSpanTrace_FullRollbackUndoesEarlierSibling is the core-fix
+// confirmation for a multi-span trace: the second of two spans fails to
+// write, and the first — already durably in the file from earlier in this
+// same seal attempt — must be undone too when the full rollback succeeds.
+// preWritePos is captured before the FIRST entry of the trace, not just the
+// failing one, so Truncate(preWritePos) atomically removes both. See
+// issue #28.
+func TestLogMultiSpanTrace_FullRollbackUndoesEarlierSibling(t *testing.T) {
+	env := newTestEnv(t)
+	exp := startExporter(t, env.cfg)
+
+	beforeTrace, err := os.ReadFile(env.cfg.LogPath)
+	if err != nil {
+		t.Fatalf("reading log before the trace: %v", err)
+	}
+
+	traceX := [16]byte{0xE1}
+	rootID := [8]byte{0x10}
+	childID := [8]byte{0x11}
+
+	// Child span first — buffered, no root yet, so no seal happens.
+	if err := exp.ConsumeTraces(context.Background(),
+		makeSpan(traceX, childID, rootID, "child", 1000, 2000)); err != nil {
+		t.Fatalf("ConsumeTraces child: %v", err)
+	}
+
+	// The child's earlier start_time sorts it as entry 0; the root (sent
+	// next, triggering the seal of both) is entry 1 and is the one that
+	// fails.
+	failing := &failNthWriteFile{
+		logSyncer:   exp.logFile,
+		passThrough: 1,
+		writeErr:    fmt.Errorf("simulated EIO"),
+	}
+	exp.mu.Lock()
+	exp.logFile = failing
+	exp.mu.Unlock()
+
+	if err := exp.ConsumeTraces(context.Background(),
+		makeSpan(traceX, rootID, zeroParentID, "root", 3000, 4000)); err != nil {
+		t.Fatalf("ConsumeTraces root: %v", err)
+	}
+	if failing.wrote == 0 {
+		t.Fatal("fake wrote no bytes for the failing entry: the rollback assertion below would be vacuous")
+	}
+
+	exp.mu.Lock()
+	poisoned := exp.logPoisoned
+	exp.mu.Unlock()
+	if poisoned {
+		t.Fatal("a rollback-able multi-entry failure must not poison the log")
+	}
+
+	// The file must be back to EXACTLY its pre-trace state: both the child
+	// AND the root are gone, not just the one that failed to write.
+	afterRollback, err := os.ReadFile(env.cfg.LogPath)
+	if err != nil {
+		t.Fatalf("reading log after rollback: %v", err)
+	}
+	if !bytes.Equal(beforeTrace, afterRollback) {
+		t.Fatalf("expected the log truncated back to exactly its pre-trace state (both entries undone)\nbefore: %q\nafter:  %q", beforeTrace, afterRollback)
+	}
+
+	// The exporter must keep working afterward.
+	traceY := [16]byte{0xE2}
+	if err := exp.ConsumeTraces(context.Background(),
+		makeSpan(traceY, [8]byte{0x20}, zeroParentID, "op-y", 5000, 6000)); err != nil {
+		t.Fatalf("ConsumeTraces Y: %v", err)
+	}
+	if err := exp.Shutdown(context.Background()); err != nil {
+		t.Fatalf("Shutdown: %v", err)
+	}
+	entries := readLogEntries(t, env.cfg.LogPath)
+	if len(entries) != 1 {
+		t.Fatalf("expected exactly 1 log entry (Y; trace X's write failed entirely), got %d", len(entries))
+	}
+	report, err := verify.VerifyLog(env.cfg.LogPath, env.cfg.CheckpointPath, env.pubKey)
+	if err != nil {
+		t.Fatalf("VerifyLog: %v", err)
+	}
+	if len(report.Errors) != 0 {
+		t.Errorf("rolled-back log must verify cleanly; got %v", report.Errors)
+	}
+}
+
+// TestLogMultiSpanTrace_PoisonsRatherThanStrandEarlierEntry is the regression
+// test for the bug pr-code-reviewer found in round 1: a multi-span trace
+// whose SECOND entry fails to write, where the full rollback ALSO fails.
+// Before this fix, repairOrPoisonLog's line-level repair only ever cleaned
+// the trailing fragment — it had no way to also remove the FIRST entry,
+// already durably written earlier in this same seal attempt. That silently
+// produced a partial, uncheckpointed, unquarantined trace (the first entry,
+// alone, forming an internally valid single-entry chain) that VerifyLog
+// reported zero errors for, with no marker anywhere that the second span
+// ever existed. The fix must instead poison — refusing to launder the file
+// clean — so the actual torn tail left behind surfaces as a verifier-visible
+// torn_trailing_line rather than vanishing.
+func TestLogMultiSpanTrace_PoisonsRatherThanStrandEarlierEntry(t *testing.T) {
+	env := newTestEnv(t)
+	exp := startExporter(t, env.cfg)
+
+	traceX := [16]byte{0xF1}
+	rootID := [8]byte{0x10}
+	childID := [8]byte{0x11}
+
+	if err := exp.ConsumeTraces(context.Background(),
+		makeSpan(traceX, childID, rootID, "child", 1000, 2000)); err != nil {
+		t.Fatalf("ConsumeTraces child: %v", err)
+	}
+
+	failing := &failTruncateFile{
+		logSyncer: &failNthWriteFile{
+			logSyncer:   exp.logFile,
+			passThrough: 1, // let the child (entry 0) write through
+			writeErr:    fmt.Errorf("simulated EIO"),
+		},
+		truncErr: fmt.Errorf("simulated truncate EIO"),
+	}
+	exp.mu.Lock()
+	exp.logFile = failing
+	exp.mu.Unlock()
+
+	// The root (entry 1) triggers the seal of both and is the one that fails.
+	if err := exp.ConsumeTraces(context.Background(),
+		makeSpan(traceX, rootID, zeroParentID, "root", 3000, 4000)); err != nil {
+		t.Fatalf("ConsumeTraces root: %v", err)
+	}
+
+	exp.mu.Lock()
+	poisoned := exp.logPoisoned
+	exp.mu.Unlock()
+	if !poisoned {
+		t.Fatal("an earlier entry already written this attempt, combined with a failed full rollback, must poison the log rather than risk a narrower repair stranding it")
+	}
+
+	// A further trace must be quarantined rather than attempted against the
+	// poisoned log.
+	traceY := [16]byte{0xF2}
+	if err := exp.ConsumeTraces(context.Background(),
+		makeSpan(traceY, [8]byte{0x20}, zeroParentID, "op-y", 5000, 6000)); err != nil {
+		t.Fatalf("ConsumeTraces Y: %v", err)
+	}
+	shutdownErr := exp.Shutdown(context.Background())
+	if !errors.Is(shutdownErr, errLogPoisoned) {
+		t.Errorf("Shutdown error: got %v, want it to wrap errLogPoisoned", shutdownErr)
+	}
+
+	// The critical assertion: the incompleteness must be VISIBLE to the
+	// verifier, not silently absent. The child's entry is durably present and
+	// valid; the root's failed write left a torn tail that was deliberately
+	// NOT repaired (repair was never attempted — see the poison message
+	// above) — so it must surface as the log's actual final line, reported as
+	// torn_trailing_line rather than laundered away.
+	report, err := verify.VerifyLog(env.cfg.LogPath, env.cfg.CheckpointPath, env.pubKey)
+	if err != nil {
+		t.Fatalf("VerifyLog: %v", err)
+	}
+	foundTornTail := false
+	for _, e := range report.Errors {
+		if e.Kind == verify.KindTornTrailingLine {
+			foundTornTail = true
+		}
+	}
+	if !foundTornTail {
+		t.Errorf("expected a torn_trailing_line finding surfacing the stranded child entry; got %v", report.Errors)
+	}
+
+	quarantined, err := os.ReadFile(env.cfg.WalPath + quarantineSuffix)
+	if err != nil {
+		t.Fatalf("reading quarantine sidecar: %v", err)
+	}
+	if !bytes.Contains(quarantined, []byte(`"span_name":"op-y"`)) {
+		t.Errorf("trace sealed after log poisoning was not quarantined:\n%s", quarantined)
+	}
+}
+
+// TestLogMultiSpanTrace_PostLoopSyncFailure_KeepsAllEntriesIntact confirms
+// the post-loop Sync-failure trigger is safe to fall back to a line-level
+// repair for a MULTI-entry trace too, unlike the mid-loop write-failure
+// trigger: by the time Step 4b's Sync runs, every entry already wrote
+// successfully, so the trailing bytes are structurally complete regardless of
+// entry count — there is nothing for repairTrailingPartialLine to get wrong,
+// so it is safe to not poison here even when the rollback truncate also
+// fails.
+func TestLogMultiSpanTrace_PostLoopSyncFailure_KeepsAllEntriesIntact(t *testing.T) {
+	env := newTestEnv(t)
+	exp := startExporter(t, env.cfg)
+
+	traceX := [16]byte{0xF3}
+	rootID := [8]byte{0x10}
+	childID := [8]byte{0x11}
+
+	if err := exp.ConsumeTraces(context.Background(),
+		makeSpan(traceX, childID, rootID, "child", 1000, 2000)); err != nil {
+		t.Fatalf("ConsumeTraces child: %v", err)
+	}
+
+	// Both writes succeed; only the POST-loop fsync of the whole batch fails,
+	// and the rollback's own truncate also fails.
+	exp.mu.Lock()
+	exp.logFile = &failTruncateFile{
+		logSyncer: &failSyncFile{
+			logSyncer: exp.logFile,
+			syncErr:   fmt.Errorf("simulated EIO"),
+			count:     1,
+		},
+		truncErr: fmt.Errorf("simulated truncate EIO"),
+	}
+	exp.mu.Unlock()
+
+	if err := exp.ConsumeTraces(context.Background(),
+		makeSpan(traceX, rootID, zeroParentID, "root", 3000, 4000)); err != nil {
+		t.Fatalf("ConsumeTraces root: %v", err)
+	}
+
+	exp.mu.Lock()
+	poisoned := exp.logPoisoned
+	exp.mu.Unlock()
+	if poisoned {
+		t.Fatal("a post-loop sync failure with fully-written, well-formed entries must not poison the log")
+	}
+
+	if err := exp.Shutdown(context.Background()); err != nil {
+		t.Fatalf("Shutdown: %v", err)
+	}
+
+	// Both spans of trace X must have survived, unlike the mid-loop failure
+	// case above.
+	entries := readLogEntries(t, env.cfg.LogPath)
+	if len(entries) != 2 {
+		t.Fatalf("expected both spans of the trace to survive, got %d entries", len(entries))
+	}
+	report, err := verify.VerifyLog(env.cfg.LogPath, env.cfg.CheckpointPath, env.pubKey)
+	if err != nil {
+		t.Fatalf("VerifyLog: %v", err)
+	}
+	if len(report.Errors) != 0 {
+		t.Errorf("expected no verifier errors; got %v", report.Errors)
 	}
 }

@@ -207,23 +207,38 @@ first creation — a related but distinct gap, tracked as issue #36.
 audit log (§3e's sibling guarantee, via `repairTrailingPartialLine`) — but two
 failure paths can leave the *live* file torn **without** a restart:
 
-- A write that fails with `fsync_log: false` has no rollback to fall back on:
-  `preWritePos` is only captured when fsync is enabled, since the rollback's
-  own truncate-and-resync depends on it.
+- A write that fails with `fsync_log: false` used to have no rollback to fall
+  back on at all: `preWritePos` was only captured when fsync was enabled,
+  since the rollback's own truncate-and-resync depended on it.
 - A rollback's own `Truncate` can itself fail (e.g. the same fault that broke
   the original write).
 
-Both paths now run the same inline repair `Start` applies to a crash-torn
-file, immediately, rather than leaving the torn bytes for the next trace's
-write to fuse onto: a fragment that is valid JSON missing only its newline is
-terminated in place, since it is a durable, signed record that simply lost
-its trailing byte (the same reasoning issue #24 already established for the
-checkpoint file); any other fragment is not a complete record and is
-truncated away. If the repair itself fails, the log is marked **poisoned**
-(`errLogPoisoned`, mirroring `errCheckpointPoisoned` — see §3c/§3d): no
-further trace is appended to it, each subsequent one is quarantined instead
-(the same sidecar §3e describes), and the failure is reported once at
-`Shutdown` with a running count, not per trace. See issue #28.
+`preWritePos` is now captured unconditionally, before a trace's first entry
+is written, regardless of `fsync_log` — so either failure first attempts a
+full `Truncate(preWritePos)`, atomically undoing every entry this trace wrote
+in the current seal attempt, not just the one that failed. This matters for a
+multi-span trace: a mid-loop failure on any entry but the first would
+otherwise leave an *earlier*, already-durable sibling entry in the log with
+no way to undo it later.
+
+Only when that full rollback also fails does the exporter fall back to the
+same narrower, trailing-line-only repair `Start` applies to a crash-torn file
+— and only when doing so cannot strand an earlier sibling: a fragment that is
+valid JSON missing only its newline is terminated in place, since it is a
+durable, signed record that simply lost its trailing byte (the same reasoning
+issue #24 already established for the checkpoint file); any other fragment is
+not a complete record and is truncated away. If an earlier entry of the same
+trace already landed this attempt and the full rollback fails, the narrower
+repair is not attempted at all — it could only clean the trailing fragment,
+silently leaving that earlier entry as an orphaned, uncheckpointed,
+unquarantined partial trace that `VerifyLog` would report zero errors for.
+The log is marked **poisoned** instead (`errLogPoisoned`, mirroring
+`errCheckpointPoisoned` — see §3c/§3d): no further trace is appended to it,
+each subsequent one is quarantined instead (the same sidecar §3e describes),
+and the failure is reported once at `Shutdown` with a running count, not per
+trace. Whatever is actually left on disk — a torn tail included — is left as
+is, so it surfaces to `VerifyLog` as `torn_trailing_line` rather than being
+silently cleaned away. See issue #28.
 
 **What this does not change:** the audit log's own hard-failure behavior in
 `VerifyLog` (`torn_trailing_line`, §7) is unaffected — this section is about

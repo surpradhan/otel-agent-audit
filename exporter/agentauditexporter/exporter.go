@@ -808,6 +808,13 @@ func (e *agentAuditExporter) sealTrace(traceID string, buf *traceBuffer, checkpo
 		if written == len(recs) {
 			e.markWALSealed(traceID)
 		}
+		// Compact must still run: unlike checkpointPoisoned (which only skips
+		// the accumulator step and reaches Step 8 normally every time), this
+		// branch returns before Step 8 below — and since poisoning is
+		// permanent, every future seal would keep taking this same early
+		// return, so without this call Compact would never run again for the
+		// rest of the process's lifetime. See issue #28.
+		e.scheduleWALCompact()
 		return
 	}
 
@@ -857,24 +864,47 @@ func (e *agentAuditExporter) sealTrace(traceID string, buf *traceBuffer, checkpo
 	}
 
 	// Step 4: write each entry as a JSONL line.
-	// If fsync is enabled, snapshot the log's end offset first so we can
-	// truncate back to it if Sync later fails — keeping the log consistent
-	// with the checkpoint (which is only updated in Step 5 below).
-	var preWritePos int64
-	if e.fsyncLog() {
-		if preWritePos, err = e.logFile.Seek(0, io.SeekEnd); err != nil {
-			e.logger.Error("agentaudit: get log offset before write",
-				zap.String("trace_id", traceID), zap.Error(err))
-			return
-		}
+	// preWritePos is captured unconditionally — regardless of fsync_log — so
+	// any write failure can attempt a full rollback to before this trace's
+	// first entry. Before issue #28, fsync_log:false had no rollback at all.
+	preWritePos, err := e.logFile.Seek(0, io.SeekEnd)
+	if err != nil {
+		e.logger.Error("agentaudit: get log offset before write",
+			zap.String("trace_id", traceID), zap.Error(err))
+		return
 	}
 
-	// rollbackLog truncates the file back to preWritePos and fsyncs the truncation
-	// so that a crash after the call cannot leave the log ahead of the checkpoint.
+	// rollbackLog truncates the file back to preWritePos and fsyncs the
+	// truncation so that a crash after the call cannot leave the log ahead of
+	// the checkpoint — an atomic "this trace's entries or nothing" rollback.
 	// Used on both write-loop failure and Sync failure below.
-	rollbackLog := func(cause string, causeErr error) {
+	//
+	// safeToRepairTail must be false whenever falling back to a narrower,
+	// trailing-line-only repair (repairOrPoisonLog) — if this truncate also
+	// fails — could leave an EARLIER entry of this SAME trace, from this SAME
+	// seal attempt, stranded in the log: repairOrPoisonLog only ever touches
+	// the final line, so it cannot undo an earlier sibling that already wrote
+	// successfully. That would silently produce a partial, uncheckpointed,
+	// unquarantined trace that VerifyLog reports zero errors for. It is false
+	// whenever an earlier entry of this trace already landed this attempt
+	// (a mid-loop failure on any entry but the first); it is true for the
+	// post-loop Sync failure below, since by then every entry already wrote
+	// successfully and the trailing bytes are structurally complete — there
+	// is nothing for a line-level repair to get wrong. See issue #28.
+	rollbackLog := func(cause string, causeErr error, safeToRepairTail bool) {
 		e.logger.Error(cause, zap.String("trace_id", traceID), zap.Error(causeErr))
 		if terr := e.logFile.Truncate(preWritePos); terr != nil {
+			if !safeToRepairTail {
+				// An earlier entry of this trace is already durably in the
+				// file and the full rollback failed: no repair can restore
+				// "all or nothing" here. Poison rather than risk a narrower
+				// repair silently laundering the file clean while stranding
+				// that earlier entry — leaving whatever is actually on disk,
+				// torn tail included, as honest evidence for the verifier
+				// (torn_trailing_line) instead. See issue #28.
+				e.poisonLog("agentaudit: rollback log truncate failed with an earlier entry of this trace already written", terr, causeErr)
+				return
+			}
 			// The truncate itself failed: the file's bytes are torn right now,
 			// not just at risk after some future crash. Repair (or, if that
 			// also fails, poison) rather than leaving it for the next trace's
@@ -886,7 +916,11 @@ func (e *agentAuditExporter) sealTrace(traceID string, buf *traceBuffer, checkpo
 		// If this fails, the file is already byte-correct for any read within
 		// this process — only crash durability is at risk, which Start's
 		// repairTrailingPartialLine independently covers on the next restart —
-		// so this does not escalate to repairOrPoisonLog.
+		// so this does not escalate to repairOrPoisonLog. (rollbackCheckpoint's
+		// equivalent branch does escalate: poisoning the log is categorically
+		// more disruptive — it stops the primary audit record, not just its
+		// checkpoint coverage — so the log side tolerates a durability-only
+		// risk the checkpoint side does not.)
 		if serr := e.logFile.Sync(); serr != nil {
 			e.logger.Error("agentaudit: rollback log sync failed — log may be ahead of checkpoint",
 				zap.String("trace_id", traceID), zap.Error(serr))
@@ -894,18 +928,9 @@ func (e *agentAuditExporter) sealTrace(traceID string, buf *traceBuffer, checkpo
 	}
 
 	logEntries := chain.ToLogEntries(entries)
-	for _, le := range logEntries {
+	for i, le := range logEntries {
 		if err := e.writeLogEntry(le); err != nil {
-			if e.fsyncLog() {
-				rollbackLog("agentaudit: write log entry", err)
-			} else {
-				// No preWritePos was captured above (fsyncLog is false), so
-				// there is nothing to roll back to. A partial write here
-				// leaves an unterminated line with no rollback in sight —
-				// repair it the same way Start does for a crash-torn tail, so
-				// the next trace's write does not fuse onto it. See issue #28.
-				e.repairOrPoisonLog(traceID, "agentaudit: write log entry", err)
-			}
+			rollbackLog("agentaudit: write log entry", err, i == 0)
 			return
 		}
 	}
@@ -920,7 +945,7 @@ func (e *agentAuditExporter) sealTrace(traceID string, buf *traceBuffer, checkpo
 	// so the trace replays cleanly on the next startup.
 	if e.fsyncLog() {
 		if err := e.logFile.Sync(); err != nil {
-			rollbackLog("agentaudit: sync log file", err)
+			rollbackLog("agentaudit: sync log file", err, true)
 			return
 		}
 	}
@@ -991,25 +1016,36 @@ func (e *agentAuditExporter) sealTrace(traceID string, buf *traceBuffer, checkpo
 		}
 	}
 
-	// Step 8: schedule compact OUTSIDE the lock (goroutine is launched while lock is held
-	// so compactWG.Add(1) is observed by Shutdown's compactWG.Wait()).
-	// On success, clear sealedTraces: entries only need to persist until Compact removes
-	// the sealed WAL records; after that the map can grow again from scratch.
-	if e.wal != nil {
-		e.compactWG.Add(1)
-		w := e.wal
-		acc := e.accumulator
-		go func() {
-			defer e.compactWG.Done()
-			if err := w.Compact(acc.PendingTips()); err != nil {
-				e.logger.Warn("agentaudit: background WAL compact failed", zap.Error(err))
-				return
-			}
-			e.mu.Lock()
-			e.sealedTraces = make(map[string]struct{})
-			e.mu.Unlock()
-		}()
+	// Step 8: schedule compact.
+	e.scheduleWALCompact()
+}
+
+// scheduleWALCompact launches a background WAL.Compact OUTSIDE the lock
+// (compactWG.Add(1) happens here, while the lock is held, so it is observed
+// by Shutdown's compactWG.Wait()). On success, clears sealedTraces: entries
+// only need to persist until Compact removes the sealed WAL records; after
+// that the map can grow again from scratch. Called under e.mu, from every
+// path that marks a trace sealed — including a quarantined or logPoisoned
+// trace, which carries no tip but must still be compacted away eventually, or
+// the WAL grows without bound for as long as every seal keeps taking that
+// path. See issue #28.
+func (e *agentAuditExporter) scheduleWALCompact() {
+	if e.wal == nil {
+		return
 	}
+	e.compactWG.Add(1)
+	w := e.wal
+	acc := e.accumulator
+	go func() {
+		defer e.compactWG.Done()
+		if err := w.Compact(acc.PendingTips()); err != nil {
+			e.logger.Warn("agentaudit: background WAL compact failed", zap.Error(err))
+			return
+		}
+		e.mu.Lock()
+		e.sealedTraces = make(map[string]struct{})
+		e.mu.Unlock()
+	}()
 }
 
 // quarantinePath is the sidecar the exporter writes records to when it cannot
@@ -1349,6 +1385,15 @@ func repairTrailingPartialLine(path string) (tornTailRepair, error) {
 // if the repair itself fails — at that point there is no way to guarantee
 // where a further write would land, which is exactly the state poisonLog
 // exists to stop. Called under e.mu. See issue #28.
+//
+// Unlike Start's own repair loop — which treats an uninspectable file
+// (errRepairUnavailable) as non-fatal and lets the process continue, since
+// nothing is yet known to be torn and refusing to start would deny a
+// configuration that worked before that check existed — this treats the same
+// error as poison-worthy. Start is a precautionary cold-boot check against a
+// system with no known active fault; this runs immediately after a live write
+// failure, where being unable to confirm the file is safe is a much stronger
+// signal that something is already wrong.
 func (e *agentAuditExporter) repairOrPoisonLog(traceID, cause string, causeErr error) {
 	e.logger.Error(cause, zap.String("trace_id", traceID), zap.Error(causeErr))
 	rep, repairErr := repairTrailingPartialLine(e.cfg.LogPath)
