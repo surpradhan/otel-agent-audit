@@ -4389,6 +4389,13 @@ func TestQuarantine_TornTrailingLineIsRepaired(t *testing.T) {
 // three (created eagerly at a single point in Start), the sidecar is created
 // lazily here, on the first unsealable record, exercising
 // warnIfParentDirSyncFails's other call site. See issue #33.
+//
+// Uses TWO independently-unsealable traces, not one, and asserts the warning
+// fires at least twice: the fix deliberately re-syncs on every
+// quarantineRecords call rather than only a detected first creation (see the
+// comment at its call site), and a single-event test cannot distinguish that
+// from a regression to a first-call-only guard — both would pass with only
+// one trace to quarantine.
 func TestQuarantine_ParentDirSyncFailureIsNonFatal(t *testing.T) {
 	if runtime.GOOS == "windows" {
 		t.Skip("directory permission bits do not model this on Windows")
@@ -4405,13 +4412,15 @@ func TestQuarantine_ParentDirSyncFailureIsNonFatal(t *testing.T) {
 	env.cfg.WalPath = filepath.Join(restricted, "wal.jsonl")
 	quarantinePath := env.cfg.WalPath + quarantineSuffix
 
-	// An empty parent_span_id marks this a root span, so WAL replay seals
-	// (and, with an empty schema_version, immediately quarantines) it
+	// An empty parent_span_id marks each a root span, so WAL replay seals
+	// (and, with an empty schema_version, immediately quarantines) both
 	// synchronously during Start — same technique as
-	// TestSealTrace_UnsealableRecordsAreQuarantined.
-	const traceID = "01010101010101010101010101010101"
-	if err := os.WriteFile(env.cfg.WalPath,
-		[]byte(legacyWALLine("", traceID, "0102030405060708", "", "corrupt.root")), 0600); err != nil {
+	// TestSealTrace_UnsealableRecordsAreQuarantined, doubled.
+	const traceID1 = "01010101010101010101010101010101"
+	const traceID2 = "02020202020202020202020202020202"
+	walLines := legacyWALLine("", traceID1, "0102030405060708", "", "corrupt.root.1") +
+		legacyWALLine("", traceID2, "0203040506070809", "", "corrupt.root.2")
+	if err := os.WriteFile(env.cfg.WalPath, []byte(walLines), 0600); err != nil {
 		t.Fatalf("writing WAL: %v", err)
 	}
 
@@ -4432,18 +4441,20 @@ func TestQuarantine_ParentDirSyncFailureIsNonFatal(t *testing.T) {
 		t.Fatalf("Shutdown: %v", err)
 	}
 
-	if logs.FilterMessageSnippet("quarantine sidecar").Len() == 0 {
-		t.Errorf("expected a warning log mentioning the quarantine sidecar, got: %v", logs.All())
+	if got := logs.FilterMessageSnippet("quarantine sidecar").Len(); got < 2 {
+		t.Errorf("expected the quarantine-sidecar parent-dir warning at least twice (once per quarantine event), got %d: %v", got, logs.All())
 	}
 
-	// The quarantine write itself must still have succeeded — the sync
-	// failure is a hardening step, not a reason to deny the write.
+	// Both quarantine writes must still have succeeded — the sync failure is
+	// a hardening step, not a reason to deny the write.
 	quarantined, err := os.ReadFile(quarantinePath)
 	if err != nil {
 		t.Fatalf("reading quarantine sidecar: %v", err)
 	}
-	if !bytes.Contains(quarantined, []byte(`"span_name":"corrupt.root"`)) {
-		t.Errorf("expected the record to still be quarantined despite the parent-dir sync failure:\n%s", quarantined)
+	for _, name := range []string{"corrupt.root.1", "corrupt.root.2"} {
+		if !bytes.Contains(quarantined, []byte(`"span_name":"`+name+`"`)) {
+			t.Errorf("expected %q still quarantined despite the parent-dir sync failure:\n%s", name, quarantined)
+		}
 	}
 }
 

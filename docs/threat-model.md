@@ -203,9 +203,13 @@ first-creation point. Repeating it is deliberate, not a missed optimization —
 `os.OpenFile`'s `O_CREATE` doesn't report whether it just created the file or
 opened an existing one, so there is no cheap way to run this only on the
 actual first-creation call; fsyncing an already-durable directory on every
-later call is a harmless, idempotent no-op, and quarantine events are rare
-enough by design that the extra syscall per event is immaterial. See
-issue #33.
+later call is a harmless, idempotent no-op, and the extra syscall per event
+is immaterial either way — quarantine events are rare by design under normal
+operation, though not once the audit log itself is poisoned (§3f), at which
+point every subsequent seal quarantines for the rest of the process's
+lifetime; even then, the added fsync is proportional to the unconditional
+`Sync` the sidecar write already performs on every call regardless of this
+fix. See issue #33.
 
 **What this does not change:** `WAL.Compact`'s atomic rename over the live WAL
 file has the same directory-durability property on an ongoing operation rather
