@@ -259,7 +259,7 @@ technical counsel.
 | `tip_hash_unverifiable` | The chain itself failed verification; the checkpoint tip cannot be independently confirmed |
 | `key_id_mismatch` | The supplied public key does not match the `key_id` recorded in the log; you are using the wrong key |
 | `duplicate_trace_segment` | Two independent chains exist for the same `trace_id` — this is an at-least-once delivery artifact, not evidence of tampering |
-| `torn_trailing_line` | The audit log's final line was unparseable — likely an interrupted write from a crash, not tampering; entries before it were fully verified |
+| `torn_trailing_line` | The audit log's final line was unparseable — likely an interrupted write from a crash. Its content was never cryptographically verified (that is what "unparseable" means), so this alone does not rule out tampering; entries before it were fully verified |
 
 **The verifier cannot detect:**
 - A trace that was **never written** to the log (it is absent, not corrupted)

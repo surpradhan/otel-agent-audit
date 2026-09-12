@@ -84,7 +84,8 @@ Status: FAILED (1 error(s))
 ```
 
 `Errors` is a JSON array of objects: `{"TraceID": "…", "Kind": "…", "Detail": "…"}`.
-`TraceID` is empty for checkpoint-level errors.
+`TraceID` is empty for checkpoint-level errors and for the log-level
+`torn_trailing_line` finding.
 
 ## Audit policy
 

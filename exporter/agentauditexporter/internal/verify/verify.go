@@ -154,6 +154,13 @@ func VerifyCheckpoint(cp chain.Checkpoint, prevSignPayloadHash string, pubKey ed
 // but not reported as errors (they are "unchecked-by-checkpoint"). Rationale:
 // the final batch before a crash may be in the log before the checkpoint was
 // persisted; treating this as an error would produce false positives on restarts.
+//
+// Policy for a torn trailing line in the audit log: the final line is
+// tolerated if unparseable (a single write(2) can be interrupted mid-line by
+// a crash) and reported as a "torn_trailing_line" entry in Report.Errors
+// rather than silently dropped or hard-failed — entries before it are still
+// fully verified. An unparseable line anywhere earlier remains a hard Go
+// error, since only the last line can plausibly be an interrupted write.
 func VerifyLog(logPath, checkpointPath string, pubKey ed25519.PublicKey) (Report, error) {
 	var report Report
 
@@ -200,6 +207,10 @@ func VerifyLog(logPath, checkpointPath string, pubKey ed25519.PublicKey) (Report
 			ids = append(ids, id)
 		}
 		sort.Strings(ids)
+		if tornTailDetail != "" {
+			return report, fmt.Errorf("multi-epoch log: %d distinct key_ids found; re-run per epoch with the matching key (found: %s); the final line was also unparseable: %s",
+				len(ids), strings.Join(ids, ", "), tornTailDetail)
+		}
 		return report, fmt.Errorf("multi-epoch log: %d distinct key_ids found; re-run per epoch with the matching key (found: %s)",
 			len(ids), strings.Join(ids, ", "))
 	}
@@ -363,7 +374,9 @@ func VerifyLog(logPath, checkpointPath string, pubKey ed25519.PublicKey) (Report
 // have duplicate seq_in_trace values (a sign of at-least-once re-delivery after
 // WAL compaction). The third return value is non-empty when the final line was
 // unparseable and was tolerated as an interrupted write rather than a hard
-// error; it describes the failure for inclusion in the caller's Report.
+// error; it describes the failure for inclusion in the caller's Report. Line
+// numbers in both this detail and the hard-error path count only non-blank
+// lines, matching readCheckpoints, not raw physical file lines.
 func readLogEntries(logPath string) (map[string][]chain.LogEntry, map[string]struct{}, string, error) {
 	f, err := os.Open(logPath)
 	if err != nil {

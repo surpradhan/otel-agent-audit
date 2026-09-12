@@ -320,6 +320,73 @@ func TestVerifyLog_MultiEpochLog(t *testing.T) {
 	}
 }
 
+// TestVerifyLog_MultiEpochLogWithTornTrailingLine covers the multi-epoch
+// bail-out's torn-tail handling: readLogEntries computes tornTailDetail
+// before the multi-epoch check runs, so a log that is both multi-epoch and
+// torn should not silently discard that already-known diagnostic — it must
+// appear in the returned error, even though the bail-out returns a bare error
+// rather than a Report.
+func TestVerifyLog_MultiEpochLogWithTornTrailingLine(t *testing.T) {
+	dir := t.TempDir()
+	logPath := filepath.Join(dir, "audit.jsonl")
+	checkpointPath := filepath.Join(dir, "checkpoint.jsonl")
+
+	priv1, _, err := sign.GenerateEd25519Key()
+	if err != nil {
+		t.Fatalf("GenerateEd25519Key 1: %v", err)
+	}
+	signer1 := sign.NewEd25519Signer(priv1)
+
+	priv2, pub2, err := sign.GenerateEd25519Key()
+	if err != nil {
+		t.Fatalf("GenerateEd25519Key 2: %v", err)
+	}
+	signer2 := sign.NewEd25519Signer(priv2)
+
+	makeEntry := func(signer sign.Signer, traceID, spanID string, seq int) chain.LogEntry {
+		rec := record.AuditRecord{
+			SchemaVersion: record.SchemaVersion,
+			TraceID:       traceID,
+			SpanID:        spanID,
+			SeqInTrace:    seq,
+			SpanName:      "span",
+			OtelKind:      "Internal",
+			AuditKind:     record.AuditKindTask,
+			Status:        "Ok",
+		}
+		seed, _ := chain.GenesisSeed(traceID)
+		entries, _ := chain.BuildChain([]record.AuditRecord{rec}, seed, signer)
+		return chain.ToLogEntries(entries)[0]
+	}
+
+	traceID1 := "01010101010101010101010101010101"
+	traceID2 := "02020202020202020202020202020202"
+	e1 := makeEntry(signer1, traceID1, "0102030405060708", 0)
+	e2 := makeEntry(signer2, traceID2, "0807060504030201", 0)
+
+	lf, _ := os.Create(logPath)
+	for _, e := range []chain.LogEntry{e1, e2} {
+		line, _ := json.Marshal(e)
+		_, _ = lf.Write(append(line, '\n'))
+	}
+	_, _ = lf.WriteString(`{"record":{"trace_id":"broken"` + "\n")
+	_ = lf.Close()
+	if f, err := os.Create(checkpointPath); err == nil {
+		_ = f.Close()
+	}
+
+	_, err = verify.VerifyLog(logPath, checkpointPath, pub2)
+	if err == nil {
+		t.Fatal("expected an error for multi-epoch log; got nil")
+	}
+	if !strings.Contains(err.Error(), "multi-epoch log") {
+		t.Errorf("expected 'multi-epoch log' in error, got: %v", err)
+	}
+	if !strings.Contains(err.Error(), "final line was also unparseable") {
+		t.Errorf("expected the torn-tail detail to survive the multi-epoch bail-out; got: %v", err)
+	}
+}
+
 // TestVerifyLog_DuplicateTraceSegment verifies that a log with two entries
 // sharing the same (trace_id, seq_in_trace) produces a "duplicate_trace_segment"
 // error rather than a confusing chain error.
@@ -448,6 +515,12 @@ func TestVerifyLog_UnparseableNonFinalLogLine(t *testing.T) {
 // log contains nothing but a torn line, which is both first and last. It must
 // be tolerated the same as a torn tail following valid entries, not
 // hard-error just because it is also the only line.
+//
+// The fixture's checkpoint still claims one entry for fixtureTraceID, but the
+// log now has zero — so, in addition to torn_trailing_line, an incidental
+// entry_count_mismatch is expected too. Both are pinned explicitly (rather
+// than just checking torn_trailing_line is present) so a future regression in
+// the checkpoint cross-check does not go unnoticed here.
 func TestVerifyLog_OnlyLogLineIsTorn(t *testing.T) {
 	logPath, checkpointPath, pub := makeVerifyFixture(t)
 
@@ -462,14 +535,63 @@ func TestVerifyLog_OnlyLogLineIsTorn(t *testing.T) {
 	if report.TracesProcessed != 0 {
 		t.Errorf("want 0 traces verified; got %d", report.TracesProcessed)
 	}
-	var found bool
+	var sawTornTail, sawEntryCountMismatch bool
 	for _, e := range report.Errors {
-		if e.Kind == "torn_trailing_line" {
-			found = true
+		switch e.Kind {
+		case "torn_trailing_line":
+			sawTornTail = true
+		case "entry_count_mismatch":
+			sawEntryCountMismatch = true
 		}
 	}
-	if !found {
+	if !sawTornTail {
 		t.Errorf("expected torn_trailing_line error; got: %v", report.Errors)
+	}
+	if !sawEntryCountMismatch {
+		t.Errorf("expected incidental entry_count_mismatch (checkpoint still claims 1 entry); got: %v", report.Errors)
+	}
+	if len(report.Errors) != 2 {
+		t.Errorf("expected exactly 2 errors (torn_trailing_line + entry_count_mismatch); got %v", report.Errors)
+	}
+}
+
+// TestVerifyLog_WrongKeyWithTornTrailingLine covers the key_id_mismatch
+// early-return branch's torn-tail handling (verify.go's other
+// report.Errors = verifyErrs site, distinct from the main path exercised by
+// TestVerifyLog_PartialLastLogLine). A log can independently have both a
+// wrong-key mismatch and a torn final line, and both must surface.
+func TestVerifyLog_WrongKeyWithTornTrailingLine(t *testing.T) {
+	logPath, checkpointPath, _ := makeVerifyFixture(t)
+	_, wrongPub, err := sign.GenerateEd25519Key()
+	if err != nil {
+		t.Fatalf("GenerateEd25519Key: %v", err)
+	}
+
+	lf, err := os.OpenFile(logPath, os.O_APPEND|os.O_WRONLY, 0600)
+	if err != nil {
+		t.Fatalf("open log for append: %v", err)
+	}
+	_, _ = lf.WriteString(`{"record":{"trace_id":"broken"` + "\n")
+	_ = lf.Close()
+
+	report, err := verify.VerifyLog(logPath, checkpointPath, wrongPub)
+	if err != nil {
+		t.Fatalf("VerifyLog: %v", err)
+	}
+	var sawMismatch, sawTornTail bool
+	for _, e := range report.Errors {
+		switch e.Kind {
+		case "key_id_mismatch":
+			sawMismatch = true
+		case "torn_trailing_line":
+			sawTornTail = true
+		}
+	}
+	if !sawMismatch {
+		t.Errorf("expected key_id_mismatch error; got: %v", report.Errors)
+	}
+	if !sawTornTail {
+		t.Errorf("expected torn_trailing_line error alongside key_id_mismatch; got: %v", report.Errors)
 	}
 }
 

@@ -93,11 +93,7 @@ func run() int {
 		} else {
 			fmt.Printf("Status: FAILED (%d error(s))\n", len(report.Errors))
 			for _, e := range report.Errors {
-				if e.TraceID != "" {
-					fmt.Printf("  [%s] %s: %s\n", e.TraceID, e.Kind, e.Detail)
-				} else {
-					fmt.Printf("  [checkpoint] %s: %s\n", e.Kind, e.Detail)
-				}
+				fmt.Printf("  [%s] %s: %s\n", errorLabel(e), e.Kind, e.Detail)
 			}
 		}
 	}
@@ -106,6 +102,22 @@ func run() int {
 		return 1
 	}
 	return 0
+}
+
+// errorLabel returns the "[...]" prefix for one report line: the trace ID
+// when the error is trace-scoped, or which file it came from otherwise. An
+// empty TraceID alone does not imply a checkpoint-level error — the log-level
+// torn_trailing_line finding also has no TraceID — so this checks Kind
+// explicitly instead of assuming.
+func errorLabel(e verify.VerifyError) string {
+	switch {
+	case e.TraceID != "":
+		return e.TraceID
+	case e.Kind == "torn_trailing_line":
+		return "audit log"
+	default:
+		return "checkpoint"
+	}
 }
 
 func loadPublicKey(hexKey, pemFile string) (ed25519.PublicKey, error) {
