@@ -881,28 +881,44 @@ func (e *agentAuditExporter) sealTrace(traceID string, buf *traceBuffer, checkpo
 	//
 	// safeToRepairTail must be false whenever falling back to a narrower,
 	// trailing-line-only repair (repairOrPoisonLog) — if this truncate also
-	// fails — could leave an EARLIER entry of this SAME trace, from this SAME
-	// seal attempt, stranded in the log: repairOrPoisonLog only ever touches
-	// the final line, so it cannot undo an earlier sibling that already wrote
-	// successfully. That would silently produce a partial, uncheckpointed,
-	// unquarantined trace that VerifyLog reports zero errors for. It is false
-	// whenever an earlier entry of this trace already landed this attempt
-	// (a mid-loop failure on any entry but the first); it is true for the
-	// post-loop Sync failure below, since by then every entry already wrote
-	// successfully and the trailing bytes are structurally complete — there
-	// is nothing for a line-level repair to get wrong. See issue #28.
+	// fails — could leave this trace only PARTIALLY represented in the log.
+	// repairOrPoisonLog only ever touches the final line, and it has two
+	// outcomes: drop the fragment (if it's not valid JSON) or KEEP it,
+	// terminated with a newline (if it happens to be complete, valid JSON
+	// missing only that byte — see repairTrailingPartialLine). The keep
+	// outcome is exactly as dangerous as an untouched earlier sibling: a
+	// multi-entry trace whose FIRST entry fails at precisely the JSON/newline
+	// byte boundary would have that one entry kept, while every later entry
+	// (never even attempted, since the write loop returns on the first
+	// failure) is silently missing — a partial, uncheckpointed, unquarantined
+	// trace that VerifyLog reports zero errors for, the identical hazard as
+	// stranding an earlier sibling, just reached through the repair's OWN
+	// "keep" branch instead of leaving one untouched.
+	//
+	// So this is only safe when EITHER (a) the trace has exactly one entry —
+	// whatever repairOrPoisonLog does to it, keep or drop, is unambiguously
+	// the whole trace's fate, not a partial subset of it — or (b) every entry
+	// already wrote successfully this attempt (the post-loop Sync failure
+	// below): the trailing bytes are then structurally complete regardless of
+	// entry count, so there is nothing for a line-level repair to get wrong.
+	// A mid-loop failure on a MULTI-entry trace is unsafe regardless of which
+	// entry index failed, including the first. See issue #28.
 	rollbackLog := func(cause string, causeErr error, safeToRepairTail bool) {
 		e.logger.Error(cause, zap.String("trace_id", traceID), zap.Error(causeErr))
 		if terr := e.logFile.Truncate(preWritePos); terr != nil {
 			if !safeToRepairTail {
-				// An earlier entry of this trace is already durably in the
-				// file and the full rollback failed: no repair can restore
-				// "all or nothing" here. Poison rather than risk a narrower
-				// repair silently laundering the file clean while stranding
-				// that earlier entry — leaving whatever is actually on disk,
-				// torn tail included, as honest evidence for the verifier
-				// (torn_trailing_line) instead. See issue #28.
-				e.poisonLog("agentaudit: rollback log truncate failed with an earlier entry of this trace already written", terr, causeErr)
+				// This is a multi-entry trace and the full rollback failed:
+				// no repair can restore "all or nothing" here, whether that's
+				// because an earlier sibling is already durably in the file,
+				// or because the repair's own "keep, terminated" outcome
+				// could strand later entries that were never even attempted
+				// (see the safeToRepairTail comment above). Poison rather
+				// than risk a narrower repair silently laundering the file
+				// clean — poisonLog forces the actual tail to become
+				// verifier-visible as torn_trailing_line regardless of what
+				// the underlying failure happened to leave behind. See
+				// issue #28.
+				e.poisonLog("agentaudit: rollback log truncate failed with this trace only partially written", terr, causeErr)
 				return
 			}
 			// The truncate itself failed: the file's bytes are torn right now,
@@ -930,7 +946,7 @@ func (e *agentAuditExporter) sealTrace(traceID string, buf *traceBuffer, checkpo
 	logEntries := chain.ToLogEntries(entries)
 	for i, le := range logEntries {
 		if err := e.writeLogEntry(le); err != nil {
-			rollbackLog("agentaudit: write log entry", err, i == 0)
+			rollbackLog("agentaudit: write log entry", err, i == 0 && len(logEntries) == 1)
 			return
 		}
 	}
@@ -1024,11 +1040,15 @@ func (e *agentAuditExporter) sealTrace(traceID string, buf *traceBuffer, checkpo
 // (compactWG.Add(1) happens here, while the lock is held, so it is observed
 // by Shutdown's compactWG.Wait()). On success, clears sealedTraces: entries
 // only need to persist until Compact removes the sealed WAL records; after
-// that the map can grow again from scratch. Called under e.mu, from every
-// path that marks a trace sealed — including a quarantined or logPoisoned
-// trace, which carries no tip but must still be compacted away eventually, or
-// the WAL grows without bound for as long as every seal keeps taking that
-// path. See issue #28.
+// that the map can grow again from scratch. Called under e.mu, at the end of
+// an ordinary seal (Step 8) and also from the logPoisoned early-return: once
+// poisoning is permanent, every future seal takes that same early-return
+// branch, so without scheduling Compact there too it would never run again
+// for the rest of the process's lifetime. (The other quarantine early-returns
+// in sealTrace — schema_version/chain-build failures — don't need this: they
+// are one-off failures for a single malformed trace, not a permanent state,
+// so a later trace's ordinary seal still reaches Step 8 and compacts them
+// away same as anything else.) See issue #28.
 func (e *agentAuditExporter) scheduleWALCompact() {
 	if e.wal == nil {
 		return
@@ -1416,17 +1436,42 @@ func (e *agentAuditExporter) repairOrPoisonLog(traceID, cause string, causeErr e
 	}
 }
 
+// logPoisonTornMarker is appended, best-effort, to the log's current tail
+// when poisoning — see poisonLog. It can never be a prefix or suffix of a
+// valid canonical audit record (these are JSON objects; a leading NUL is not
+// valid JSON syntax and appending it directly after a complete JSON value
+// with no separating newline invalidates that value's line too, since
+// json.Unmarshal rejects trailing non-whitespace content), so it forces the
+// file's actual final line to fail parsing regardless of what the triggering
+// failure happened to leave behind.
+const logPoisonTornMarker = "\x00 agentaudit: log poisoned, see errLogPoisoned \x00"
+
 // poisonLog permanently disables further audit-log writes for this process.
-// Called once a log write failure cannot be rolled back and the inline repair
-// repairOrPoisonLog attempts also fails: at that point neither the exact torn
-// bytes nor a safe append point are known, so any further write risks fusing
-// onto wreckage and corrupting a second record. Future traces are quarantined
-// instead — see sealTrace's logPoisoned check. Called under e.mu.
+// Called once a log write failure cannot be rolled back, and either an
+// earlier entry of the same trace already landed this attempt or the inline
+// repair repairOrPoisonLog attempts also fails: at that point there is no way
+// to guarantee this trace is either fully present or fully absent. Future
+// traces are quarantined instead — see sealTrace's logPoisoned check. Called
+// under e.mu.
 //
-// What is already durably in the log still verifies for the lifetime of this
-// process, and a restart resumes cleanly: repairTrailingPartialLine repairs
-// or drops whatever the failed write left behind before the file is reopened.
-// See issue #28.
+// Best-effort, appends logPoisonTornMarker to the file's current tail. Without
+// this, a failure that happened to leave the file looking complete — nothing
+// written at all, or a fragment that happens to be valid JSON missing only
+// its newline (see repairTrailingPartialLine and the safeToRepairTail comment
+// in sealTrace) — would poison writes for this process but leave nothing for
+// VerifyLog to flag: the on-disk bytes alone are indistinguishable from an
+// ordinary, complete trace. The marker forces the file's true final line to
+// be unparseable, so it surfaces as torn_trailing_line — tolerated as the
+// last line (nothing more is ever appended once poisoned), not silently
+// absent. If the marker write itself fails, that gap stands for this
+// instance: logged, not escalated further, since the process already knows
+// to stop trusting this file regardless.
+//
+// What was already durably in the log before poisoning still verifies for
+// the lifetime of this process, and a restart resumes cleanly:
+// repairTrailingPartialLine repairs or drops whatever is left behind
+// (marker included — it is itself an invalid, unterminated fragment) before
+// the file is reopened. See issue #28.
 func (e *agentAuditExporter) poisonLog(msg string, err, cause error) {
 	if e.logPoisoned {
 		return
@@ -1439,6 +1484,16 @@ func (e *agentAuditExporter) poisonLog(msg string, err, cause error) {
 	e.logger.Error(msg+" — audit-log writes are now permanently disabled for this process; "+
 		"further sealed traces will be quarantined instead of logged",
 		fields...)
+
+	if _, werr := e.logFile.Write([]byte(logPoisonTornMarker)); werr != nil {
+		e.logger.Warn("agentaudit: could not mark the audit log's tail as torn after poisoning; "+
+			"whatever was left behind may look complete to the verifier",
+			zap.Error(werr))
+		return
+	}
+	if serr := e.logFile.Sync(); serr != nil {
+		e.logger.Warn("agentaudit: syncing the poison marker", zap.Error(serr))
+	}
 }
 
 // readLastCheckpoint opens path for reading and returns the last valid Checkpoint

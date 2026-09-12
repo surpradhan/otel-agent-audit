@@ -5054,3 +5054,202 @@ func TestLogMultiSpanTrace_PostLoopSyncFailure_KeepsAllEntriesIntact(t *testing.
 		t.Errorf("expected no verifier errors; got %v", report.Errors)
 	}
 }
+
+// failWriteFileMissingNewlineOnly writes every byte of the buffer EXCEPT the
+// final one — the "\n" writeLogEntry always appends last, in the same single
+// Write call — then returns writeErr. The fragment that lands is therefore
+// complete, valid JSON missing only its terminating newline: exactly the
+// boundary repairTrailingPartialLine's "keep, terminate" outcome (as opposed
+// to "drop") is built to handle. Used to probe that outcome specifically on
+// the FIRST entry of a multi-entry trace, where keeping it would silently
+// strand every later entry that was never even attempted.
+type failWriteFileMissingNewlineOnly struct {
+	logSyncer
+	writeErr error
+	count    int
+	wrote    int
+}
+
+func (f *failWriteFileMissingNewlineOnly) Write(p []byte) (int, error) {
+	if f.count > 0 {
+		f.count--
+		n, werr := f.logSyncer.Write(p[:len(p)-1])
+		f.wrote += n
+		if werr != nil {
+			return n, werr
+		}
+		return n, f.writeErr
+	}
+	return f.logSyncer.Write(p)
+}
+
+// TestLogMultiSpanTrace_PoisonsRatherThanKeepFirstEntry_NewlineBoundaryFailure
+// is the regression test for round 2's finding: gating safeToRepairTail on
+// i==0 alone was not enough. A multi-entry trace whose FIRST entry fails
+// exactly at the JSON/newline byte boundary leaves a fragment that
+// repairTrailingPartialLine would KEEP (it is complete, valid JSON) rather
+// than drop — and keeping it, while every later entry of the same trace was
+// never even attempted (the write loop returns on the first failure),
+// silently produces the identical partial-trace hazard as stranding an
+// earlier sibling. safeToRepairTail must also require the trace have exactly
+// one entry, not just that the failing entry is the first.
+func TestLogMultiSpanTrace_PoisonsRatherThanKeepFirstEntry_NewlineBoundaryFailure(t *testing.T) {
+	env := newTestEnv(t)
+	exp := startExporter(t, env.cfg)
+
+	traceX := [16]byte{0xF4}
+	rootID := [8]byte{0x10}
+	childID := [8]byte{0x11}
+
+	if err := exp.ConsumeTraces(context.Background(),
+		makeSpan(traceX, childID, rootID, "child", 1000, 2000)); err != nil {
+		t.Fatalf("ConsumeTraces child: %v", err)
+	}
+
+	failing := &failWriteFileMissingNewlineOnly{
+		logSyncer: exp.logFile,
+		writeErr:  fmt.Errorf("simulated EIO"),
+		count:     1,
+	}
+	exp.mu.Lock()
+	exp.logFile = &failTruncateFile{
+		logSyncer: failing,
+		truncErr:  fmt.Errorf("simulated truncate EIO"),
+	}
+	exp.mu.Unlock()
+
+	// The child (entry 0, sorts first) fails at the newline boundary; the
+	// root (entry 1) triggers the seal and is never even attempted.
+	if err := exp.ConsumeTraces(context.Background(),
+		makeSpan(traceX, rootID, zeroParentID, "root", 3000, 4000)); err != nil {
+		t.Fatalf("ConsumeTraces root: %v", err)
+	}
+	if failing.wrote == 0 {
+		t.Fatal("fake wrote no bytes: the assertions below would be vacuous")
+	}
+
+	exp.mu.Lock()
+	poisoned := exp.logPoisoned
+	exp.mu.Unlock()
+	if !poisoned {
+		t.Fatal("a first-entry failure at the newline boundary, on a multi-entry trace, must poison rather than keep the lone entry and silently drop the rest")
+	}
+
+	traceY := [16]byte{0xF5}
+	if err := exp.ConsumeTraces(context.Background(),
+		makeSpan(traceY, [8]byte{0x20}, zeroParentID, "op-y", 5000, 6000)); err != nil {
+		t.Fatalf("ConsumeTraces Y: %v", err)
+	}
+	shutdownErr := exp.Shutdown(context.Background())
+	if !errors.Is(shutdownErr, errLogPoisoned) {
+		t.Errorf("Shutdown error: got %v, want it to wrap errLogPoisoned", shutdownErr)
+	}
+
+	// The critical assertion: even though the child's own fragment is valid,
+	// complete JSON on its own, the incompleteness must still surface to the
+	// verifier — this is what the poison marker (see poisonLog) exists for.
+	report, err := verify.VerifyLog(env.cfg.LogPath, env.cfg.CheckpointPath, env.pubKey)
+	if err != nil {
+		t.Fatalf("VerifyLog: %v", err)
+	}
+	foundTornTail := false
+	for _, e := range report.Errors {
+		if e.Kind == verify.KindTornTrailingLine {
+			foundTornTail = true
+		}
+	}
+	if !foundTornTail {
+		t.Errorf("expected a torn_trailing_line finding surfacing the stranded child entry; got %v", report.Errors)
+	}
+}
+
+// failWriteFileZeroBytes fails every targeted Write without writing anything
+// at all — a "clean" failure (e.g. ENOSPC before a single byte lands) that
+// leaves the file completely unchanged, unlike failWriteFile's half-written
+// fragment. Used to probe poisonLog's marker specifically: without it, this
+// failure shape leaves nothing at all for repairTrailingPartialLine or the
+// verifier to notice as torn, even though the trace is genuinely incomplete.
+type failWriteFileZeroBytes struct {
+	logSyncer
+	writeErr error
+	count    int
+}
+
+func (f *failWriteFileZeroBytes) Write(p []byte) (int, error) {
+	if f.count > 0 {
+		f.count--
+		return 0, f.writeErr
+	}
+	return f.logSyncer.Write(p)
+}
+
+// TestLogPoisonMarker_ForcesDetectionOfAnOtherwiseCleanFailure is round 2's
+// other finding: poisoning alone does not guarantee VerifyLog sees anything
+// wrong. A "clean" failure — zero bytes written — on a later entry of a
+// multi-entry trace, combined with a failed rollback, poisons the log but
+// leaves the earlier entry's bytes completely untouched: a syntactically
+// complete, chain-valid single entry with no torn tail at all. Without
+// poisonLog's marker, VerifyLog would report zero errors despite the trace
+// being incomplete. This proves the marker closes that gap.
+func TestLogPoisonMarker_ForcesDetectionOfAnOtherwiseCleanFailure(t *testing.T) {
+	env := newTestEnv(t)
+	exp := startExporter(t, env.cfg)
+
+	traceX := [16]byte{0xF6}
+	rootID := [8]byte{0x10}
+	childID := [8]byte{0x11}
+
+	if err := exp.ConsumeTraces(context.Background(),
+		makeSpan(traceX, childID, rootID, "child", 1000, 2000)); err != nil {
+		t.Fatalf("ConsumeTraces child: %v", err)
+	}
+
+	// The child (entry 0) writes through untouched; the root (entry 1) is the
+	// one that fails, cleanly (zero bytes), when it triggers the seal.
+	exp.mu.Lock()
+	exp.logFile = &failTruncateFile{
+		logSyncer: &failWriteFileZeroBytes{
+			logSyncer: exp.logFile,
+			writeErr:  fmt.Errorf("simulated EIO"),
+			count:     1,
+		},
+		truncErr: fmt.Errorf("simulated truncate EIO"),
+	}
+	exp.mu.Unlock()
+
+	if err := exp.ConsumeTraces(context.Background(),
+		makeSpan(traceX, rootID, zeroParentID, "root", 3000, 4000)); err != nil {
+		t.Fatalf("ConsumeTraces root: %v", err)
+	}
+
+	exp.mu.Lock()
+	poisoned := exp.logPoisoned
+	exp.mu.Unlock()
+	if !poisoned {
+		t.Fatal("expected poisoning after a zero-byte write failure with a failed rollback")
+	}
+
+	// Without the marker, the file's last byte would be the child's own
+	// clean newline — indistinguishable from an ordinary, complete trace.
+	raw, err := os.ReadFile(env.cfg.LogPath)
+	if err != nil {
+		t.Fatalf("reading log: %v", err)
+	}
+	if bytes.HasSuffix(bytes.TrimRight(raw, "\n"), []byte("}")) {
+		t.Fatalf("expected the poison marker to make the file's tail visibly non-JSON, got a clean-looking tail:\n%s", raw)
+	}
+
+	report, err := verify.VerifyLog(env.cfg.LogPath, env.cfg.CheckpointPath, env.pubKey)
+	if err != nil {
+		t.Fatalf("VerifyLog: %v", err)
+	}
+	foundTornTail := false
+	for _, e := range report.Errors {
+		if e.Kind == verify.KindTornTrailingLine {
+			foundTornTail = true
+		}
+	}
+	if !foundTornTail {
+		t.Errorf("expected the poison marker to surface as torn_trailing_line even though the underlying failure left no torn bytes of its own; got %v", report.Errors)
+	}
+}

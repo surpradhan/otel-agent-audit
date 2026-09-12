@@ -223,22 +223,33 @@ no way to undo it later.
 
 Only when that full rollback also fails does the exporter fall back to the
 same narrower, trailing-line-only repair `Start` applies to a crash-torn file
-— and only when doing so cannot strand an earlier sibling: a fragment that is
-valid JSON missing only its newline is terminated in place, since it is a
-durable, signed record that simply lost its trailing byte (the same reasoning
-issue #24 already established for the checkpoint file); any other fragment is
-not a complete record and is truncated away. If an earlier entry of the same
-trace already landed this attempt and the full rollback fails, the narrower
-repair is not attempted at all — it could only clean the trailing fragment,
-silently leaving that earlier entry as an orphaned, uncheckpointed,
-unquarantined partial trace that `VerifyLog` would report zero errors for.
-The log is marked **poisoned** instead (`errLogPoisoned`, mirroring
-`errCheckpointPoisoned` — see §3c/§3d): no further trace is appended to it,
-each subsequent one is quarantined instead (the same sidecar §3e describes),
-and the failure is reported once at `Shutdown` with a running count, not per
-trace. Whatever is actually left on disk — a torn tail included — is left as
-is, so it surfaces to `VerifyLog` as `torn_trailing_line` rather than being
-silently cleaned away. See issue #28.
+— and only when doing so cannot leave the trace only partially represented: a
+fragment that is valid JSON missing only its newline is terminated in place,
+since it is a durable, signed record that simply lost its trailing byte (the
+same reasoning issue #24 already established for the checkpoint file); any
+other fragment is not a complete record and is truncated away. Both outcomes
+are safe only when the trace has exactly one entry (either outcome then
+unambiguously decides the whole trace's fate) or every entry already wrote
+successfully this attempt (the trailing bytes are then structurally complete
+regardless of entry count). A **multi**-entry trace failing mid-write — on any
+entry, including the first — is unsafe either way: keeping a lone complete
+fragment is exactly as dangerous as leaving an untouched earlier sibling,
+since every later entry was never even attempted once the write loop returns.
+
+In every unsafe case the log is marked **poisoned** instead (`errLogPoisoned`,
+mirroring `errCheckpointPoisoned` — see §3c/§3d): no further trace is appended
+to it, each subsequent one is quarantined instead (the same sidecar §3e
+describes), and the failure is reported once at `Shutdown` with a running
+count, not per trace. Poisoning alone does not guarantee anything is visibly
+wrong on disk, though — a failure that deposits zero bytes, or a kept fragment
+that happens to be valid JSON on its own, can leave the file looking
+completely ordinary. So poisoning also appends a short, deliberately
+unparseable marker to the file's current tail (best-effort; a failure here is
+logged, not escalated further, since the process already knows to stop
+trusting the file regardless): a `\x00` byte can never start or follow a
+JSON value, so it forces the file's true final line to fail parsing — tolerated
+as `torn_trailing_line`, not silently absent, whatever the triggering failure
+actually left behind. See issue #28.
 
 **What this does not change:** the audit log's own hard-failure behavior in
 `VerifyLog` (`torn_trailing_line`, §7) is unaffected — this section is about
