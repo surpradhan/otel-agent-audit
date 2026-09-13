@@ -3071,6 +3071,14 @@ func TestShouldCheckpoint_RetryRateFloorOnceAtCap(t *testing.T) {
 // first, with nothing left over from the first episode's lastCheckpointAttempt
 // or pendingCapWarned state.
 //
+// Episode 1 additionally covers a case every other step here does not: the
+// floor elapsing while the checkpoint file is STILL failing. Every recovery
+// step below pairs "floor elapsed" with "file now writable," which alone
+// would never exercise a real attempt past the reopen that fails again — a
+// future regression narrowing Step 6's log suppression to only the attempt
+// immediately at pin time (rather than the whole pendingCapWarned episode)
+// would pass every other check here undetected.
+//
 // lastCheckpointAttempt is set directly (rather than via time.Sleep) at every
 // checkpoint below, so the assertions do not depend on how long the pinning
 // loops' cumulative I/O took. One timing assumption remains, deliberately: the
@@ -3100,8 +3108,14 @@ func TestPendingCap_RetryRateFloorOnceAtCap(t *testing.T) {
 
 	realFile := exp.checkFile
 
-	seal := func(i int) {
+	// nextSealIdx gives each seal below a fresh, strictly increasing index —
+	// its only job is a unique traceID/timestamp per call, so callers never
+	// need to hand-compute or renumber indices as steps are added or reordered.
+	nextSealIdx := 0
+	seal := func() {
 		t.Helper()
+		i := nextSealIdx
+		nextSealIdx++
 		traceID := [16]byte{0xD0, byte(i)}
 		if err := exp.ConsumeTraces(context.Background(),
 			makeSpan(traceID, [8]byte{byte(i + 1)}, zeroParentID, "op",
@@ -3126,8 +3140,8 @@ func TestPendingCap_RetryRateFloorOnceAtCap(t *testing.T) {
 	// shouldCheckpoint check in Step 6), also means that 6th seal's own
 	// attempt is already gated by the new floor.
 	const toPinCap = 6
-	for i := 0; i < toPinCap; i++ {
-		seal(i)
+	for n := 0; n < toPinCap; n++ {
+		seal()
 	}
 	exp.mu.Lock()
 	warned := exp.pendingCapWarned
@@ -3145,7 +3159,7 @@ func TestPendingCap_RetryRateFloorOnceAtCap(t *testing.T) {
 
 	// A seal right on top of that must not attempt again: pending alone,
 	// pinned at the cap, can no longer supply a useful retry signal.
-	seal(toPinCap)
+	seal()
 	exp.mu.Lock()
 	attemptsAfter := counter1.attempts
 	exp.mu.Unlock()
@@ -3154,13 +3168,38 @@ func TestPendingCap_RetryRateFloorOnceAtCap(t *testing.T) {
 			attemptsAfter-attemptsAtPin)
 	}
 
-	// Deterministically simulate the floor having elapsed, and the file
-	// becoming writable again: recovery must be detected.
+	// Force the floor to have elapsed while the file is STILL failing: the
+	// gate must reopen (pending alone cannot explain the earlier suppression
+	// forever), but a failure at this reopened attempt must still be
+	// suppressed for the rest of this pendingCapWarned episode — the gap
+	// round-3 review flagged, since every other step here pairs "floor
+	// elapsed" with "file now writable," which never exercises a failure
+	// past the reopen. logFailuresBeforeReopen captures the cumulative count
+	// (4 pre-cap attempts already legitimately logged before pendingCapWarned
+	// was set) so the assertion below checks "unchanged," not "zero."
+	logFailuresBeforeReopen := logs.FilterMessage("agentaudit: write checkpoint").Len()
+	exp.mu.Lock()
+	exp.lastCheckpointAttempt = time.Now().Add(-2 * cfg.MinCheckpointRetryInterval)
+	exp.mu.Unlock()
+	seal()
+	exp.mu.Lock()
+	attemptsAfterReopen := counter1.attempts
+	exp.mu.Unlock()
+	if attemptsAfterReopen == attemptsAfter {
+		t.Fatal("episode 1: expected the gate to reopen once the retry-interval floor elapsed")
+	}
+	if got := logs.FilterMessage("agentaudit: write checkpoint").Len(); got != logFailuresBeforeReopen {
+		t.Errorf("episode 1: per-attempt failure logs after the floor reopens but the write still fails: got %d new (%d -> %d), want 0 new (must stay suppressed)",
+			got-logFailuresBeforeReopen, logFailuresBeforeReopen, got)
+	}
+
+	// Deterministically simulate the floor having elapsed again, and the file
+	// becoming writable: recovery must be detected.
 	exp.mu.Lock()
 	exp.lastCheckpointAttempt = time.Now().Add(-2 * cfg.MinCheckpointRetryInterval)
 	exp.checkFile = realFile
 	exp.mu.Unlock()
-	seal(toPinCap + 1)
+	seal()
 
 	exp.mu.Lock()
 	pendingAfter := exp.accumulator.PendingCount()
@@ -3186,9 +3225,8 @@ func TestPendingCap_RetryRateFloorOnceAtCap(t *testing.T) {
 	exp.checkFile = counter2
 	exp.mu.Unlock()
 
-	const episode2Start = toPinCap + 2 // continues the trace-ID sequence past episode 1's seals (0..7)
-	for i := episode2Start; i < episode2Start+toPinCap; i++ {
-		seal(i)
+	for n := 0; n < toPinCap; n++ {
+		seal()
 	}
 	exp.mu.Lock()
 	warned2 := exp.pendingCapWarned
@@ -3202,7 +3240,7 @@ func TestPendingCap_RetryRateFloorOnceAtCap(t *testing.T) {
 		t.Errorf("episode 2: cumulative pending-cap-exceeded warning logs: got %d, want 2 (once per degraded episode, not just the first)", got)
 	}
 
-	seal(episode2Start + toPinCap)
+	seal()
 	exp.mu.Lock()
 	attemptsAfter2 := counter2.attempts
 	exp.mu.Unlock()
@@ -3216,7 +3254,7 @@ func TestPendingCap_RetryRateFloorOnceAtCap(t *testing.T) {
 	exp.lastCheckpointAttempt = time.Now().Add(-2 * cfg.MinCheckpointRetryInterval)
 	exp.checkFile = realFile
 	exp.mu.Unlock()
-	seal(episode2Start + toPinCap + 1)
+	seal()
 
 	exp.mu.Lock()
 	pendingAfter2 := exp.accumulator.PendingCount()
