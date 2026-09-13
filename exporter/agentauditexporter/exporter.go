@@ -1043,9 +1043,13 @@ func (e *agentAuditExporter) sealTrace(traceID string, buf *traceBuffer, checkpo
 // by Shutdown's compactWG.Wait()). On success, clears sealedTraces: entries
 // only need to persist until Compact removes the sealed WAL records; after
 // that the map can grow again from scratch. Called under e.mu, from every
-// early-return branch in sealTrace that marks a trace sealed without
-// reaching the ordinary Step 8 at the bottom — the schema_version/chain-build
-// quarantine branches and the logPoisoned branch alike.
+// early-return branch in sealTrace that hands a trace to quarantine or
+// log-poison handling instead of reaching the ordinary Step 8 at the bottom —
+// the schema_version/chain-build quarantine branches and the logPoisoned
+// branch alike. Deliberately NOT called from the write-failure rollback
+// branches (rollbackLog's callers): those leave the trace WAL-unsealed on
+// purpose, for retry on the next restart, so there is nothing yet for Compact
+// to remove.
 //
 // The permanent, sustained case is what makes this load-bearing: once
 // logPoisoned is set it never clears, so every future seal keeps taking that
