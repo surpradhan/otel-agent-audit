@@ -1690,8 +1690,9 @@ func TestStart_ParentDirSyncFailureIsNonFatal(t *testing.T) {
 	}
 }
 
-// TestConfig_Validate_NegativeValues verifies that negative TraceTimeout and
-// CheckpointInterval are rejected by Validate.
+// TestConfig_Validate_NegativeValues verifies that negative TraceTimeout,
+// CheckpointInterval, MaxPendingTips, and MinCheckpointRetryInterval are all
+// rejected by Validate.
 func TestConfig_Validate_NegativeValues(t *testing.T) {
 	base := Config{
 		LogPath:        "/tmp/a.jsonl",
