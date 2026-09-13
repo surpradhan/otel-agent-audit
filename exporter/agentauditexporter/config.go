@@ -53,6 +53,16 @@ type Config struct {
 	// bounded; this reintroduces bounded, observable data loss in exchange for
 	// that bound. Default: 0, meaning 10 * CheckpointInterval.
 	MaxPendingTips int `mapstructure:"max_pending_tips"`
+
+	// MinCheckpointRetryInterval is the minimum wall-clock time between
+	// checkpoint write attempts once MaxPendingTips has pinned the pending set
+	// at its cap. Below the cap, retries are already thinned by the
+	// count-based backoff in shouldCheckpoint; once pinned, pending stops
+	// moving, so that backoff is permanently satisfied and, without this
+	// floor, a persistent checkpoint-write outage would retry a full
+	// checkpoint write on every single sealed trace for as long as it lasts
+	// (issue #30). Default: 0, meaning 1 second.
+	MinCheckpointRetryInterval time.Duration `mapstructure:"min_checkpoint_retry_interval"`
 }
 
 // Validate checks that the configuration is valid.
@@ -90,6 +100,9 @@ func (c *Config) Validate() error {
 	}
 	if c.MaxPendingTips < 0 {
 		return errors.New("max_pending_tips must not be negative")
+	}
+	if c.MinCheckpointRetryInterval < 0 {
+		return errors.New("min_checkpoint_retry_interval must not be negative")
 	}
 	// If the effective cap is below the effective interval, TrimPending would
 	// hold pending below the threshold shouldCheckpoint needs to ever fire a

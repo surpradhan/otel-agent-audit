@@ -163,9 +163,20 @@ type agentAuditExporter struct {
 
 	// pendingCapWarned is set the first time the pending-tip cap is hit, so the
 	// loud log fires once per degraded episode rather than once per dropped tip
-	// — the same rationale as shouldCheckpoint's backoff. Cleared whenever a
-	// checkpoint write next succeeds (see writeCheckpoint).
+	// — the same rationale as shouldCheckpoint's backoff. It also marks the
+	// state in which shouldCheckpoint substitutes the time-based
+	// effectiveMinCheckpointRetryInterval floor for the (by then permanently
+	// satisfied) count-based backoff — see lastCheckpointAttempt. Cleared
+	// whenever a checkpoint write next succeeds (see writeCheckpoint).
 	pendingCapWarned bool // guarded by mu
+
+	// lastCheckpointAttempt is the wall-clock time of the most recent
+	// writeCheckpoint call (successful or not). Only consulted once
+	// pendingCapWarned is set, to enforce effectiveMinCheckpointRetryInterval
+	// — see shouldCheckpoint. Its zero value ("never attempted") never blocks
+	// a retry, since time.Since of the zero Time is always far beyond any
+	// configured interval.
+	lastCheckpointAttempt time.Time // guarded by mu
 
 	mu        sync.Mutex
 	compactWG sync.WaitGroup // tracks background Compact goroutines
@@ -216,6 +227,27 @@ func (e *agentAuditExporter) effectiveCheckpointInterval() int {
 // sustained checkpoint write failure — see the TrimPending call in sealTrace.
 func (e *agentAuditExporter) effectiveMaxPendingTips(checkpointInterval int) int {
 	return effectiveMaxPendingTipsOf(e.cfg.MaxPendingTips, checkpointInterval)
+}
+
+// defaultMinCheckpointRetryInterval is applied when MinCheckpointRetryInterval
+// is unset. See effectiveMinCheckpointRetryIntervalOf.
+const defaultMinCheckpointRetryInterval = time.Second
+
+// effectiveMinCheckpointRetryIntervalOf returns interval with
+// defaultMinCheckpointRetryInterval applied when unset (<= 0). A free
+// function, rather than a method, mirroring effectiveCheckpointIntervalOf.
+func effectiveMinCheckpointRetryIntervalOf(interval time.Duration) time.Duration {
+	if interval > 0 {
+		return interval
+	}
+	return defaultMinCheckpointRetryInterval
+}
+
+// effectiveMinCheckpointRetryInterval returns the configured retry-rate floor,
+// defaulting to defaultMinCheckpointRetryInterval when unset (zero). See
+// shouldCheckpoint.
+func (e *agentAuditExporter) effectiveMinCheckpointRetryInterval() time.Duration {
+	return effectiveMinCheckpointRetryIntervalOf(e.cfg.MinCheckpointRetryInterval)
 }
 
 // fsyncLog reports whether the audit-log file should be fsynced after each
@@ -1011,13 +1043,15 @@ func (e *agentAuditExporter) sealTrace(traceID string, buf *traceBuffer, checkpo
 	// failed attempt).
 	if e.shouldCheckpoint(checkpointInterval) {
 		if err := e.writeCheckpoint(); err != nil {
-			// Once pinned at the pending-tip cap, nextCheckpointRetryAt's clamp
-			// means shouldCheckpoint retries on literally every seal for as long
-			// as the outage lasts (see its doc comment) — logging each of those
-			// failures would flood the log for no new information beyond what the
-			// one-time pendingCapWarned log and the Shutdown summary already give.
-			// Below the cap, attempts are already rare (the backoff is doing its
-			// job), so log every one of those.
+			// Once pinned at the pending-tip cap, shouldCheckpoint retries at
+			// most once per effectiveMinCheckpointRetryInterval for as long as
+			// the outage lasts (see its doc comment and issue #30) rather than
+			// on literally every seal — but that can still be many attempts
+			// over a long outage, and logging each one would flood the log for
+			// no new information beyond what the one-time pendingCapWarned log
+			// and the Shutdown summary already give. Below the cap, attempts
+			// are already rare (the count-based backoff is doing its job), so
+			// log every one of those.
 			if !e.pendingCapWarned {
 				e.logger.Error("agentaudit: write checkpoint", zap.Error(err))
 			}
@@ -1593,9 +1627,25 @@ const maxCheckpointRetryGap = 1024
 // see effectiveMaxPendingTips and the TrimPending call in sealTrace. (Once
 // checkpointing is *permanently* disabled the tips are all dropped instead;
 // see poisonCheckpoint.)
+//
+// Once pending is pinned at effectiveMaxPendingTips (see the TrimPending call
+// in sealTrace), the count-based check above is permanently satisfied —
+// pending stops moving, so "pending >= checkpointRetryAt" can never again be
+// false. Without a separate check, every subsequently sealed trace would
+// re-attempt the write, collapsing ConsumeTraces throughput for as long as a
+// persistent outage lasts (issue #30). pendingCapWarned marks that pinned
+// state, so once it is set an attempt is only made if
+// effectiveMinCheckpointRetryInterval has elapsed since lastCheckpointAttempt
+// — pending cannot supply a useful signal anymore at that point.
 func (e *agentAuditExporter) shouldCheckpoint(checkpointInterval int) bool {
 	pending := e.accumulator.PendingCount()
-	return pending >= checkpointInterval && pending >= e.checkpointRetryAt
+	if pending < checkpointInterval || pending < e.checkpointRetryAt {
+		return false
+	}
+	if e.pendingCapWarned && time.Since(e.lastCheckpointAttempt) < e.effectiveMinCheckpointRetryInterval() {
+		return false
+	}
+	return true
 }
 
 // nextCheckpointRetryAt returns the pending count at which the next retry is
@@ -1609,13 +1659,16 @@ func (e *agentAuditExporter) shouldCheckpoint(checkpointInterval int) bool {
 // the underlying outage heals. Clamping guarantees pending sitting at the cap
 // always qualifies for a retry, so recovery is still detected.
 //
-// This deliberately gives up the backoff's thinning once pending is pinned at
-// the cap: from that point every seal both retries and re-trims, for as long
-// as the outage lasts. That is the trade for guaranteeing recovery is detected
-// on the very next successful write rather than at some later, possibly much
-// larger, pending count. See the pendingCapWarned check around the
-// writeCheckpoint call in sealTrace, which is what keeps that steady-state
-// retrying from also flooding the log.
+// This deliberately gives up the count-based backoff's thinning once pending
+// is pinned at the cap: from that point, "pending >= checkpointRetryAt" above
+// is permanently satisfied (pending stops moving, since TrimPending holds it
+// at the cap on every seal). That is the trade for guaranteeing recovery is
+// detected as soon as a write succeeds, rather than at some later, possibly
+// much larger, pending count. What still bounds the *rate* of retry attempts
+// in that steady state is a separate, time-based floor — see the
+// pendingCapWarned check in shouldCheckpoint and
+// effectiveMinCheckpointRetryInterval (issue #30) — since a count-based
+// backoff has nothing left to grow once pending stops moving.
 func (e *agentAuditExporter) nextCheckpointRetryAt(pending int) int {
 	next := pending + 1
 	if e.checkpointFailures > 1 {
@@ -1648,7 +1701,12 @@ func (e *agentAuditExporter) nextCheckpointRetryAt(pending int) int {
 // and break prev_checkpoint_hash from there on, so instead the file is marked
 // poisoned and every later checkpoint write fails with errCheckpointPoisoned.
 // The chain stops growing, but what is already persisted still verifies.
+//
+// Records lastCheckpointAttempt unconditionally, before anything can fail —
+// shouldCheckpoint's pending-cap retry floor measures the gap since the last
+// *attempt*, not the last failure, regardless of how this one turns out.
 func (e *agentAuditExporter) writeCheckpoint() (err error) {
+	e.lastCheckpointAttempt = time.Now()
 	// Back off before retrying a failed checkpoint; clear the backoff on success.
 	defer func() {
 		if err != nil {
