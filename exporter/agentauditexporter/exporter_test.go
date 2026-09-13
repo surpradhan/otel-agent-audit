@@ -1717,6 +1717,12 @@ func TestConfig_Validate_NegativeValues(t *testing.T) {
 	if err := neg3.Validate(); err == nil {
 		t.Error("expected error for negative max_pending_tips")
 	}
+
+	neg4 := base
+	neg4.MinCheckpointRetryInterval = -1 * time.Second
+	if err := neg4.Validate(); err == nil {
+		t.Error("expected error for negative min_checkpoint_retry_interval")
+	}
 }
 
 // TestConfig_Validate_MaxPendingTipsBelowCheckpointInterval verifies the
@@ -1869,6 +1875,20 @@ func TestEffectiveMaxPendingTips(t *testing.T) {
 	set := newAgentAuditExporter(&Config{CheckpointInterval: 100, MaxPendingTips: 42}, nil)
 	if got := set.effectiveMaxPendingTips(set.effectiveCheckpointInterval()); got != 42 {
 		t.Fatalf("configured cap = %d, want 42", got)
+	}
+}
+
+// TestEffectiveMinCheckpointRetryInterval verifies that an unset floor falls
+// back to 1 second, and that an explicit positive value overrides it.
+func TestEffectiveMinCheckpointRetryInterval(t *testing.T) {
+	def := newAgentAuditExporter(&Config{}, nil)
+	if got := def.effectiveMinCheckpointRetryInterval(); got != time.Second {
+		t.Fatalf("default floor = %v, want 1s", got)
+	}
+
+	set := newAgentAuditExporter(&Config{MinCheckpointRetryInterval: 5 * time.Millisecond}, nil)
+	if got := set.effectiveMinCheckpointRetryInterval(); got != 5*time.Millisecond {
+		t.Fatalf("configured floor = %v, want 5ms", got)
 	}
 }
 
@@ -2822,6 +2842,13 @@ func TestPendingCap_DropsOldestTipsAndRecovers(t *testing.T) {
 	cfg := env.cfg
 	cfg.CheckpointInterval = 1
 	cfg.MaxPendingTips = 5
+	// This test exercises the drop/recover mechanism (issue #21 / PR #29), not
+	// the retry-rate floor added for issue #30 — see
+	// TestPendingCap_RetryRateFloorOnceAtCap for that. Its recovery seal runs
+	// microseconds after the preceding failing seal, well inside the default
+	// 1s floor, so a negligible interval keeps that floor from suppressing the
+	// very attempt this test's recovery assertions depend on.
+	cfg.MinCheckpointRetryInterval = time.Nanosecond
 
 	exp := startExporter(t, cfg)
 
@@ -2923,11 +2950,16 @@ func TestPendingCap_DropsOldestTipsAndRecovers(t *testing.T) {
 
 // TestPendingCap_SuppressesPerAttemptLogOnceAtCap is the regression guard for
 // the log-flood fix in sealTrace's Step 6: once pending is pinned at the cap,
-// nextCheckpointRetryAt's clamp means shouldCheckpoint retries on literally
-// every seal for the rest of the outage, so an unthrottled per-attempt
-// "write checkpoint" failure log would flood for as long as it lasts. Only the
-// one-time "pending tip set exceeded its cap" warning should survive at
-// steady state — the per-attempt log must stop once pendingCapWarned is set.
+// an unthrottled per-attempt "write checkpoint" failure log would flood for as
+// long as the outage lasts — whether attempts happen on every seal (pre-#30)
+// or are thinned by effectiveMinCheckpointRetryInterval (#30), a busy trace
+// rate can still produce many of them over a long outage. Only the one-time
+// "pending tip set exceeded its cap" warning should survive at steady state —
+// the per-attempt log must stop once pendingCapWarned is set. This test uses
+// the default MinCheckpointRetryInterval, so in practice its 40-seal burst
+// completes well inside the first interval and only the pre-cap schedule's
+// four attempts ever fire; see TestPendingCap_RetryRateFloorOnceAtCap for the
+// floor's own behavior once pinned.
 func TestPendingCap_SuppressesPerAttemptLogOnceAtCap(t *testing.T) {
 	env := newTestEnv(t)
 	cfg := env.cfg
@@ -2973,6 +3005,147 @@ func TestPendingCap_SuppressesPerAttemptLogOnceAtCap(t *testing.T) {
 	}
 	if got := logs.FilterMessageSnippet("pending tip set exceeded its cap").Len(); got != 1 {
 		t.Errorf("pending-cap-exceeded warning logs: got %d, want exactly 1 (once per degraded episode)", got)
+	}
+}
+
+// TestShouldCheckpoint_RetryRateFloorOnceAtCap covers the fix for issue #30 at
+// the unit level: once pending is pinned at the cap, nextCheckpointRetryAt's
+// clamp makes the count-based condition in shouldCheckpoint permanently
+// satisfied (see its doc comment), so without a separate check shouldCheckpoint
+// would return true on every call for as long as a persistent outage lasts.
+// MinCheckpointRetryInterval bounds that directly. Drives shouldCheckpoint
+// directly (mirroring TestNextCheckpointRetryAt's style) so the assertions
+// depend only on time.Now() arithmetic, never on how long a real I/O
+// operation happens to take.
+func TestShouldCheckpoint_RetryRateFloorOnceAtCap(t *testing.T) {
+	priv, _, err := sign.GenerateEd25519Key()
+	if err != nil {
+		t.Fatalf("GenerateEd25519Key: %v", err)
+	}
+	e := newAgentAuditExporter(&Config{
+		CheckpointInterval:         1,
+		MaxPendingTips:             5,
+		MinCheckpointRetryInterval: 100 * time.Millisecond,
+	}, nil)
+	e.accumulator = chain.NewAccumulator(sign.NewEd25519Signer(priv), 0, chain.ZeroPrevCheckpointHash)
+
+	// Simulate "pinned at the cap": pending sits at the cap, checkpointRetryAt
+	// is clamped there too (nextCheckpointRetryAt's steady state), and
+	// pendingCapWarned is set.
+	for i := 0; i < 5; i++ {
+		e.accumulator.AddTip(fmt.Sprintf("trace-%d", i), fmt.Sprintf("hash-%d", i), 1)
+	}
+	e.checkpointRetryAt = 5
+	e.pendingCapWarned = true
+
+	e.lastCheckpointAttempt = time.Now()
+	if e.shouldCheckpoint(1) {
+		t.Error("shouldCheckpoint immediately after an attempt: got true, want false (retry-interval floor should block it)")
+	}
+
+	e.lastCheckpointAttempt = time.Now().Add(-200 * time.Millisecond)
+	if !e.shouldCheckpoint(1) {
+		t.Error("shouldCheckpoint once the retry-interval floor has elapsed: got false, want true")
+	}
+
+	// Below the cap (pendingCapWarned false), the floor must not apply at all
+	// — only the pre-existing count-based backoff governs.
+	e.pendingCapWarned = false
+	e.lastCheckpointAttempt = time.Now()
+	if !e.shouldCheckpoint(1) {
+		t.Error("shouldCheckpoint below the cap: got false, want true (the new floor must not apply pre-cap)")
+	}
+}
+
+// TestPendingCap_RetryRateFloorOnceAtCap is the end-to-end counterpart to
+// TestShouldCheckpoint_RetryRateFloorOnceAtCap: it drives the fix for issue #30
+// through the real ConsumeTraces path, proving sealTrace/writeCheckpoint wire
+// pendingCapWarned, lastCheckpointAttempt, and MinCheckpointRetryInterval
+// together correctly. lastCheckpointAttempt is set directly (rather than via
+// time.Sleep) at both checkpoints below so the assertions do not depend on how
+// long the real file I/O in the seals actually takes.
+func TestPendingCap_RetryRateFloorOnceAtCap(t *testing.T) {
+	env := newTestEnv(t)
+	cfg := env.cfg
+	cfg.CheckpointInterval = 1
+	cfg.MaxPendingTips = 5
+	cfg.MinCheckpointRetryInterval = 200 * time.Millisecond
+
+	exp := startExporter(t, cfg)
+	// Drain the background WAL-compact goroutines sealTrace spawns before
+	// t.TempDir() removes the directory out from under them — otherwise this
+	// races os.RemoveAll and flakes with "unlinkat: directory not empty" (see
+	// TestPendingCap_SuppressesPerAttemptLogOnceAtCap).
+	t.Cleanup(func() { _ = exp.Shutdown(context.Background()) })
+
+	realFile := exp.checkFile
+	counter := &countingWriteFile{
+		logSyncer: realFile,
+		syncErr:   fmt.Errorf("simulated ENOSPC"),
+	}
+	exp.mu.Lock()
+	exp.checkFile = counter
+	exp.mu.Unlock()
+
+	seal := func(i int) {
+		t.Helper()
+		traceID := [16]byte{0xD0, byte(i)}
+		if err := exp.ConsumeTraces(context.Background(),
+			makeSpan(traceID, [8]byte{byte(i + 1)}, zeroParentID, "op",
+				uint64(1_000_000*(i+1)), uint64(1_000_000*(i+2)))); err != nil {
+			t.Fatalf("ConsumeTraces %d: %v", i, err)
+		}
+	}
+
+	// Pin at the cap: interval=1, cap=5 -> attempts fire at pending 1,2,4,5
+	// (four total, same schedule as TestPendingCap_SuppressesPerAttemptLogOnceAtCap),
+	// then pendingCapWarned is set during the 6th seal — which, per
+	// shouldCheckpoint's ordering (TrimPending in Step 5 runs before the
+	// shouldCheckpoint check in Step 6), also means that 6th seal's own
+	// attempt is already gated by the new floor.
+	const toPinCap = 6
+	for i := 0; i < toPinCap; i++ {
+		seal(i)
+	}
+	exp.mu.Lock()
+	warned := exp.pendingCapWarned
+	attemptsAtPin := counter.attempts
+	// Force the "just attempted" state deterministically, independent of how
+	// long the pinning loop above actually took under -race or a slow disk.
+	exp.lastCheckpointAttempt = time.Now()
+	exp.mu.Unlock()
+	if !warned {
+		t.Fatal("expected pendingCapWarned once the cap was first hit")
+	}
+
+	// A seal right on top of that must not attempt again: pending alone,
+	// pinned at the cap, can no longer supply a useful retry signal.
+	seal(toPinCap)
+	exp.mu.Lock()
+	attemptsAfter := counter.attempts
+	exp.mu.Unlock()
+	if attemptsAfter != attemptsAtPin {
+		t.Errorf("checkpoint attempts on the seal immediately after pinning: got %d new attempts, want 0 (the retry-interval floor should have suppressed it)",
+			attemptsAfter-attemptsAtPin)
+	}
+
+	// Deterministically simulate the floor having elapsed, and the file
+	// becoming writable again: recovery must be detected.
+	exp.mu.Lock()
+	exp.lastCheckpointAttempt = time.Now().Add(-2 * cfg.MinCheckpointRetryInterval)
+	exp.checkFile = realFile
+	exp.mu.Unlock()
+	seal(toPinCap + 1)
+
+	exp.mu.Lock()
+	pendingAfter := exp.accumulator.PendingCount()
+	warnedAfter := exp.pendingCapWarned
+	exp.mu.Unlock()
+	if pendingAfter != 0 {
+		t.Errorf("pending after the recovery seal: got %d, want 0 (recovery must be detected once the retry-interval floor elapses)", pendingAfter)
+	}
+	if warnedAfter {
+		t.Error("pendingCapWarned must reset once the checkpoint succeeds")
 	}
 }
 

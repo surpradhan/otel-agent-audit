@@ -104,17 +104,21 @@ entries are still durably in the audit log, `VerifyLog` does not flag them as
 an error (`internal/verify/verify.go` deliberately tolerates checkpoint-uncovered
 traces), and only the checkpoint's coverage of them is lost.
 
-Once pending is pinned at the cap, the backoff's thinning intentionally stops:
-every subsequently sealed trace both retries the checkpoint write and re-trims
-the pending set, for as long as the outage lasts. That is the trade for
-guaranteeing the very next successful write is retried immediately rather than
-at some later, possibly much larger, pending count — but it does mean the
-write+`fsync` attempt rate against the already-faulting file rises to one per
-sealed trace. The per-attempt failure log is suppressed during this steady
-state (the one-time cap-exceeded log and the `Shutdown` summary already cover
-it), so log volume does not scale with it, only the write attempts themselves do.
-Decoupling the attempt rate itself from recovery-detection speed is tracked as
-a follow-up (issue #30) rather than addressed here.
+Once pending is pinned at the cap, the count-based backoff's thinning
+intentionally stops: pending stops moving, so its "pending >=
+checkpointRetryAt" condition is permanently satisfied. Left unchecked, every
+subsequently sealed trace would both retry the checkpoint write and re-trim
+the pending set, for as long as the outage lasts — a write+`fsync` attempt
+against the already-faulting file on every single sealed trace, collapsing
+`ConsumeTraces` throughput. `min_checkpoint_retry_interval` (default 1s) bounds
+that instead: once pinned at the cap, an attempt is made at most once per
+interval, independent of pending, which can no longer supply a useful retry
+signal once it stops moving. Recovery is still detected promptly — within one
+interval of the underlying fault clearing — rather than on the very next
+sealed trace, trading a small, bounded detection delay for a bounded attempt
+rate (issue #30). The per-attempt failure log is suppressed during this steady
+state regardless of the attempt rate (the one-time cap-exceeded log and the
+`Shutdown` summary already cover it).
 
 This is distinct from the **poisoned** state (`errCheckpointPoisoned`): poisoning
 means no checkpoint can *ever* be written again for the life of the process, so
@@ -125,7 +129,9 @@ checkpointing could still succeed once the underlying fault clears.
 **Mitigation:** monitor for the `pending tip set exceeded its cap` error log and
 the `tips_dropped_for_pending_cap` count at `Shutdown` — both indicate degraded
 coverage, not a crash. Size `max_pending_tips` for the outage duration an
-operator is willing to tolerate before accepting additional loss.
+operator is willing to tolerate before accepting additional loss, and
+`min_checkpoint_retry_interval` for the attempt-rate-vs-recovery-latency
+trade-off once that cap is hit.
 
 ### 3d. Sealed trace tip survives a crash before its checkpoint
 

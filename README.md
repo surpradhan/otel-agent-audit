@@ -109,6 +109,7 @@ exporters:
     checkpoint_interval: 100
     fsync_log: true   # default; set false to disable for high-throughput testing
     max_pending_tips: 1000  # default: 10x checkpoint_interval; caps memory during a sustained checkpoint write failure
+    min_checkpoint_retry_interval: 1s  # default; floors the retry-attempt rate once max_pending_tips is hit
 
 service:
   pipelines:
