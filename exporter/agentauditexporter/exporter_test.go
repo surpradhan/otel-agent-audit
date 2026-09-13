@@ -4333,6 +4333,82 @@ func TestSealTrace_UnseedableQuarantineStillSchedulesCompact(t *testing.T) {
 	if !bytes.Contains(quarantined, []byte(`"span_name":"unseedable"`)) {
 		t.Errorf("expected the record quarantined via sealTrace's genesis-seed-failure branch specifically:\n%s", quarantined)
 	}
+	// Ties this to the specific branch under test, not just any quarantine
+	// path that happens to produce a similarly-shaped entry.
+	if !bytes.Contains(quarantined, []byte(`"reason":"schema_version cannot seed a chain"`)) {
+		t.Errorf("expected the genesis-seed-failure reason specifically:\n%s", quarantined)
+	}
+}
+
+// failingSigner always fails Sign, for driving chain.BuildChain into its own
+// error path (its only other failure source, canonical.Marshal, is
+// realistically unreachable: AuditRecord's only custom marshaler always
+// returns a nil error).
+type failingSigner struct{}
+
+func (failingSigner) Sign([]byte) ([]byte, error) { return nil, fmt.Errorf("forced signer failure") }
+func (failingSigner) KeyID() string               { return "fake-key" }
+
+// TestSealTrace_ChainBuildFailureStillSchedulesCompact covers the other half
+// of the scheduleWALCompact parity fix: the "chain could not be built"
+// branch, alongside TestSealTrace_UnseedableQuarantineStillSchedulesCompact's
+// "schema_version cannot seed a chain" branch. Swaps in a signer that always
+// fails right before the seal, the same technique used elsewhere in this file
+// to corrupt in-memory state mid-flow (e.g. SchemaVersion above) rather than
+// trying to construct a failure through the public API, since chain.BuildChain
+// has no public input shape that fails on its own.
+func TestSealTrace_ChainBuildFailureStillSchedulesCompact(t *testing.T) {
+	env := newTestEnv(t)
+	core, logs := observer.New(zap.WarnLevel)
+	exp := newAgentAuditExporter(env.cfg, zap.New(core))
+	if err := exp.Start(context.Background(), nil); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	t.Cleanup(func() { _ = exp.Shutdown(context.Background()) })
+
+	traceID := [16]byte{0x88}
+	childID := [8]byte{0x01}
+	rootID := [8]byte{0x02}
+
+	if err := exp.ConsumeTraces(context.Background(),
+		makeSpan(traceID, childID, rootID, "child-ok", 1000, 2000)); err != nil {
+		t.Fatalf("ConsumeTraces child: %v", err)
+	}
+
+	exp.mu.Lock()
+	exp.signer = failingSigner{}
+	exp.mu.Unlock()
+
+	// Root triggers the seal; BuildChain fails on this signer for every
+	// entry, including the child's otherwise-valid one.
+	if err := exp.ConsumeTraces(context.Background(),
+		makeSpan(traceID, rootID, zeroParentID, "root", 3000, 4000)); err != nil {
+		t.Fatalf("ConsumeTraces root: %v", err)
+	}
+
+	exp.compactWG.Wait()
+
+	if logs.FilterMessageSnippet("background WAL compact failed").Len() != 0 {
+		t.Errorf("Compact failed unexpectedly: %v", logs.All())
+	}
+
+	exp.mu.Lock()
+	remaining := len(exp.sealedTraces)
+	exp.mu.Unlock()
+	if remaining != 0 {
+		t.Errorf("expected sealedTraces cleared by a scheduled Compact, got %d entries still present", remaining)
+	}
+
+	quarantined, err := os.ReadFile(env.cfg.WalPath + quarantineSuffix)
+	if err != nil {
+		t.Fatalf("reading quarantine sidecar: %v", err)
+	}
+	if !bytes.Contains(quarantined, []byte(`"span_name":"child-ok"`)) {
+		t.Errorf("expected the record quarantined via sealTrace's chain-build-failure branch specifically:\n%s", quarantined)
+	}
+	if !bytes.Contains(quarantined, []byte(`"reason":"chain could not be built"`)) {
+		t.Errorf("expected the chain-build-failure reason specifically:\n%s", quarantined)
+	}
 }
 
 // TestQuarantine_OpenFailureLeavesRecordsInWAL covers the one path where this
