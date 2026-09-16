@@ -143,8 +143,7 @@ than one distinct `key_id` in the log and refuses to verify it as a whole.
 
 **A rotated log cannot currently be verified end to end** (issue #19).
 Splitting the log per epoch and verifying each slice separately — which this
-section used to recommend as the fix — does not reliably detect deletion of
-the boundary trace (issue #35):
+section used to recommend as the fix — has two defects (issue #35):
 
 - The trace sealed under the old key but first checkpointed under the new one
   loses its only attestation once the new epoch's checkpoint is excluded from
@@ -155,6 +154,13 @@ the boundary trace (issue #35):
   checkpoint truncation — because the split gives the verifier no way to seed
   the previous epoch's tail.
 
+To identify the epochs present in a log:
+
+```bash
+jq -r '.signed.key_id' audit.jsonl | sort -u
+jq -r '.key_id' checkpoint.jsonl | sort -u
+```
+
 Until rotation-aware verification lands, two compensating controls reduce the
 exposure without closing it:
 
@@ -163,12 +169,13 @@ exposure without closing it:
    lose.
 2. **Run the verifier once per epoch, then cross-check every checkpoint's
    `trace_tips` against the whole (unsplit) log** — not just its own epoch's
-   slice. Extract each epoch's log/checkpoint lines by `key_id` (e.g.
-   `jq 'select(.signed.key_id == "<id>")'`) and run the verifier against each
-   slice with its matching key. That alone still reports `Status: OK` even
-   when the boundary trace has been deleted, per above — the cross-check is
-   what catches it: a checkpoint claiming a trace the full log no longer
-   holds is the deletion made visible:
+   slice. Extract each epoch's lines by `key_id` — the log and checkpoint
+   files nest it differently: `jq 'select(.signed.key_id == "<id>")'
+   audit.jsonl` and `jq 'select(.key_id == "<id>")' checkpoint.jsonl` — and
+   run the verifier against each slice with its matching key. That alone
+   still reports `Status: OK` even when the boundary trace has been deleted,
+   per above — the cross-check is what catches it: a checkpoint claiming a
+   trace the full log no longer holds is the deletion made visible:
 
    ```
    cp claims 1111…  entry_count=2 ; log has 2
@@ -178,13 +185,6 @@ exposure without closing it:
    This catches an outright-deleted boundary trace, but covers neither that
    checkpoint's `tip_hash` nor its own signature — a partial check, not a
    substitute for rotation-aware verification.
-
-To identify the epochs present in a log:
-
-```bash
-jq -r '.signed.key_id' audit.jsonl | sort -u
-jq -r '.key_id' checkpoint.jsonl | sort -u
-```
 
 ## Key distribution (v1 scope)
 
