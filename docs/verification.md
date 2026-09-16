@@ -170,9 +170,11 @@ exposure without closing it:
 2. **Run the verifier once per epoch, then cross-check every checkpoint's
    `trace_tips` against the whole (unsplit) log** — not just its own epoch's
    slice. Extract each epoch's lines by `key_id` — the log and checkpoint
-   files nest it differently: `jq 'select(.signed.key_id == "<id>")'
-   audit.jsonl` and `jq 'select(.key_id == "<id>")' checkpoint.jsonl` — and
-   run the verifier against each slice with its matching key. That alone
+   files nest it differently: `jq -c 'select(.signed.key_id == "<id>")'
+   audit.jsonl` and `jq -c 'select(.key_id == "<id>")' checkpoint.jsonl` —
+   note the `-c`: jq's default pretty-printed output spans multiple lines,
+   which breaks the verifier's one-JSON-object-per-line parsing. Run the
+   verifier against each slice with its matching key. That alone
    still reports `Status: OK` even when the boundary trace has been deleted,
    per above — the cross-check is what catches it: a checkpoint claiming a
    trace the full log no longer holds is the deletion made visible:
