@@ -64,6 +64,13 @@ Operators requiring finer completeness guarantees should lower
 `checkpoint_interval` or call `Shutdown` at regular intervals to force a
 checkpoint flush.
 
+This guarantee holds within a single key epoch. At a key-rotation boundary,
+the "next checkpoint" is signed by the new key, and the currently-documented
+per-epoch verification procedure excludes it from the old epoch's run — so
+the one checkpoint that would have caught a dropped boundary trace is
+exactly the one omitted. See [docs/verification.md § Multi-epoch
+logs](verification.md#multi-epoch-logs) and issue #19.
+
 ### 3b. Intra-trace completeness (early-root truncation)
 
 A trace is sealed **as soon as any span with an empty `parent_span_id` arrives**
@@ -348,6 +355,11 @@ technical counsel.
 - A trace that was **never written** to the log (it is absent, not corrupted)
 - Tampering that occurred before the span reached the collector
 - A complete log rewrite by an adversary who holds the private key (§2)
+- At a key-rotation boundary, deletion of the trace whose only checkpoint
+  coverage crosses the boundary — the currently-documented per-epoch
+  verification procedure reports `Status: OK` regardless (§3a,
+  [docs/verification.md § Multi-epoch
+  logs](verification.md#multi-epoch-logs), issue #19)
 
 ---
 

@@ -260,7 +260,8 @@ func TestVerifyLog_WrongKey_KeyIDMismatch(t *testing.T) {
 
 // TestVerifyLog_MultiEpochLog verifies that a log containing entries signed by
 // two different keys returns an error (not a report with per-trace errors).
-// The operator must re-run per epoch with the matching key.
+// Rotation-aware verification is not yet supported — see
+// docs/verification.md "Multi-epoch logs" and issue #19.
 func TestVerifyLog_MultiEpochLog(t *testing.T) {
 	dir := t.TempDir()
 	logPath := filepath.Join(dir, "audit.jsonl")
