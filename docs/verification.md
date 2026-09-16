@@ -143,8 +143,8 @@ than one distinct `key_id` in the log and refuses to verify it as a whole.
 
 **A rotated log cannot currently be verified end to end** (issue #19).
 Splitting the log per epoch and verifying each slice separately — which this
-section used to recommend as the fix — does not reliably detect tampering at
-the boundary (issue #35):
+section used to recommend as the fix — does not reliably detect deletion of
+the boundary trace (issue #35):
 
 - The trace sealed under the old key but first checkpointed under the new one
   loses its only attestation once the new epoch's checkpoint is excluded from
@@ -161,19 +161,23 @@ exposure without closing it:
 1. **Rotate only across a clean `Shutdown`.** A final checkpoint flush means
    no trace's coverage crosses the boundary, so there is no boundary trace to
    lose.
-2. **After the per-epoch runs, cross-check every checkpoint's `trace_tips`
-   against the whole (unsplit) log**, not just its own epoch's slice — a
-   checkpoint claiming a trace the full log no longer holds is exactly the
-   deletion the split otherwise hides:
+2. **Run the verifier once per epoch, then cross-check every checkpoint's
+   `trace_tips` against the whole (unsplit) log** — not just its own epoch's
+   slice. Extract each epoch's log/checkpoint lines by `key_id` (e.g.
+   `jq 'select(.signed.key_id == "<id>")'`) and run the verifier against each
+   slice with its matching key. That alone still reports `Status: OK` even
+   when the boundary trace has been deleted, per above — the cross-check is
+   what catches it: a checkpoint claiming a trace the full log no longer
+   holds is the deletion made visible:
 
    ```
    cp claims 1111…  entry_count=2 ; log has 2
    cp claims 2222…  entry_count=2 ; log has 0   <- deleted boundary trace
    ```
 
-   This catches an outright-deleted boundary trace but covers neither
-   `tip_hash` nor the later checkpoint's own signature — it is a partial
-   check, not a substitute for rotation-aware verification.
+   This catches an outright-deleted boundary trace, but covers neither that
+   checkpoint's `tip_hash` nor its own signature — a partial check, not a
+   substitute for rotation-aware verification.
 
 To identify the epochs present in a log:
 

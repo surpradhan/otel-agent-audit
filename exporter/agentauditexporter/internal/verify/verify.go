@@ -155,8 +155,8 @@ func VerifyCheckpoint(cp chain.Checkpoint, prevSignPayloadHash string, pubKey ed
 //     VerifyLog returns a Go error (not a Report) and stops. Rotation-aware
 //     verification is not yet supported (see docs/verification.md
 //     "Multi-epoch logs" and issue #19) — splitting the log per epoch and
-//     verifying each slice separately does not reliably detect tampering at
-//     the boundary.
+//     verifying each slice separately does not reliably detect deletion of
+//     the boundary trace.
 //   - If the single key_id in the log does not match the supplied public key,
 //     VerifyLog emits "key_id_mismatch" errors for every trace and checkpoint
 //     without attempting chain verification (which would only produce misleading

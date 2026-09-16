@@ -561,6 +561,7 @@ log format. No `schema_version` bump is required.
 
 **Key distribution (v1 scope):** the operator is responsible for distributing
 the Ed25519 public key out-of-band (e.g. storing it alongside the log, or in a
-key management system). Key rotation is not defined for v1; rotated keys produce
-new `key_id` values in the log, requiring the verifier to be run with the
-appropriate key for each epoch.
+key management system). Key rotation is not defined for v1; rotated keys
+produce new `key_id` values in the log. See [docs/verification.md §
+Multi-epoch logs](verification.md#multi-epoch-logs) for what verification
+actually covers today and its gaps (issue #19).
