@@ -152,8 +152,11 @@ func VerifyCheckpoint(cp chain.Checkpoint, prevSignPayloadHash string, pubKey ed
 //   - The verifier computes the fingerprint of the supplied public key as
 //     hex(SHA256(pubKey)) and pre-scans all entries and checkpoints.
 //   - If the log contains more than one distinct key_id (a multi-epoch log),
-//     VerifyLog returns a Go error (not a Report) and stops. Re-run once
-//     per epoch with the key that matches that epoch's key_id.
+//     VerifyLog returns a Go error (not a Report) and stops. Rotation-aware
+//     verification is not yet supported (see docs/verification.md
+//     "Multi-epoch logs" and issue #19) — splitting the log per epoch and
+//     verifying each slice separately does not reliably detect tampering at
+//     the boundary.
 //   - If the single key_id in the log does not match the supplied public key,
 //     VerifyLog emits "key_id_mismatch" errors for every trace and checkpoint
 //     without attempting chain verification (which would only produce misleading
@@ -209,14 +212,15 @@ func VerifyLog(logPath, checkpointPath string, pubKey ed25519.PublicKey) (Report
 	}
 
 	// Multi-epoch check: more than one distinct key_id means the log spans a
-	// key rotation. Re-run per epoch with the matching key.
+	// key rotation. Rotation-aware verification is not yet supported — see
+	// docs/verification.md "Multi-epoch logs" and issue #19.
 	if len(seenKeyIDs) > 1 {
 		ids := make([]string, 0, len(seenKeyIDs))
 		for id := range seenKeyIDs {
 			ids = append(ids, id)
 		}
 		sort.Strings(ids)
-		msg := fmt.Sprintf("multi-epoch log: %d distinct key_ids found; re-run per epoch with the matching key (found: %s)",
+		msg := fmt.Sprintf("multi-epoch log: %d distinct key_ids found; rotation-aware verification is not yet supported (see docs/verification.md#multi-epoch-logs, issue #19) (found: %s)",
 			len(ids), strings.Join(ids, ", "))
 		if tornTailDetail != "" {
 			msg += fmt.Sprintf("; the final line was also unparseable: %s", tornTailDetail)

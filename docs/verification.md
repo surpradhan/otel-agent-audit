@@ -133,19 +133,54 @@ signature verification. This produces actionable errors instead of confusing
 |----------|-------------------|
 | Correct key supplied | Chain and checkpoint signatures are verified normally |
 | Wrong key supplied (single epoch) | `key_id_mismatch` error for each trace and checkpoint; no misleading signature errors |
-| Log spans multiple key epochs | `VerifyLog` returns an error: "multi-epoch log: re-run per epoch with the matching key" — see below |
+| Log spans multiple key epochs | `VerifyLog` returns an error rather than a `Report` — a rotated log cannot yet be verified end to end; see [Multi-epoch logs](#multi-epoch-logs) below |
 
 ### Multi-epoch logs
 
 When a signing key is rotated, entries before the rotation carry the old
 `key_id` and entries after carry the new `key_id`. The verifier detects more
-than one distinct `key_id` in the log and returns an error. To verify a
-multi-epoch log:
+than one distinct `key_id` in the log and refuses to verify it as a whole.
 
-1. Identify the key epochs: `jq -r '.signed.key_id' audit.jsonl | sort -u`
-2. Identify the checkpoint epochs: `jq -r '.key_id' checkpoint.jsonl | sort -u`
-3. For each epoch, extract the relevant log/checkpoint lines and run the verifier
-   with the key for that epoch.
+**A rotated log cannot currently be verified end to end** (issue #19).
+Splitting the log per epoch and verifying each slice separately — which this
+section used to recommend as the fix — does not reliably detect tampering at
+the boundary (issue #35):
+
+- The trace sealed under the old key but first checkpointed under the new one
+  loses its only attestation once the new epoch's checkpoint is excluded from
+  the old epoch's slice. Deleting that trace afterward still reports
+  `Status: OK`.
+- Every epoch after the first reports a `prev_checkpoint_hash` mismatch
+  against the zero sentinel — the same error that (correctly) flags
+  checkpoint truncation — because the split gives the verifier no way to seed
+  the previous epoch's tail.
+
+Until rotation-aware verification lands, two compensating controls reduce the
+exposure without closing it:
+
+1. **Rotate only across a clean `Shutdown`.** A final checkpoint flush means
+   no trace's coverage crosses the boundary, so there is no boundary trace to
+   lose.
+2. **After the per-epoch runs, cross-check every checkpoint's `trace_tips`
+   against the whole (unsplit) log**, not just its own epoch's slice — a
+   checkpoint claiming a trace the full log no longer holds is exactly the
+   deletion the split otherwise hides:
+
+   ```
+   cp claims 1111…  entry_count=2 ; log has 2
+   cp claims 2222…  entry_count=2 ; log has 0   <- deleted boundary trace
+   ```
+
+   This catches an outright-deleted boundary trace but covers neither
+   `tip_hash` nor the later checkpoint's own signature — it is a partial
+   check, not a substitute for rotation-aware verification.
+
+To identify the epochs present in a log:
+
+```bash
+jq -r '.signed.key_id' audit.jsonl | sort -u
+jq -r '.key_id' checkpoint.jsonl | sort -u
+```
 
 ## Key distribution (v1 scope)
 
@@ -154,9 +189,9 @@ Key distribution is the operator's responsibility. Recommended practices:
 - Store the public key alongside the audit log (e.g. `audit.pub.pem`).
 - Include the `key_id` field from the log entries in any chain-of-custody record
   so verifiers can confirm they are using the correct key for a given epoch.
-- Key rotation is not defined for v1; after rotation, entries carry the new
-  `key_id`. Run the verifier once per epoch, each time with the key that matches
-  that epoch's `key_id`.
+- Key rotation is not defined for v1 — see [Multi-epoch
+  logs](#multi-epoch-logs) above for what verification actually covers today
+  and its gaps (issue #19).
 
 ## Intra-trace completeness caveat
 
