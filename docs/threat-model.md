@@ -181,7 +181,7 @@ every span for that `trace_id` as settled the moment any marker for it is
 seen, so the later segment's in-progress spans are never mistaken for the
 earlier segment's and silently dropped.
 
-### 3e. Parent-directory durability on first file creation
+### 3e. Parent-directory durability
 
 `fsync` on a file's descriptor makes its *data* durable; it says nothing about
 the *directory entry* that names the file. The first time the audit log,
@@ -224,9 +224,16 @@ lifetime; even then, the added fsync is proportional to the unconditional
 `Sync` the sidecar write already performs on every call regardless of this
 fix. See issue #33.
 
-**What this does not change:** `WAL.Compact`'s atomic rename over the live WAL
-file has the same directory-durability property on an ongoing operation rather
-than a first creation — a related but distinct gap, tracked as issue #36.
+**`WAL.Compact`'s atomic rename** over the live WAL file has the same
+directory-durability property as first creation, just on an ongoing operation
+instead — so it was originally tracked as a separate gap (issue #36) rather
+than folded in above, since a rename recurs on every compaction rather than
+happening once at a fixed `Start()`-time hook. `Compact` now fsyncs the WAL's
+parent directory after the rename and fd reopen both succeed, the same way on
+every call — there is no "first rename" to distinguish, and fsyncing an
+already-durable directory again is a harmless no-op. It stays best-effort and
+non-fatal like every case above: a failure does not fail an otherwise-
+successful compaction, only logs a warning and continues. See issue #36.
 
 ### 3f. Torn audit-log line within a single process lifetime
 

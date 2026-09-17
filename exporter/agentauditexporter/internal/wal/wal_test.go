@@ -3,6 +3,7 @@ package wal_test
 import (
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"sync"
 	"testing"
@@ -657,5 +658,160 @@ func TestWAL_CompactPreservesStoredSchemaVersion(t *testing.T) {
 	}
 	if !strings.Contains(string(after), `"start_time_unix_nano":1764547200123456789`) {
 		t.Errorf("compaction re-encoded a v2 timestamp out of its numeric form: %s", after)
+	}
+}
+
+// TestCompact_ParentDirSyncFailureIsNonFatal verifies that Compact logs (via
+// SetWarnFunc) and continues, rather than failing an otherwise-successful
+// compaction, when the WAL's parent directory cannot be fsynced after the
+// atomic rename (e.g. a restrictive directory mode). Same non-fatal
+// treatment as the exporter package's TestStart_ParentDirSyncFailureIsNonFatal
+// applies to a file's first creation; this covers Compact's rename instead.
+// See issue #36.
+func TestCompact_ParentDirSyncFailureIsNonFatal(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("directory permission bits do not model this on Windows")
+	}
+	if os.Geteuid() == 0 {
+		t.Skip("running as root: directory read permission is not enforced")
+	}
+
+	restricted := filepath.Join(t.TempDir(), "restricted")
+	if err := os.Mkdir(restricted, 0700); err != nil {
+		t.Fatalf("Mkdir: %v", err)
+	}
+	path := filepath.Join(restricted, "test.wal")
+
+	w, err := wal.Open(path)
+	if err != nil {
+		t.Fatalf("wal.Open: %v", err)
+	}
+	t.Cleanup(func() { _ = w.Close() })
+
+	var warnings []error
+	w.SetWarnFunc(func(err error) { warnings = append(warnings, err) })
+
+	rec := makeRecord("trace001", "span001", 1000)
+	if err := w.AppendSpan("trace001", rec); err != nil {
+		t.Fatalf("AppendSpan: %v", err)
+	}
+
+	// Write+execute still lets Compact create the temp file and rename it
+	// over the live WAL inside restricted; no read bit means opening
+	// restricted itself (to fsync it) fails — same technique as the exporter
+	// package's TestStart_ParentDirSyncFailureIsNonFatal.
+	if err := os.Chmod(restricted, 0300); err != nil {
+		t.Fatalf("Chmod: %v", err)
+	}
+	t.Cleanup(func() { _ = os.Chmod(restricted, 0700) })
+
+	if err := w.Compact(nil); err != nil {
+		t.Fatalf("Compact should tolerate a parent-dir sync failure, got: %v", err)
+	}
+
+	if len(warnings) != 1 {
+		t.Fatalf("expected exactly one warn callback call, got %d: %v", len(warnings), warnings)
+	}
+
+	// The compaction itself must still have genuinely happened despite the
+	// injected fault: restore read access and confirm the span survived.
+	if err := os.Chmod(restricted, 0700); err != nil {
+		t.Fatalf("Chmod restore: %v", err)
+	}
+	buffers, _, err := w.Replay()
+	if err != nil {
+		t.Fatalf("Replay: %v", err)
+	}
+	if len(buffers["trace001"]) != 1 {
+		t.Errorf("expected trace001's span to survive compaction despite the parent-dir sync failure, got %v", buffers)
+	}
+
+	// warn must fire only when the sync actually fails, not on every
+	// Compact call: with permissions restored, a second compaction's parent
+	// dir sync succeeds, so the warning count must not grow.
+	if err := w.Compact(nil); err != nil {
+		t.Fatalf("second Compact: %v", err)
+	}
+	if len(warnings) != 1 {
+		t.Errorf("expected no additional warning once the parent dir is syncable again, got %d total: %v", len(warnings), warnings)
+	}
+}
+
+// TestCompact_FdReopenSurvivesWarnCallbackPanic verifies that Compact's fd
+// swap (closing the pre-compaction fd, reopening the freshly renamed file)
+// has already completed before the best-effort parent-dir warn callback
+// runs — so a callback that panics cannot leave the WAL still writing into
+// an orphaned, already-renamed-away inode. A callback that merely appends to
+// a slice (as in the test above) can't tell which side of the fd swap it
+// ran on; only a callback that never returns normally can. Round-1 review
+// found this ordering as a real hazard (a panicking callback used to run
+// BEFORE the fd swap); this pins the fix down so a future refactor can't
+// silently reintroduce it. See issue #36.
+func TestCompact_FdReopenSurvivesWarnCallbackPanic(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("directory permission bits do not model this on Windows")
+	}
+	if os.Geteuid() == 0 {
+		t.Skip("running as root: directory read permission is not enforced")
+	}
+
+	restricted := filepath.Join(t.TempDir(), "restricted")
+	if err := os.Mkdir(restricted, 0700); err != nil {
+		t.Fatalf("Mkdir: %v", err)
+	}
+	path := filepath.Join(restricted, "test.wal")
+
+	w, err := wal.Open(path)
+	if err != nil {
+		t.Fatalf("wal.Open: %v", err)
+	}
+	t.Cleanup(func() { _ = w.Close() })
+
+	rec0 := makeRecord("trace001", "span001", 1000)
+	if err := w.AppendSpan("trace001", rec0); err != nil {
+		t.Fatalf("AppendSpan 0: %v", err)
+	}
+
+	w.SetWarnFunc(func(error) { panic("simulated warn callback failure") })
+
+	// Same restricted-directory technique as TestCompact_ParentDirSyncFailureIsNonFatal:
+	// the rename itself still succeeds, but syncing the directory (and so
+	// invoking the panicking callback) fails.
+	if err := os.Chmod(restricted, 0300); err != nil {
+		t.Fatalf("Chmod: %v", err)
+	}
+	t.Cleanup(func() { _ = os.Chmod(restricted, 0700) })
+
+	func() {
+		defer func() {
+			r := recover()
+			if r == nil {
+				t.Fatal("expected the warn callback's panic to propagate out of Compact")
+			}
+			if msg, ok := r.(string); !ok || msg != "simulated warn callback failure" {
+				t.Fatalf("expected the warn callback's own panic, got: %v", r)
+			}
+		}()
+		_ = w.Compact(nil)
+	}()
+
+	if err := os.Chmod(restricted, 0700); err != nil {
+		t.Fatalf("Chmod restore: %v", err)
+	}
+
+	// If the fd swap already completed before the panic (as it must), the
+	// WAL is still fully usable: a further write lands in the real,
+	// post-compaction file, not an orphaned pre-compaction inode invisible
+	// to Replay.
+	rec1 := makeRecord("trace001", "span002", 2000)
+	if err := w.AppendSpan("trace001", rec1); err != nil {
+		t.Fatalf("AppendSpan 1: %v", err)
+	}
+	buffers, _, err := w.Replay()
+	if err != nil {
+		t.Fatalf("Replay: %v", err)
+	}
+	if len(buffers["trace001"]) != 2 {
+		t.Errorf("expected both spans to survive a panicking warn callback (fd swap must precede it), got %v", buffers)
 	}
 }

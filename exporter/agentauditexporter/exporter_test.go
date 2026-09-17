@@ -1690,6 +1690,50 @@ func TestStart_ParentDirSyncFailureIsNonFatal(t *testing.T) {
 	}
 }
 
+// TestStart_WALCompactParentDirSyncFailureIsNonFatal verifies that Start
+// logs and continues, rather than failing outright, when WAL.Compact's own
+// post-rename parent-directory sync fails — a distinct call site, wired via
+// wal.WAL.SetWarnFunc, from TestStart_ParentDirSyncFailureIsNonFatal's
+// file-creation case above (a different log message: "after compaction").
+// Start always runs a WAL.Compact right after Replay, even for a freshly
+// created, empty WAL, so this fires without needing any pre-existing WAL
+// content. See issue #36.
+func TestStart_WALCompactParentDirSyncFailureIsNonFatal(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("directory permission bits do not model this on Windows")
+	}
+	if os.Geteuid() == 0 {
+		t.Skip("running as root: directory read permission is not enforced")
+	}
+
+	env := newTestEnv(t)
+	restricted := filepath.Join(t.TempDir(), "restricted")
+	if err := os.Mkdir(restricted, 0700); err != nil {
+		t.Fatalf("Mkdir: %v", err)
+	}
+	env.cfg.WalPath = filepath.Join(restricted, "wal.jsonl")
+
+	// Write+execute lets Open create the WAL and Compact rename over it
+	// inside restricted; no read bit means opening restricted itself (to
+	// fsync it) fails — same technique as
+	// TestStart_ParentDirSyncFailureIsNonFatal.
+	if err := os.Chmod(restricted, 0300); err != nil {
+		t.Fatalf("Chmod: %v", err)
+	}
+	t.Cleanup(func() { _ = os.Chmod(restricted, 0700) })
+
+	core, logs := observer.New(zap.WarnLevel)
+	exp := newAgentAuditExporter(env.cfg, zap.New(core))
+	if err := exp.Start(context.Background(), nil); err != nil {
+		t.Fatalf("Start should tolerate a parent-dir sync failure, got: %v", err)
+	}
+	t.Cleanup(func() { _ = exp.Shutdown(context.Background()) })
+
+	if logs.FilterMessageSnippet("after compaction").Len() == 0 {
+		t.Errorf("expected a warning log for WAL.Compact's parent-dir sync failure, got: %v", logs.All())
+	}
+}
+
 // TestConfig_Validate_NegativeValues verifies that negative TraceTimeout,
 // CheckpointInterval, MaxPendingTips, and MinCheckpointRetryInterval are all
 // rejected by Validate.
