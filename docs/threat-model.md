@@ -72,7 +72,7 @@ procedure does not have this property: splitting the checkpoint file by
 `key_id` excludes the new epoch's checkpoint from the old epoch's run, so the
 one checkpoint that would have caught a dropped boundary trace is exactly the
 one omitted. See [docs/verification.md § Multi-epoch
-logs](verification.md#multi-epoch-logs) and issue #19.
+logs](verification.md#multi-epoch-logs) and issue #35.
 
 ### 3b. Intra-trace completeness (early-root truncation)
 
