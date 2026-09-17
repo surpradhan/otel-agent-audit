@@ -242,17 +242,33 @@ func TestRotation_UnsplitRunCatchesBoundaryTraceDeletion(t *testing.T) {
 	if err != nil {
 		t.Fatalf("VerifyLog: %v", err)
 	}
-	var sawCountMismatch bool
+	// Exactly 2: cp2's own signature still fails against pubA (it is really
+	// signed by B — same as TestRotation_WholeLogAgainstOneKey), plus the
+	// entry_count_mismatch this test is about. Asserting the exact count, not
+	// just presence, so a future regression adding a spurious extra finding
+	// doesn't slip through unnoticed.
+	if len(report.Errors) != 2 {
+		t.Fatalf("expected exactly 2 errors (cp2 signature failure + entry_count_mismatch); got %+v", report.Errors)
+	}
+	var sawCountMismatch, sawCheckpointFailure bool
 	for _, e := range report.Errors {
-		if e.TraceID == rotTraceBoundary && e.Kind == "entry_count_mismatch" {
+		switch {
+		case e.TraceID == rotTraceBoundary && e.Kind == "entry_count_mismatch":
 			sawCountMismatch = true
 			if !strings.Contains(e.Detail, "log has 0") {
 				t.Errorf("expected the mismatch detail to show the log now holds 0 entries, got: %s", e.Detail)
 			}
+		case e.TraceID == "" && e.Kind == "checkpoint":
+			sawCheckpointFailure = true
+		default:
+			t.Errorf("unexpected error: %+v", e)
 		}
 	}
 	if !sawCountMismatch {
 		t.Errorf("expected entry_count_mismatch for the deleted boundary trace; got %v", report.Errors)
+	}
+	if !sawCheckpointFailure {
+		t.Errorf("expected cp2's own checkpoint signature failure alongside it; got %v", report.Errors)
 	}
 }
 
@@ -354,6 +370,14 @@ func TestRotation_EpochBAloneSymptoms(t *testing.T) {
 		if err != nil {
 			t.Fatalf("VerifyLog: %v", err)
 		}
+		// Exactly 4: a "chain" error per trace (both signed by A, checked
+		// against pubB), cp2's own prev_checkpoint_hash mismatch, and
+		// tip_hash_unverifiable for the one trace cp2 covers. Asserting the
+		// exact count, not just presence, so a future regression adding a
+		// spurious extra finding doesn't slip through unnoticed.
+		if len(report.Errors) != 4 {
+			t.Fatalf("expected exactly 4 errors; got %+v", report.Errors)
+		}
 		chainErrs := 0
 		var sawPrevMismatch, sawTipUnverifiable bool
 		for _, e := range report.Errors {
@@ -368,6 +392,8 @@ func TestRotation_EpochBAloneSymptoms(t *testing.T) {
 				if e.TraceID == rotTraceBoundary {
 					sawTipUnverifiable = true
 				}
+			default:
+				t.Errorf("unexpected error kind %q: %+v", e.Kind, e)
 			}
 		}
 		// Both traces are genuinely signed by A, so neither verifies against pubB.

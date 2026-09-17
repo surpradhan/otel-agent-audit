@@ -677,6 +677,50 @@ func TestVerifyLog_TamperedEntryKeyIDDoesNotBlockVerification(t *testing.T) {
 	}
 }
 
+// TestVerifyLog_TamperedCheckpointKeyIDFailsSignature pins a security
+// property distinct from the entry-side case above: a checkpoint's key_id is
+// one of the fields chain.CheckpointSigningPayload marshals into the signed
+// bytes (see chain.Accumulator.Stage), so — unlike an entry's key_id —
+// editing it alone invalidates the checkpoint's signature. This must produce
+// an ordinary "checkpoint" signature-failure error, never
+// "key_id_field_mismatch": that finding only exists for entries, because only
+// an entry's key_id sits outside what gets signed.
+func TestVerifyLog_TamperedCheckpointKeyIDFailsSignature(t *testing.T) {
+	logPath, checkpointPath, pub := makeVerifyFixture(t)
+
+	data, err := os.ReadFile(checkpointPath)
+	if err != nil {
+		t.Fatalf("read checkpoint: %v", err)
+	}
+	var cp chain.Checkpoint
+	if err := json.Unmarshal(data, &cp); err != nil {
+		t.Fatalf("unmarshal checkpoint: %v", err)
+	}
+	cp.KeyID = "bogus-tampered-key-id"
+	tampered, err := json.Marshal(cp)
+	if err != nil {
+		t.Fatalf("marshal tampered checkpoint: %v", err)
+	}
+	if err := os.WriteFile(checkpointPath, append(tampered, '\n'), 0600); err != nil {
+		t.Fatalf("write tampered checkpoint: %v", err)
+	}
+
+	report, err := verify.VerifyLog(logPath, checkpointPath, pub)
+	if err != nil {
+		t.Fatalf("VerifyLog: %v", err)
+	}
+	if len(report.Errors) != 1 {
+		t.Fatalf("expected exactly 1 error; got %v", report.Errors)
+	}
+	e := report.Errors[0]
+	if e.Kind != "checkpoint" {
+		t.Errorf("expected kind=checkpoint (key_id is signed, so tampering it fails signature verification), got kind=%s detail=%s", e.Kind, e.Detail)
+	}
+	if !strings.Contains(e.Detail, "signature verification failed") {
+		t.Errorf("expected a signature-verification-failed detail, got: %s", e.Detail)
+	}
+}
+
 // TestVerifyLog_UnifiedFakeKeyIDDoesNotMaskDifferentSigner pins issue #46's
 // second scenario. Forcing every entry's key_id to the same (possibly fake)
 // value must not collapse a log that genuinely has entries signed by

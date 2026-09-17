@@ -124,11 +124,20 @@ seq-0 record, and the verifier rejects a chain whose entries disagree.
 ## Key-id verification
 
 Every log entry and checkpoint carries a `key_id` field equal to
-`hex(SHA256(ed25519PublicKeyBytes))`. That field sits beside the signature,
-not inside what gets signed (see `internal/sign`) — it is **not
-authenticated**, and nothing stops it being edited independently of a
-perfectly valid signature. The verifier therefore never lets the claimed
-`key_id` decide whether, or how, verification runs: every entry and
+`hex(SHA256(ed25519PublicKeyBytes))`, but the two are trusted differently:
+
+- An **entry's** `key_id` (`sign.SignedEntry.KeyID`) sits beside its
+  signature, not inside what gets signed (see `internal/sign`) — it is **not
+  authenticated**, and nothing stops it being edited independently of a
+  perfectly valid signature.
+- A **checkpoint's** `key_id` (`chain.Checkpoint.KeyID`) is different: it is
+  one of the fields `chain.CheckpointSigningPayload` marshals into the bytes
+  that get signed (see `chain.Accumulator.Stage`), so it **is** authenticated
+  — editing it invalidates the checkpoint's signature like editing any other
+  signed field.
+
+The verifier does not rely on this distinction, or on either field's claimed
+value, to decide whether or how verification runs: every entry and
 checkpoint is always verified directly against the supplied public key
 (issue #46).
 
@@ -136,19 +145,21 @@ checkpoint is always verified directly against the supplied public key
 |----------|-------------------|
 | Correct key supplied | Chain and checkpoint signatures are verified normally |
 | Wrong key supplied | Ordinary `chain` / `checkpoint` signature-failure errors — the verifier cannot and does not try to tell "wrong key" apart from "corrupted" using a single candidate key |
-| Entry/checkpoint verifies, but its claimed `key_id` disagrees with the supplied key | `key_id_field_mismatch` — a non-fatal finding. The signature already proved the content is authentic; the `key_id` metadata is stale or was tampered with, which is worth flagging but not a reason to fail an otherwise-good entry |
+| An entry verifies, but its claimed `key_id` disagrees with the supplied key | `key_id_field_mismatch` — a non-fatal finding. The signature already proved the content is authentic; the `key_id` metadata is stale or was tampered with, which is worth flagging but not a reason to fail an otherwise-good entry. There is no checkpoint-side equivalent: a checkpoint's `key_id` is signed, so tampering it alone fails its signature check instead (an ordinary `checkpoint` error) |
 | Log spans multiple key epochs | No longer refused outright — see [Multi-epoch logs](#multi-epoch-logs) below |
 
 ### Multi-epoch logs
 
 When a signing key is rotated, entries before the rotation carry the old
 `key_id` and entries after carry the new `key_id`. Before issue #46, the
-verifier pre-scanned this claimed field and refused to verify the log at all
-once it saw more than one distinct value. That pre-scan is gone — `key_id` is
-unauthenticated, so trusting it for that decision let one edited field either
-deny verification of an otherwise-intact single-epoch log, or mask a
-genuinely rotated log as single-epoch and bury real per-entry failures under
-a misleading blanket diagnosis. See issue #46 for both scenarios in detail.
+verifier pre-scanned every claimed `key_id` — entries' and checkpoints'
+alike — and refused to verify the log at all once it saw more than one
+distinct value. That pre-scan is gone. Checkpoints' claimed `key_id` is
+trustworthy (see above), but entries' is not, and the pre-scan mixed both
+into one decision — so trusting it let one edited *entry* field either deny
+verification of an otherwise-intact single-epoch log, or mask a genuinely
+rotated log as single-epoch and bury real per-entry failures under a
+misleading blanket diagnosis. See issue #46 for both scenarios in detail.
 
 **Rotation-aware verification — a single run that cleanly attests both
 epochs without signature-failure noise — is still not implemented**

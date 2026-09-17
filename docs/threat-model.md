@@ -357,7 +357,7 @@ technical counsel.
 | `entry_count_mismatch` | A checkpoint claims more entries than the log contains — a trace may have been deleted post-seal |
 | `tip_hash_mismatch` | The recomputed chain tip does not match the checkpoint — at least one entry was altered or reordered |
 | `tip_hash_unverifiable` | The chain itself failed verification; the checkpoint tip cannot be independently confirmed |
-| `key_id_field_mismatch` | An entry or checkpoint's signature verified, but its claimed `key_id` does not match the supplied key — the content is authentic (the signature already proved that); the `key_id` metadata is stale or was tampered with |
+| `key_id_field_mismatch` | An entry's signature verified, but its claimed `key_id` does not match the supplied key — the content is authentic (the signature already proved that); the `key_id` metadata is stale or was tampered with. Entry-only: a checkpoint's `key_id` is itself signed, so tampering it fails the checkpoint's signature check instead |
 | `duplicate_trace_segment` | Two independent chains exist for the same `trace_id` — this is an at-least-once delivery artifact, not evidence of tampering |
 | `torn_trailing_line` | The audit log's final line was unparseable — likely an interrupted write from a crash. Its content was never cryptographically verified (that is what "unparseable" means), so this alone does not rule out tampering; entries before it were fully verified |
 

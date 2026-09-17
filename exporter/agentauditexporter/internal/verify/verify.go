@@ -147,20 +147,28 @@ func VerifyCheckpoint(cp chain.Checkpoint, prevSignPayloadHash string, pubKey ed
 // checkpoints, and returns a Report.
 //
 // Key-id handling:
-//   - Every log entry and checkpoint may carry a key_id field
-//     (hex(SHA256(pubKeyBytes))), but that field sits beside the signature,
-//     not inside what gets signed (see internal/sign) — it is not
-//     authenticated, and nothing stops it being edited independently of a
-//     perfectly valid signature. VerifyLog therefore never lets the claimed
-//     key_id decide whether, or how, verification runs: every entry and
-//     checkpoint is always verified directly against the supplied public key.
-//   - When an entry or checkpoint verifies successfully, its claimed key_id
-//     is compared against the now-authenticated actual signer,
+//   - Every log entry carries a key_id field (hex(SHA256(pubKeyBytes))), but
+//     sign.SignedEntry.KeyID sits beside the signature, not inside what gets
+//     signed (see internal/sign) — it is not authenticated, and nothing stops
+//     it being edited independently of a perfectly valid signature. VerifyLog
+//     therefore never lets an entry's claimed key_id decide whether, or how,
+//     its chain is verified: every entry is always verified directly against
+//     the supplied public key.
+//   - When a trace's chain verifies successfully, its entries' claimed
+//     key_id is compared against the now-authenticated actual signer,
 //     hex(SHA256(pubKey)). A disagreement there cannot mean the content is
 //     forged — the signature already proved otherwise — so it is reported as
 //     a non-fatal "key_id_field_mismatch" finding (stale or tampered
 //     metadata on an otherwise-good entry) rather than something that blocks
 //     verification.
+//   - A checkpoint's key_id is different: chain.Checkpoint.KeyID is one of
+//     the fields chain.CheckpointSigningPayload marshals into the bytes that
+//     get signed (see chain.Accumulator.Stage), so it IS authenticated —
+//     editing it invalidates the checkpoint's signature like editing any
+//     other signed field, and VerifyCheckpoint reports that as an ordinary
+//     "checkpoint" signature-failure error. There is no checkpoint-side
+//     key_id_field_mismatch: a checkpoint that verifies has, by construction,
+//     a key_id equal to the supplied key's fingerprint.
 //   - An entry or checkpoint that does NOT verify against the supplied key
 //     (wrong key, key rotation, or genuine tampering) produces the ordinary
 //     "chain" / "checkpoint" signature-failure error. VerifyLog cannot and
@@ -169,7 +177,7 @@ func VerifyCheckpoint(cp chain.Checkpoint, prevSignPayloadHash string, pubKey ed
 //     values by hand (see docs/verification.md "Multi-epoch logs") — always
 //     against the full, unsplit log and checkpoint files, since filtering by
 //     key_id can exclude the very checkpoint that covers a rotation-boundary
-//     trace (issue #19).
+//     trace (issue #35).
 //
 // Policy for traces not covered by any checkpoint: counted in TracesProcessed
 // but not reported as errors (they are "unchecked-by-checkpoint"). Rationale:
@@ -286,17 +294,16 @@ func VerifyLog(logPath, checkpointPath string, pubKey ed25519.PublicKey) (Report
 				Kind:    "checkpoint",
 				Detail:  fmt.Sprintf("seq %d: %v", cp.CheckpointSeq, err),
 			})
-		} else if cp.KeyID != "" && cp.KeyID != suppliedKeyID {
-			// Same reasoning as the per-entry check above: this checkpoint
-			// verified, so suppliedKeyID is its authenticated signer, and a
-			// disagreeing claimed key_id is metadata drift, not forgery.
-			verifyErrs = append(verifyErrs, VerifyError{
-				TraceID: "",
-				Kind:    "key_id_field_mismatch",
-				Detail: fmt.Sprintf("checkpoint seq %d: key_id %s does not match verified signer %s",
-					cp.CheckpointSeq, cp.KeyID, suppliedKeyID),
-			})
 		}
+		// No checkpoint-side key_id_field_mismatch check here: unlike an
+		// entry's key_id, cp.KeyID is one of the fields CheckpointSigningPayload
+		// marshals into the signed bytes (see chain.Accumulator.Stage), so it is
+		// authenticated. A checkpoint that reaches this point having verified
+		// necessarily has cp.KeyID == suppliedKeyID already — Ed25519
+		// verification succeeding is proof the exact payload, KeyID included,
+		// was signed by the supplied key. Editing cp.KeyID alone changes the
+		// signed bytes and fails verification above like any other tampered
+		// field; it cannot reach here with a disagreeing value.
 		// prevHash advances even when VerifyCheckpoint fails so that the next
 		// checkpoint's prev_checkpoint_hash field is evaluated against the hash
 		// of the corrupt/tampered entry's payload rather than the last good one.
