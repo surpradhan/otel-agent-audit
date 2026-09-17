@@ -229,8 +229,8 @@ directory-durability property as first creation, just on an ongoing operation
 instead — so it was originally tracked as a separate gap (issue #36) rather
 than folded in above, since a rename recurs on every compaction rather than
 happening once at a fixed `Start()`-time hook. `Compact` now fsyncs the WAL's
-parent directory immediately after the rename succeeds, the same way on every
-call — there is no "first rename" to distinguish, and fsyncing an
+parent directory after the rename and fd reopen both succeed, the same way on
+every call — there is no "first rename" to distinguish, and fsyncing an
 already-durable directory again is a harmless no-op. It stays best-effort and
 non-fatal like every case above: a failure does not fail an otherwise-
 successful compaction, only logs a warning and continues. See issue #36.

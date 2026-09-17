@@ -784,8 +784,12 @@ func TestCompact_FdReopenSurvivesWarnCallbackPanic(t *testing.T) {
 
 	func() {
 		defer func() {
-			if r := recover(); r == nil {
+			r := recover()
+			if r == nil {
 				t.Fatal("expected the warn callback's panic to propagate out of Compact")
+			}
+			if msg, ok := r.(string); !ok || msg != "simulated warn callback failure" {
+				t.Fatalf("expected the warn callback's own panic, got: %v", r)
 			}
 		}()
 		_ = w.Compact(nil)
