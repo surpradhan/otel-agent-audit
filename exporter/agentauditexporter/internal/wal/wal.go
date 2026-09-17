@@ -17,7 +17,11 @@
 //   - All writes (AppendSpan, MarkSealed) are serialized by the WAL's internal mutex.
 //   - Compact acquires the same mutex, atomically renames a temp file over the WAL,
 //     then re-opens the fd before releasing. No concurrent write can touch the
-//     unlinked inode after Compact completes.
+//     unlinked inode after Compact completes. Only once that fd is safely
+//     reopened does Compact make a best-effort attempt to fsync the WAL's
+//     parent directory, invoking an optional warn callback (SetWarnFunc) on
+//     failure — still under the same mutex, so that callback must not call
+//     back into WAL or block.
 //   - Close acquires the mutex; call only after compactWG.Wait() in Shutdown.
 //   - Replay is called only from Start, before any concurrent writes begin.
 package wal
@@ -93,9 +97,18 @@ func Open(path string) (*WAL, error) {
 // fsyncing the WAL's parent directory after Compact's atomic rename (see
 // Compact and issue #36). wal has no logger of its own by design, so this
 // lets the caller (which does) report the failure however it reports
-// everything else. Pass nil, the default, to disable this reporting. Not
-// safe to call concurrently with Compact.
+// everything else. Pass nil, the default, to disable this reporting.
+//
+// Safe to call concurrently with Compact — both take the WAL's internal
+// mutex — but a Compact call already in flight may still see the old fn. fn
+// itself runs synchronously while Compact holds that same mutex, after
+// Compact's own internal state (the reopened fd) is already consistent: it
+// must not call back into any *WAL method, since the mutex is not
+// reentrant, and should not block or panic, since Compact does not recover
+// from it.
 func (w *WAL) SetWarnFunc(fn func(error)) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
 	w.warn = fn
 }
 
@@ -222,13 +235,16 @@ func (w *WAL) Replay() (buffers map[string][]record.AuditRecord, sealedPending [
 // one, then re-opens the append fd so subsequent AppendSpan calls are not
 // writing to the unlinked inode. Compact calls Sync before rename.
 //
-// After a successful rename, it also fsyncs the WAL's parent directory,
-// best-effort: the rename is a directory-entry mutation, not durable until
-// the directory itself is fsynced — the same class of gap the exporter
-// package's Start closes for a file's first creation, but here on an
-// ongoing rename instead of a one-time creation. A failure to sync does not
-// fail an otherwise-successful compaction; it is only reported via
-// SetWarnFunc's callback, if one is installed. See issue #36.
+// Once the rename and fd reopen both succeed, it also fsyncs the WAL's
+// parent directory, best-effort: the rename is a directory-entry mutation,
+// not durable until the directory itself is fsynced — the same class of gap
+// the exporter package's Start closes for a file's first creation, but here
+// on an ongoing rename instead of a one-time creation. This runs last,
+// after Compact's own internal state is already consistent, so that a slow
+// or misbehaving SetWarnFunc callback (see its doc comment) cannot delay or
+// interfere with the fd reopen. A failure to sync does not fail an
+// otherwise-successful compaction; it is only reported via that callback,
+// if one is installed. See issue #36.
 func (w *WAL) Compact(pending map[string]map[string]struct{}) error {
 	w.mu.Lock()
 	defer w.mu.Unlock()
@@ -338,10 +354,6 @@ func (w *WAL) Compact(pending map[string]map[string]struct{}) error {
 		return fmt.Errorf("wal: compact rename: %w", err)
 	}
 
-	if err := syncParentDir(w.path); err != nil && w.warn != nil {
-		w.warn(fmt.Errorf("wal: sync parent directory after compact rename: %w", err))
-	}
-
 	// Re-open the append fd so AppendSpan doesn't write to the unlinked inode.
 	_ = w.f.Close()
 	newF, err := os.OpenFile(w.path, os.O_APPEND|os.O_WRONLY, 0600)
@@ -349,6 +361,13 @@ func (w *WAL) Compact(pending map[string]map[string]struct{}) error {
 		return fmt.Errorf("wal: compact reopen: %w", err)
 	}
 	w.f = newF
+
+	// Best-effort parent-directory fsync, last: Compact's own state (the fd
+	// above) is already consistent by this point, so a slow, blocking, or
+	// panicking warn callback cannot delay or interfere with it.
+	if err := syncParentDir(w.path); err != nil && w.warn != nil {
+		w.warn(fmt.Errorf("wal: compact sync parent dir: %w", err))
+	}
 	return nil
 }
 
@@ -368,10 +387,11 @@ func (w *WAL) Close() error {
 // package's helper of the same name, which this package cannot call
 // directly — exporter imports wal, so the reverse would be an import cycle.
 // Carries the same OS-portability caveat as that original: only the
-// os.Open-fails branch is exercised by tests (see TestSyncParentDir_
-// MissingParent); a successful Open with a failing Sync is not portably
-// reachable from package os without a fault-injection seam this package
-// does not have.
+// os.Open-fails branch is exercised by tests (directly by
+// TestSyncParentDir_MissingParent, and via Compact's real call path by
+// TestCompact_ParentDirSyncFailureIsNonFatal's permission-denied case); a
+// successful Open with a failing Sync is not portably reachable from
+// package os without a fault-injection seam this package does not have.
 func syncParentDir(path string) error {
 	d, err := os.Open(filepath.Dir(path))
 	if err != nil {

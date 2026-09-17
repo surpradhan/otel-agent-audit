@@ -181,7 +181,7 @@ every span for that `trace_id` as settled the moment any marker for it is
 seen, so the later segment's in-progress spans are never mistaken for the
 earlier segment's and silently dropped.
 
-### 3e. Parent-directory durability on first file creation
+### 3e. Parent-directory durability
 
 `fsync` on a file's descriptor makes its *data* durable; it says nothing about
 the *directory entry* that names the file. The first time the audit log,
