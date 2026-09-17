@@ -124,77 +124,90 @@ seq-0 record, and the verifier rejects a chain whose entries disagree.
 ## Key-id verification
 
 Every log entry and checkpoint carries a `key_id` field equal to
-`hex(SHA256(ed25519PublicKeyBytes))`. The verifier computes this fingerprint from
-the supplied public key and compares it to the log before attempting any
-signature verification. This produces actionable errors instead of confusing
-"signature failed" messages when the wrong key is used.
+`hex(SHA256(ed25519PublicKeyBytes))`. That field sits beside the signature,
+not inside what gets signed (see `internal/sign`) — it is **not
+authenticated**, and nothing stops it being edited independently of a
+perfectly valid signature. The verifier therefore never lets the claimed
+`key_id` decide whether, or how, verification runs: every entry and
+checkpoint is always verified directly against the supplied public key
+(issue #46).
 
 | Scenario | Verifier behaviour |
 |----------|-------------------|
 | Correct key supplied | Chain and checkpoint signatures are verified normally |
-| Wrong key supplied (single epoch) | `key_id_mismatch` error for each trace and checkpoint; no misleading signature errors |
-| Log spans multiple key epochs | `VerifyLog` returns an error rather than a `Report` — a rotated log cannot yet be verified end to end; see [Multi-epoch logs](#multi-epoch-logs) below |
+| Wrong key supplied | Ordinary `chain` / `checkpoint` signature-failure errors — the verifier cannot and does not try to tell "wrong key" apart from "corrupted" using a single candidate key |
+| Entry/checkpoint verifies, but its claimed `key_id` disagrees with the supplied key | `key_id_field_mismatch` — a non-fatal finding. The signature already proved the content is authentic; the `key_id` metadata is stale or was tampered with, which is worth flagging but not a reason to fail an otherwise-good entry |
+| Log spans multiple key epochs | No longer refused outright — see [Multi-epoch logs](#multi-epoch-logs) below |
 
 ### Multi-epoch logs
 
 When a signing key is rotated, entries before the rotation carry the old
-`key_id` and entries after carry the new `key_id`. The verifier detects more
-than one distinct `key_id` in the log and refuses to verify it as a whole.
+`key_id` and entries after carry the new `key_id`. Before issue #46, the
+verifier pre-scanned this claimed field and refused to verify the log at all
+once it saw more than one distinct value. That pre-scan is gone — `key_id` is
+unauthenticated, so trusting it for that decision let one edited field either
+deny verification of an otherwise-intact single-epoch log, or mask a
+genuinely rotated log as single-epoch and bury real per-entry failures under
+a misleading blanket diagnosis. See issue #46 for both scenarios in detail.
 
-**A rotated log cannot currently be verified end to end** (issue #19).
-Splitting the log per epoch and verifying each slice separately — which this
-section used to recommend as the fix — has two defects (issue #35):
+**Rotation-aware verification — a single run that cleanly attests both
+epochs without signature-failure noise — is still not implemented**
+(issue #19). What changed is *how* to work around that gap today.
 
-- The trace sealed under the old key but first checkpointed under the new one
-  loses its only attestation once the new epoch's checkpoint is excluded from
-  the old epoch's slice. Deleting that trace afterward still reports
-  `Status: OK`.
-- Every epoch after the first reports a `prev_checkpoint_hash` mismatch
-  against the zero sentinel — the same error that (correctly) flags
-  checkpoint truncation — because the split gives the verifier no way to seed
-  the previous epoch's tail.
+Run the verifier **once per candidate key you hold, against the full,
+unsplit log and checkpoint files** — do not pre-filter either file by
+`key_id`. Every entry and checkpoint is verified directly against that one
+key regardless of what it claims to be signed by:
 
-To identify the epochs present in a log:
+- Entries and checkpoints from the epoch matching your key verify normally.
+- Entries and checkpoints from a *different* epoch produce ordinary `chain` /
+  `checkpoint` signature-failure errors. That is expected — it means "not
+  signed by this key," not additional tampering. Run the verifier again with
+  the other epoch's key for a clean report on that half.
+- The checkpoint cross-checks (`entry_count_mismatch`, `tip_hash_mismatch`)
+  still run for **every** checkpoint's `trace_tips`, including checkpoints
+  whose own signature didn't verify against your key. This is what catches a
+  deleted rotation-boundary trace: the checkpoint that attests it stays in
+  view and stays cross-checked against the whole log, even though verifying
+  *that checkpoint's own signature* needs the other epoch's key.
+
+This one unsplit run gives strictly more coverage than the previously
+documented split-per-epoch procedure, which is no longer recommended — it had
+two real defects (issue #35):
+
+- Filtering the checkpoint file by `key_id` can exclude the very checkpoint
+  that covers a rotation-boundary trace, silently losing the only
+  attestation that would have caught its deletion.
+- Filtering both files independently gives the verifier no way to seed the
+  previous epoch's tail, so every epoch after the first reports a spurious
+  `prev_checkpoint_hash` mismatch against the zero sentinel.
+
+To identify which keys you need in the first place:
 
 ```bash
 jq -r '.signed.key_id' audit.jsonl | sort -u
 jq -r '.key_id' checkpoint.jsonl | sort -u
 ```
 
-Until rotation-aware verification lands, two compensating controls reduce the
-exposure without closing it:
+Two further compensating controls reduce exposure while #19 remains open:
 
 1. **Rotate only across a clean `Shutdown`.** A final checkpoint flush means
    no trace's coverage crosses the boundary, so there is no boundary trace to
-   lose.
-2. **Run the verifier once per epoch, then cross-check every checkpoint's
-   `trace_tips` against the whole (unsplit) log** — not just its own epoch's
-   slice. Extract each epoch's lines by `key_id` — the log and checkpoint
-   files nest it differently: `jq -c 'select(.signed.key_id == "<id>")'
-   audit.jsonl` and `jq -c 'select(.key_id == "<id>")' checkpoint.jsonl` —
-   note the `-c`: jq's default pretty-printed output spans multiple lines,
-   which breaks the verifier's one-JSON-object-per-line parsing. Run the
-   verifier against each slice with its matching key. That alone
-   still reports `Status: OK` even when the boundary trace has been deleted,
-   per above — the cross-check is what catches it: a checkpoint claiming a
-   trace the full log no longer holds is the deletion made visible:
-
-   ```
-   cp claims 1111…  entry_count=2 ; log has 2
-   cp claims 2222…  entry_count=2 ; log has 0   <- deleted boundary trace
-   ```
-
-   This catches an outright-deleted boundary trace, but covers neither that
-   checkpoint's `tip_hash` nor its own signature — a partial check, not a
-   substitute for rotation-aware verification.
+   lose in the first place.
+2. **Treat a `chain` / `checkpoint` signature failure as "try the other
+   epoch's key," not automatically as tampering**, when you know a rotation
+   happened around that point in time. The verifier cannot tell the two
+   apart with only one candidate key at a time — closing that gap is exactly
+   what issue #19 is for.
 
 ## Key distribution (v1 scope)
 
 Key distribution is the operator's responsibility. Recommended practices:
 
 - Store the public key alongside the audit log (e.g. `audit.pub.pem`).
-- Include the `key_id` field from the log entries in any chain-of-custody record
-  so verifiers can confirm they are using the correct key for a given epoch.
+- Include the `key_id` field from the log entries in any chain-of-custody
+  record as a hint for which epoch's key to try first — it is not
+  authenticated, so treat it as a hint, not proof (issue #46).
 - Key rotation is not defined for v1 — see [Multi-epoch
   logs](#multi-epoch-logs) above for what verification actually covers today
   and its gaps (issue #19).

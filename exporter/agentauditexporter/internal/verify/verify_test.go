@@ -234,11 +234,13 @@ func TestVerifyChain_Empty(t *testing.T) {
 	}
 }
 
-// TestVerifyLog_WrongKey_KeyIDMismatch asserts that supplying the wrong public
-// key produces "key_id_mismatch" errors (not misleading "chain" errors).
-// A key_id mismatch is detected before signature verification, so the error
-// kind unambiguously tells the operator to check which key epoch they need.
-func TestVerifyLog_WrongKey_KeyIDMismatch(t *testing.T) {
+// TestVerifyLog_WrongKey asserts that supplying the wrong public key produces
+// ordinary signature-failure errors ("chain" / "checkpoint" /
+// "tip_hash_unverifiable"), not a distinct "key_id_mismatch" kind. As of
+// issue #46, VerifyLog never decides this from the claimed (unauthenticated)
+// key_id field — the outcome is whatever the Ed25519 check against the
+// supplied key actually says.
+func TestVerifyLog_WrongKey(t *testing.T) {
 	logPath, checkpointPath, _ := makeVerifyFixture(t)
 	_, wrongPub, err := sign.GenerateEd25519Key()
 	if err != nil {
@@ -248,21 +250,37 @@ func TestVerifyLog_WrongKey_KeyIDMismatch(t *testing.T) {
 	if err != nil {
 		t.Fatalf("VerifyLog: %v", err)
 	}
-	if len(report.Errors) == 0 {
-		t.Fatal("expected errors when verifying with wrong key; got none")
-	}
+	var sawChain, sawCheckpoint, sawTipUnverifiable bool
 	for _, e := range report.Errors {
-		if e.Kind != "key_id_mismatch" {
-			t.Errorf("expected kind=key_id_mismatch, got kind=%s detail=%s", e.Kind, e.Detail)
+		switch e.Kind {
+		case "chain":
+			sawChain = true
+			if !strings.Contains(e.Detail, "signature verification failed") {
+				t.Errorf("chain error detail = %q, want it to mention signature verification", e.Detail)
+			}
+		case "checkpoint":
+			sawCheckpoint = true
+			if !strings.Contains(e.Detail, "signature verification failed") {
+				t.Errorf("checkpoint error detail = %q, want it to mention signature verification", e.Detail)
+			}
+		case "tip_hash_unverifiable":
+			sawTipUnverifiable = true
+		default:
+			t.Errorf("unexpected error kind %q: %+v", e.Kind, e)
 		}
+	}
+	if !sawChain || !sawCheckpoint || !sawTipUnverifiable {
+		t.Errorf("expected chain + checkpoint + tip_hash_unverifiable errors; got %v", report.Errors)
 	}
 }
 
-// TestVerifyLog_MultiEpochLog verifies that a log containing entries signed by
-// two different keys returns an error (not a report with per-trace errors).
-// Rotation-aware verification is not yet supported — see
-// docs/verification.md "Multi-epoch logs" and issue #19.
-func TestVerifyLog_MultiEpochLog(t *testing.T) {
+// TestVerifyLog_EntrySignedByDifferentKey replaces the old "multi-epoch"
+// bail-out test (issue #46): a log holding entries signed by two different
+// keys no longer makes VerifyLog refuse the whole log. Each trace is verified
+// independently against the single supplied key — the trace actually signed
+// by that key verifies cleanly, the other produces an ordinary "chain"
+// signature-failure error, and VerifyLog still returns a Report either way.
+func TestVerifyLog_EntrySignedByDifferentKey(t *testing.T) {
 	dir := t.TempDir()
 	logPath := filepath.Join(dir, "audit.jsonl")
 	checkpointPath := filepath.Join(dir, "checkpoint.jsonl")
@@ -312,22 +330,28 @@ func TestVerifyLog_MultiEpochLog(t *testing.T) {
 		_ = f.Close()
 	}
 
-	_, err = verify.VerifyLog(logPath, checkpointPath, pub2)
-	if err == nil {
-		t.Fatal("expected an error for multi-epoch log; got nil")
+	report, err := verify.VerifyLog(logPath, checkpointPath, pub2)
+	if err != nil {
+		t.Fatalf("VerifyLog: %v", err)
 	}
-	if !strings.Contains(err.Error(), "multi-epoch log") {
-		t.Errorf("expected 'multi-epoch log' in error, got: %v", err)
+	if report.TracesProcessed != 2 {
+		t.Errorf("TracesProcessed = %d, want 2", report.TracesProcessed)
+	}
+	if len(report.Errors) != 1 {
+		t.Fatalf("expected exactly 1 error (traceID1, signed by a different key); got %v", report.Errors)
+	}
+	if e := report.Errors[0]; e.TraceID != traceID1 || e.Kind != "chain" {
+		t.Errorf("expected a chain error for %s; got %+v", traceID1, e)
+	} else if !strings.Contains(e.Detail, "signature verification failed") {
+		t.Errorf("expected a signature-verification-failed detail, got: %s", e.Detail)
 	}
 }
 
-// TestVerifyLog_MultiEpochLogWithTornTrailingLine covers the multi-epoch
-// bail-out's torn-tail handling: readLogEntries computes tornTailDetail
-// before the multi-epoch check runs, so a log that is both multi-epoch and
-// torn should not silently discard that already-known diagnostic — it must
-// appear in the returned error, even though the bail-out returns a bare error
-// rather than a Report.
-func TestVerifyLog_MultiEpochLogWithTornTrailingLine(t *testing.T) {
+// TestVerifyLog_DifferentSignerWithTornTrailingLine covers the interaction
+// between a real different-signer trace and a torn trailing line — both must
+// surface in the same Report now that neither condition makes VerifyLog bail
+// out early (issue #46).
+func TestVerifyLog_DifferentSignerWithTornTrailingLine(t *testing.T) {
 	dir := t.TempDir()
 	logPath := filepath.Join(dir, "audit.jsonl")
 	checkpointPath := filepath.Join(dir, "checkpoint.jsonl")
@@ -376,15 +400,24 @@ func TestVerifyLog_MultiEpochLogWithTornTrailingLine(t *testing.T) {
 		_ = f.Close()
 	}
 
-	_, err = verify.VerifyLog(logPath, checkpointPath, pub2)
-	if err == nil {
-		t.Fatal("expected an error for multi-epoch log; got nil")
+	report, err := verify.VerifyLog(logPath, checkpointPath, pub2)
+	if err != nil {
+		t.Fatalf("VerifyLog: %v", err)
 	}
-	if !strings.Contains(err.Error(), "multi-epoch log") {
-		t.Errorf("expected 'multi-epoch log' in error, got: %v", err)
+	var sawChain, sawTornTail bool
+	for _, e := range report.Errors {
+		switch {
+		case e.Kind == "chain" && e.TraceID == traceID1:
+			sawChain = true
+		case e.Kind == verify.KindTornTrailingLine:
+			sawTornTail = true
+		}
 	}
-	if !strings.Contains(err.Error(), "final line was also unparseable") {
-		t.Errorf("expected the torn-tail detail to survive the multi-epoch bail-out; got: %v", err)
+	if !sawChain {
+		t.Errorf("expected a chain error for %s; got %v", traceID1, report.Errors)
+	}
+	if !sawTornTail {
+		t.Errorf("expected torn_trailing_line error; got %v", report.Errors)
 	}
 }
 
@@ -556,11 +589,9 @@ func TestVerifyLog_OnlyLogLineIsTorn(t *testing.T) {
 	}
 }
 
-// TestVerifyLog_WrongKeyWithTornTrailingLine covers the key_id_mismatch
-// early-return branch's torn-tail handling (verify.go's other
-// report.Errors = verifyErrs site, distinct from the main path exercised by
-// TestVerifyLog_PartialLastLogLine). A log can independently have both a
-// wrong-key mismatch and a torn final line, and both must surface.
+// TestVerifyLog_WrongKeyWithTornTrailingLine covers a wrong-key run whose log
+// also has a torn final line — both must surface in the same Report; neither
+// condition makes VerifyLog bail out early.
 func TestVerifyLog_WrongKeyWithTornTrailingLine(t *testing.T) {
 	logPath, checkpointPath, _ := makeVerifyFixture(t)
 	_, wrongPub, err := sign.GenerateEd25519Key()
@@ -579,20 +610,165 @@ func TestVerifyLog_WrongKeyWithTornTrailingLine(t *testing.T) {
 	if err != nil {
 		t.Fatalf("VerifyLog: %v", err)
 	}
-	var sawMismatch, sawTornTail bool
+	var sawChain, sawTornTail bool
 	for _, e := range report.Errors {
 		switch e.Kind {
-		case "key_id_mismatch":
-			sawMismatch = true
+		case "chain":
+			sawChain = true
 		case verify.KindTornTrailingLine:
 			sawTornTail = true
 		}
 	}
-	if !sawMismatch {
-		t.Errorf("expected key_id_mismatch error; got: %v", report.Errors)
+	if !sawChain {
+		t.Errorf("expected a chain signature-failure error; got: %v", report.Errors)
 	}
 	if !sawTornTail {
-		t.Errorf("expected torn_trailing_line error alongside key_id_mismatch; got: %v", report.Errors)
+		t.Errorf("expected torn_trailing_line error alongside the wrong-key errors; got: %v", report.Errors)
+	}
+}
+
+// TestVerifyLog_TamperedEntryKeyIDDoesNotBlockVerification pins issue #46's
+// first scenario. key_id sits beside the signature, not inside what gets
+// signed, so editing one entry's key_id to a bogus value must not deny
+// verification of an otherwise-intact, single-signer log. Before the fix,
+// this tripped the pre-scan's "more than one distinct key_id" multi-epoch
+// guard and returned a bare Go error instead of a Report — a log that was
+// entirely intact failed outright over one unsigned byte.
+func TestVerifyLog_TamperedEntryKeyIDDoesNotBlockVerification(t *testing.T) {
+	logPath, checkpointPath, pub := makeVerifyFixture(t)
+
+	data, err := os.ReadFile(logPath)
+	if err != nil {
+		t.Fatalf("read log: %v", err)
+	}
+	var entry chain.LogEntry
+	if err := json.Unmarshal(data, &entry); err != nil {
+		t.Fatalf("unmarshal log entry: %v", err)
+	}
+	realKeyID := entry.Signed.KeyID
+	entry.Signed.KeyID = "bogus-tampered-key-id"
+	tampered, err := json.Marshal(entry)
+	if err != nil {
+		t.Fatalf("marshal tampered entry: %v", err)
+	}
+	if err := os.WriteFile(logPath, append(tampered, '\n'), 0600); err != nil {
+		t.Fatalf("write tampered log: %v", err)
+	}
+
+	report, err := verify.VerifyLog(logPath, checkpointPath, pub)
+	if err != nil {
+		t.Fatalf("VerifyLog returned a bare error instead of a Report: %v", err)
+	}
+	if report.TracesProcessed != 1 {
+		t.Errorf("TracesProcessed = %d, want 1", report.TracesProcessed)
+	}
+	if report.CheckpointsProcessed != 1 {
+		t.Errorf("CheckpointsProcessed = %d, want 1", report.CheckpointsProcessed)
+	}
+	if len(report.Errors) != 1 {
+		t.Fatalf("expected exactly 1 error (key_id_field_mismatch); got %v", report.Errors)
+	}
+	e := report.Errors[0]
+	if e.Kind != "key_id_field_mismatch" {
+		t.Errorf("expected kind=key_id_field_mismatch, got kind=%s detail=%s", e.Kind, e.Detail)
+	}
+	if !strings.Contains(e.Detail, "bogus-tampered-key-id") || !strings.Contains(e.Detail, realKeyID) {
+		t.Errorf("expected detail to name both the claimed and verified key_id, got: %s", e.Detail)
+	}
+}
+
+// TestVerifyLog_UnifiedFakeKeyIDDoesNotMaskDifferentSigner pins issue #46's
+// second scenario. Forcing every entry's key_id to the same (possibly fake)
+// value must not collapse a log that genuinely has entries signed by
+// different keys into one misleading diagnosis. Each entry is still judged
+// strictly by its own signature: the one actually signed by the supplied key
+// verifies (with a key_id_field_mismatch flagging its now-wrong metadata),
+// and the one signed by a different key still produces a genuine chain
+// error — not a blanket "key_id_mismatch" wall that would have hidden which
+// trace is the real problem and obscured that this log needs the
+// per-epoch procedure at all.
+func TestVerifyLog_UnifiedFakeKeyIDDoesNotMaskDifferentSigner(t *testing.T) {
+	dir := t.TempDir()
+	logPath := filepath.Join(dir, "audit.jsonl")
+	checkpointPath := filepath.Join(dir, "checkpoint.jsonl")
+
+	priv1, pub1, err := sign.GenerateEd25519Key()
+	if err != nil {
+		t.Fatalf("GenerateEd25519Key 1: %v", err)
+	}
+	signer1 := sign.NewEd25519Signer(priv1)
+
+	priv2, _, err := sign.GenerateEd25519Key()
+	if err != nil {
+		t.Fatalf("GenerateEd25519Key 2: %v", err)
+	}
+	signer2 := sign.NewEd25519Signer(priv2)
+
+	makeEntry := func(signer sign.Signer, traceID, spanID string, seq int) chain.LogEntry {
+		rec := record.AuditRecord{
+			SchemaVersion: record.SchemaVersion,
+			TraceID:       traceID,
+			SpanID:        spanID,
+			SeqInTrace:    seq,
+			SpanName:      "span",
+			OtelKind:      "Internal",
+			AuditKind:     record.AuditKindTask,
+			Status:        "Ok",
+		}
+		seed, _ := chain.GenesisSeed(traceID)
+		entries, _ := chain.BuildChain([]record.AuditRecord{rec}, seed, signer)
+		return chain.ToLogEntries(entries)[0]
+	}
+
+	traceID1 := "01010101010101010101010101010101"
+	traceID2 := "02020202020202020202020202020202"
+	e1 := makeEntry(signer1, traceID1, "0102030405060708", 0)
+	e2 := makeEntry(signer2, traceID2, "0807060504030201", 0)
+
+	// Force both entries to claim the same fake key_id, disguising the fact
+	// that they were really signed by two different keys.
+	e1.Signed.KeyID = "shared-fake-key-id"
+	e2.Signed.KeyID = "shared-fake-key-id"
+
+	lf, _ := os.Create(logPath)
+	for _, e := range []chain.LogEntry{e1, e2} {
+		line, _ := json.Marshal(e)
+		_, _ = lf.Write(append(line, '\n'))
+	}
+	_ = lf.Close()
+	if f, err := os.Create(checkpointPath); err == nil {
+		_ = f.Close()
+	}
+
+	report, err := verify.VerifyLog(logPath, checkpointPath, pub1)
+	if err != nil {
+		t.Fatalf("VerifyLog: %v", err)
+	}
+	if report.TracesProcessed != 2 {
+		t.Errorf("TracesProcessed = %d, want 2", report.TracesProcessed)
+	}
+	if len(report.Errors) != 2 {
+		t.Fatalf("expected exactly 2 errors; got %v", report.Errors)
+	}
+	var sawFieldMismatch, sawChain bool
+	for _, e := range report.Errors {
+		switch {
+		case e.TraceID == traceID1 && e.Kind == "key_id_field_mismatch":
+			sawFieldMismatch = true
+		case e.TraceID == traceID2 && e.Kind == "chain":
+			sawChain = true
+			if !strings.Contains(e.Detail, "signature verification failed") {
+				t.Errorf("expected a signature-verification-failed detail for %s, got: %s", traceID2, e.Detail)
+			}
+		default:
+			t.Errorf("unexpected error: %+v", e)
+		}
+	}
+	if !sawFieldMismatch {
+		t.Errorf("expected key_id_field_mismatch for %s (verifies, but claims the wrong key_id); got %v", traceID1, report.Errors)
+	}
+	if !sawChain {
+		t.Errorf("expected a real chain error for %s (signed by a different key); got %v", traceID2, report.Errors)
 	}
 }
 
