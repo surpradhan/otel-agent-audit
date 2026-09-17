@@ -27,6 +27,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"path/filepath"
 	"sync"
 
 	"github.com/surpradhan/otel-agent-audit/exporter/agentauditexporter/internal/record"
@@ -72,6 +73,10 @@ type WAL struct {
 	mu   sync.Mutex
 	path string
 	f    *os.File
+
+	// warn, if set, is called when a best-effort durability step fails
+	// without failing the operation it belongs to. See SetWarnFunc.
+	warn func(error)
 }
 
 // Open opens or creates the WAL file at path for appending.
@@ -81,6 +86,17 @@ func Open(path string) (*WAL, error) {
 		return nil, fmt.Errorf("wal: open %q: %w", path, err)
 	}
 	return &WAL{path: path, f: f}, nil
+}
+
+// SetWarnFunc installs fn to be called when a best-effort durability step
+// fails without failing the operation it belongs to — currently, only
+// fsyncing the WAL's parent directory after Compact's atomic rename (see
+// Compact and issue #36). wal has no logger of its own by design, so this
+// lets the caller (which does) report the failure however it reports
+// everything else. Pass nil, the default, to disable this reporting. Not
+// safe to call concurrently with Compact.
+func (w *WAL) SetWarnFunc(fn func(error)) {
+	w.warn = fn
 }
 
 // AppendSpan writes a span entry to the WAL. Does not call Sync.
@@ -205,6 +221,14 @@ func (w *WAL) Replay() (buffers map[string][]record.AuditRecord, sealedPending [
 // It acquires the write lock, atomically renames the new file over the old
 // one, then re-opens the append fd so subsequent AppendSpan calls are not
 // writing to the unlinked inode. Compact calls Sync before rename.
+//
+// After a successful rename, it also fsyncs the WAL's parent directory,
+// best-effort: the rename is a directory-entry mutation, not durable until
+// the directory itself is fsynced — the same class of gap the exporter
+// package's Start closes for a file's first creation, but here on an
+// ongoing rename instead of a one-time creation. A failure to sync does not
+// fail an otherwise-successful compaction; it is only reported via
+// SetWarnFunc's callback, if one is installed. See issue #36.
 func (w *WAL) Compact(pending map[string]map[string]struct{}) error {
 	w.mu.Lock()
 	defer w.mu.Unlock()
@@ -314,6 +338,10 @@ func (w *WAL) Compact(pending map[string]map[string]struct{}) error {
 		return fmt.Errorf("wal: compact rename: %w", err)
 	}
 
+	if err := syncParentDir(w.path); err != nil && w.warn != nil {
+		w.warn(fmt.Errorf("wal: sync parent directory after compact rename: %w", err))
+	}
+
 	// Re-open the append fd so AppendSpan doesn't write to the unlinked inode.
 	_ = w.f.Close()
 	newF, err := os.OpenFile(w.path, os.O_APPEND|os.O_WRONLY, 0600)
@@ -334,4 +362,21 @@ func (w *WAL) Close() error {
 		return err
 	}
 	return nil
+}
+
+// syncParentDir fsyncs the directory containing path. Mirrors the exporter
+// package's helper of the same name, which this package cannot call
+// directly — exporter imports wal, so the reverse would be an import cycle.
+// Carries the same OS-portability caveat as that original: only the
+// os.Open-fails branch is exercised by tests (see TestSyncParentDir_
+// MissingParent); a successful Open with a failing Sync is not portably
+// reachable from package os without a fault-injection seam this package
+// does not have.
+func syncParentDir(path string) error {
+	d, err := os.Open(filepath.Dir(path))
+	if err != nil {
+		return err
+	}
+	defer func() { _ = d.Close() }()
+	return d.Sync()
 }

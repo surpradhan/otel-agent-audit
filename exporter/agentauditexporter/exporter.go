@@ -357,6 +357,12 @@ func (e *agentAuditExporter) Start(_ context.Context, _ component.Host) error {
 		return fmt.Errorf("agentaudit: opening WAL %q: %w", e.cfg.WalPath, err)
 	}
 	e.wal = w
+	w.SetWarnFunc(func(err error) {
+		e.logger.Warn("agentaudit: syncing WAL's parent directory after compaction's "+
+			"atomic rename; a crash before this succeeds could leave the directory "+
+			"entry pointing at the pre-compaction file",
+			zap.String("path", e.cfg.WalPath), zap.Error(err))
+	})
 	e.warnIfParentDirSyncFails("WAL", e.cfg.WalPath)
 
 	// Replay WAL to rehydrate in-progress buffers, plus any sealed trace's tip

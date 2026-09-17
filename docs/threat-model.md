@@ -224,9 +224,16 @@ lifetime; even then, the added fsync is proportional to the unconditional
 `Sync` the sidecar write already performs on every call regardless of this
 fix. See issue #33.
 
-**What this does not change:** `WAL.Compact`'s atomic rename over the live WAL
-file has the same directory-durability property on an ongoing operation rather
-than a first creation — a related but distinct gap, tracked as issue #36.
+**`WAL.Compact`'s atomic rename** over the live WAL file has the same
+directory-durability property as first creation, just on an ongoing operation
+instead — so it was originally tracked as a separate gap (issue #36) rather
+than folded in above, since a rename recurs on every compaction rather than
+happening once at a fixed `Start()`-time hook. `Compact` now fsyncs the WAL's
+parent directory immediately after the rename succeeds, the same way on every
+call — there is no "first rename" to distinguish, and fsyncing an
+already-durable directory again is a harmless no-op. It stays best-effort and
+non-fatal like every case above: a failure does not fail an otherwise-
+successful compaction, only logs a warning and continues. See issue #36.
 
 ### 3f. Torn audit-log line within a single process lifetime
 
