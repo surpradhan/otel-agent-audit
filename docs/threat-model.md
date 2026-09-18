@@ -64,12 +64,15 @@ Operators requiring finer completeness guarantees should lower
 `checkpoint_interval` or call `Shutdown` at regular intervals to force a
 checkpoint flush.
 
-This guarantee holds within a single key epoch. At a key-rotation boundary,
-the "next checkpoint" is signed by the new key, and the currently-documented
-per-epoch verification procedure excludes it from the old epoch's run — so
-the one checkpoint that would have caught a dropped boundary trace is
-exactly the one omitted. See [docs/verification.md § Multi-epoch
-logs](verification.md#multi-epoch-logs) and issue #19.
+This guarantee holds within a single key epoch by default, and now extends
+across a rotation boundary too, provided the verifier is run unsplit — once
+per candidate key, against the full log and checkpoint files rather than a
+per-epoch slice (issue #46). The previously-documented split-per-epoch
+procedure does not have this property: splitting the checkpoint file by
+`key_id` excludes the new epoch's checkpoint from the old epoch's run, so the
+one checkpoint that would have caught a dropped boundary trace is exactly the
+one omitted. See [docs/verification.md § Multi-epoch
+logs](verification.md#multi-epoch-logs) and issue #35.
 
 ### 3b. Intra-trace completeness (early-root truncation)
 
@@ -354,7 +357,7 @@ technical counsel.
 | `entry_count_mismatch` | A checkpoint claims more entries than the log contains — a trace may have been deleted post-seal |
 | `tip_hash_mismatch` | The recomputed chain tip does not match the checkpoint — at least one entry was altered or reordered |
 | `tip_hash_unverifiable` | The chain itself failed verification; the checkpoint tip cannot be independently confirmed |
-| `key_id_mismatch` | The supplied public key does not match the `key_id` recorded in the log; you are using the wrong key |
+| `key_id_field_mismatch` | An entry's signature verified, but its claimed `key_id` does not match the supplied key — the content is authentic (the signature already proved that); the `key_id` metadata is stale or was tampered with. Entry-only: a checkpoint's `key_id` is itself signed, so tampering it fails the checkpoint's signature check instead |
 | `duplicate_trace_segment` | Two independent chains exist for the same `trace_id` — this is an at-least-once delivery artifact, not evidence of tampering |
 | `torn_trailing_line` | The audit log's final line was unparseable — likely an interrupted write from a crash. Its content was never cryptographically verified (that is what "unparseable" means), so this alone does not rule out tampering; entries before it were fully verified |
 
@@ -363,10 +366,14 @@ technical counsel.
 - Tampering that occurred before the span reached the collector
 - A complete log rewrite by an adversary who holds the private key (§2)
 - At a key-rotation boundary, deletion of the trace whose only checkpoint
-  coverage crosses the boundary — the currently-documented per-epoch
-  verification procedure reports `Status: OK` regardless (§3a,
+  coverage crosses the boundary — **if** the verifier is run against a log
+  and checkpoint file pre-split by `key_id`, per the now-discouraged
+  procedure this section used to recommend (§3a,
   [docs/verification.md § Multi-epoch
-  logs](verification.md#multi-epoch-logs), issue #19)
+  logs](verification.md#multi-epoch-logs)). Running it unsplit, once per
+  candidate key, does detect this (issue #46) — a clean,
+  non-noisy attestation across the boundary in a single run remains
+  issue #19's open design question, not this one
 
 ---
 

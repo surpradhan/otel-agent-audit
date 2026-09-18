@@ -26,8 +26,13 @@ func TestErrorLabel(t *testing.T) {
 			want: "checkpoint",
 		},
 		{
-			name: "checkpoint-side key_id_mismatch",
-			err:  verify.VerifyError{TraceID: "", Kind: "key_id_mismatch"},
+			// Not a Kind verify.VerifyLog produces today (checkpoint and
+			// torn_trailing_line are the only empty-TraceID kinds it emits —
+			// see verify.go) — this pins errorLabel's fallback for any other
+			// empty-TraceID kind, so a future addition defaults sanely without
+			// needing its own case here.
+			name: "unrecognized empty-TraceID kind falls back to checkpoint",
+			err:  verify.VerifyError{TraceID: "", Kind: "some_future_kind"},
 			want: "checkpoint",
 		},
 		{

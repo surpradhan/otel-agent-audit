@@ -10,11 +10,9 @@ import (
 	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"os"
 	"sort"
-	"strings"
 
 	"github.com/surpradhan/otel-agent-audit/exporter/agentauditexporter/internal/canonical"
 	"github.com/surpradhan/otel-agent-audit/exporter/agentauditexporter/internal/chain"
@@ -149,18 +147,37 @@ func VerifyCheckpoint(cp chain.Checkpoint, prevSignPayloadHash string, pubKey ed
 // checkpoints, and returns a Report.
 //
 // Key-id handling:
-//   - The verifier computes the fingerprint of the supplied public key as
-//     hex(SHA256(pubKey)) and pre-scans all entries and checkpoints.
-//   - If the log contains more than one distinct key_id (a multi-epoch log),
-//     VerifyLog returns a Go error (not a Report) and stops. Rotation-aware
-//     verification is not yet supported (see docs/verification.md
-//     "Multi-epoch logs" and issue #19) — splitting the log per epoch and
-//     verifying each slice separately does not reliably detect deletion of
-//     the boundary trace.
-//   - If the single key_id in the log does not match the supplied public key,
-//     VerifyLog emits "key_id_mismatch" errors for every trace and checkpoint
-//     without attempting chain verification (which would only produce misleading
-//     signature-failure errors).
+//   - Every log entry carries a key_id field (hex(SHA256(pubKeyBytes))), but
+//     sign.SignedEntry.KeyID sits beside the signature, not inside what gets
+//     signed (see internal/sign) — it is not authenticated, and nothing stops
+//     it being edited independently of a perfectly valid signature. VerifyLog
+//     therefore never lets an entry's claimed key_id decide whether, or how,
+//     its chain is verified: every entry is always verified directly against
+//     the supplied public key.
+//   - When a trace's chain verifies successfully, its entries' claimed
+//     key_id is compared against the now-authenticated actual signer,
+//     hex(SHA256(pubKey)). A disagreement there cannot mean the content is
+//     forged — the signature already proved otherwise — so it is reported as
+//     a non-fatal "key_id_field_mismatch" finding (stale or tampered
+//     metadata on an otherwise-good entry) rather than something that blocks
+//     verification.
+//   - A checkpoint's key_id is different: chain.Checkpoint.KeyID is one of
+//     the fields chain.CheckpointSigningPayload marshals into the bytes that
+//     get signed (see chain.Accumulator.Stage), so it IS authenticated —
+//     editing it invalidates the checkpoint's signature like editing any
+//     other signed field, and VerifyCheckpoint reports that as an ordinary
+//     "checkpoint" signature-failure error. There is no checkpoint-side
+//     key_id_field_mismatch: a checkpoint that verifies has, by construction,
+//     a key_id equal to the supplied key's fingerprint.
+//   - An entry or checkpoint that does NOT verify against the supplied key
+//     (wrong key, key rotation, or genuine tampering) produces the ordinary
+//     "chain" / "checkpoint" signature-failure error. VerifyLog cannot and
+//     does not try to tell those causes apart using a single candidate key.
+//     To check whether a log spans a key rotation, compare claimed key_id
+//     values by hand (see docs/verification.md "Multi-epoch logs") — always
+//     against the full, unsplit log and checkpoint files, since filtering by
+//     key_id can exclude the very checkpoint that covers a rotation-boundary
+//     trace (issue #35).
 //
 // Policy for traces not covered by any checkpoint: counted in TracesProcessed
 // but not reported as errors (they are "unchecked-by-checkpoint"). Rationale:
@@ -190,84 +207,11 @@ func VerifyLog(logPath, checkpointPath string, pubKey ed25519.PublicKey) (Report
 		return report, err
 	}
 
-	// Pre-scan: collect all distinct key_ids across log entries and checkpoints.
-	// This allows us to distinguish "wrong key supplied" (key_id_mismatch) from
-	// "bad signature" (chain error) and to detect multi-epoch logs early.
-	// Entries with an empty key_id (pre-key_id-field logs) are excluded from
-	// this scan; for those logs the verifier falls back to direct signature
-	// verification rather than a more precise key_id_mismatch diagnostic.
+	// suppliedKeyID is the fingerprint of the key this run verifies against.
+	// Compared against each entry/checkpoint's claimed key_id only AFTER that
+	// entry/checkpoint's signature has been independently verified below —
+	// see VerifyLog's doc comment.
 	suppliedKeyID := pubKeyID(pubKey)
-	seenKeyIDs := make(map[string]struct{})
-	for _, entries := range traceEntries {
-		for _, e := range entries {
-			if e.Signed.KeyID != "" {
-				seenKeyIDs[e.Signed.KeyID] = struct{}{}
-			}
-		}
-	}
-	for _, cp := range checkpoints {
-		if cp.KeyID != "" {
-			seenKeyIDs[cp.KeyID] = struct{}{}
-		}
-	}
-
-	// Multi-epoch check: more than one distinct key_id means the log spans a
-	// key rotation. Rotation-aware verification is not yet supported — see
-	// docs/verification.md "Multi-epoch logs" and issue #19.
-	if len(seenKeyIDs) > 1 {
-		ids := make([]string, 0, len(seenKeyIDs))
-		for id := range seenKeyIDs {
-			ids = append(ids, id)
-		}
-		sort.Strings(ids)
-		msg := fmt.Sprintf("multi-epoch log: %d distinct key_ids found; rotation-aware verification is not yet supported (see docs/verification.md#multi-epoch-logs, issue #19) (found: %s)",
-			len(ids), strings.Join(ids, ", "))
-		if tornTailDetail != "" {
-			msg += fmt.Sprintf("; the final line was also unparseable: %s", tornTailDetail)
-		}
-		return report, errors.New(msg)
-	}
-
-	// Single key_id check: if the log has exactly one key_id and it doesn't
-	// match the supplied key, emit key_id_mismatch for every trace and checkpoint
-	// rather than letting chain verification produce misleading signature errors.
-	if len(seenKeyIDs) == 1 {
-		var logKeyID string
-		for id := range seenKeyIDs {
-			logKeyID = id
-		}
-		if logKeyID != suppliedKeyID {
-			detail := fmt.Sprintf("log signed by %s, supplied key is %s", logKeyID, suppliedKeyID)
-			var verifyErrs []VerifyError
-
-			traceIDs := make([]string, 0, len(traceEntries))
-			for id := range traceEntries {
-				traceIDs = append(traceIDs, id)
-			}
-			sort.Strings(traceIDs)
-			for _, traceID := range traceIDs {
-				verifyErrs = append(verifyErrs, VerifyError{
-					TraceID: traceID,
-					Kind:    "key_id_mismatch",
-					Detail:  detail,
-				})
-				report.TracesProcessed++
-			}
-			for _, cp := range checkpoints {
-				verifyErrs = append(verifyErrs, VerifyError{
-					TraceID: "",
-					Kind:    "key_id_mismatch",
-					Detail:  fmt.Sprintf("checkpoint seq %d: %s", cp.CheckpointSeq, detail),
-				})
-				report.CheckpointsProcessed++
-			}
-			if tornTailDetail != "" {
-				verifyErrs = append(verifyErrs, VerifyError{Kind: KindTornTrailingLine, Detail: tornTailDetail})
-			}
-			report.Errors = verifyErrs
-			return report, nil
-		}
-	}
 
 	// Verify each trace chain in sorted order for deterministic error output.
 	traceIDs := make([]string, 0, len(traceEntries))
@@ -309,6 +253,22 @@ func VerifyLog(logPath, checkpointPath string, pubKey ed25519.PublicKey) (Report
 			chainFailed[traceID] = struct{}{}
 		} else {
 			verifiedTips[traceID] = tipHash
+			// The chain verified against the supplied key, so suppliedKeyID is
+			// now this trace's authenticated signer. A claimed key_id that
+			// disagrees is stale or tampered metadata, not a forged entry —
+			// worth reporting, but not a reason to fail an otherwise-good
+			// trace. Entries with an empty key_id (pre-key_id-field logs) are
+			// skipped: there is nothing to compare.
+			for _, e := range entries {
+				if e.Signed.KeyID != "" && e.Signed.KeyID != suppliedKeyID {
+					verifyErrs = append(verifyErrs, VerifyError{
+						TraceID: traceID,
+						Kind:    "key_id_field_mismatch",
+						Detail: fmt.Sprintf("seq %d: entry key_id %s does not match verified signer %s",
+							e.Record.SeqInTrace, e.Signed.KeyID, suppliedKeyID),
+					})
+				}
+			}
 		}
 		report.TracesProcessed++
 	}
@@ -335,6 +295,15 @@ func VerifyLog(logPath, checkpointPath string, pubKey ed25519.PublicKey) (Report
 				Detail:  fmt.Sprintf("seq %d: %v", cp.CheckpointSeq, err),
 			})
 		}
+		// No checkpoint-side key_id_field_mismatch check here: unlike an
+		// entry's key_id, cp.KeyID is one of the fields CheckpointSigningPayload
+		// marshals into the signed bytes (see chain.Accumulator.Stage), so it is
+		// authenticated. A checkpoint that reaches this point having verified
+		// necessarily has cp.KeyID == suppliedKeyID already — Ed25519
+		// verification succeeding is proof the exact payload, KeyID included,
+		// was signed by the supplied key. Editing cp.KeyID alone changes the
+		// signed bytes and fails verification above like any other tampered
+		// field; it cannot reach here with a disagreeing value.
 		// prevHash advances even when VerifyCheckpoint fails so that the next
 		// checkpoint's prev_checkpoint_hash field is evaluated against the hash
 		// of the corrupt/tampered entry's payload rather than the last good one.
