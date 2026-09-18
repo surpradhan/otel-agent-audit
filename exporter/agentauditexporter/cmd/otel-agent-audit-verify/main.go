@@ -14,9 +14,16 @@
 //
 // Exit codes:
 //
-//	0  all checks pass
-//	1  one or more verification failures (chain or checkpoint)
+//	0  all checks pass, or only advisory findings were reported
+//	1  one or more fatal verification failures were reported
 //	2  usage error, I/O error, or key parse error
+//
+// "Fatal" and "advisory" are verify.VerifyError.Severity: a fatal finding
+// (e.g. chain, checkpoint, tip_hash_mismatch) means verification failed or
+// could not be completed; an advisory finding (key_id_field_mismatch,
+// torn_trailing_line) means the flagged entries were still fully verified
+// despite the finding. Advisory findings are always printed but never
+// affect the exit code or the Status line — see docs/verification.md.
 package main
 
 import (
@@ -78,6 +85,8 @@ func run() int {
 		return 2
 	}
 
+	fatal := fatalCount(report.Errors)
+
 	if *jsonOut {
 		enc := json.NewEncoder(os.Stdout)
 		enc.SetIndent("", "  ")
@@ -88,20 +97,34 @@ func run() int {
 	} else {
 		fmt.Printf("Traces processed:      %d\n", report.TracesProcessed)
 		fmt.Printf("Checkpoints processed: %d\n", report.CheckpointsProcessed)
-		if len(report.Errors) == 0 {
+		if fatal == 0 {
 			fmt.Println("Status: OK")
 		} else {
-			fmt.Printf("Status: FAILED (%d error(s))\n", len(report.Errors))
-			for _, e := range report.Errors {
-				fmt.Printf("  [%s] %s: %s\n", errorLabel(e), e.Kind, e.Detail)
-			}
+			fmt.Printf("Status: FAILED (%d error(s))\n", fatal)
+		}
+		for _, e := range report.Errors {
+			fmt.Printf("  [%s] %s (%s): %s\n", errorLabel(e), e.Kind, e.Severity, e.Detail)
 		}
 	}
 
-	if len(report.Errors) > 0 {
+	if fatal > 0 {
 		return 1
 	}
 	return 0
+}
+
+// fatalCount returns how many of errs have Severity == verify.SeverityFatal.
+// The exit code and the Status line are driven by this count, not len(errs)
+// — an advisory finding (verify.SeverityAdvisory) is always printed but
+// never fails the run (issue #49).
+func fatalCount(errs []verify.VerifyError) int {
+	n := 0
+	for _, e := range errs {
+		if e.Severity == verify.SeverityFatal {
+			n++
+		}
+	}
+	return n
 }
 
 // errorLabel returns the "[...]" prefix for one report line: the trace ID

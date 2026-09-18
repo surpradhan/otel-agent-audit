@@ -49,3 +49,52 @@ func TestErrorLabel(t *testing.T) {
 		})
 	}
 }
+
+// TestFatalCount pins the exit-code/Status-line policy (issue #49): only
+// verify.SeverityFatal errors count, so a report holding solely advisory
+// findings counts zero, and mixing severities counts only the fatal ones.
+func TestFatalCount(t *testing.T) {
+	tests := []struct {
+		name string
+		errs []verify.VerifyError
+		want int
+	}{
+		{
+			name: "no errors",
+			errs: nil,
+			want: 0,
+		},
+		{
+			name: "all advisory",
+			errs: []verify.VerifyError{
+				{Kind: "key_id_field_mismatch", Severity: verify.SeverityAdvisory},
+				{Kind: verify.KindTornTrailingLine, Severity: verify.SeverityAdvisory},
+			},
+			want: 0,
+		},
+		{
+			name: "all fatal",
+			errs: []verify.VerifyError{
+				{Kind: "chain", Severity: verify.SeverityFatal},
+				{Kind: "checkpoint", Severity: verify.SeverityFatal},
+			},
+			want: 2,
+		},
+		{
+			name: "mixed severities counts only fatal",
+			errs: []verify.VerifyError{
+				{Kind: "chain", Severity: verify.SeverityFatal},
+				{Kind: "key_id_field_mismatch", Severity: verify.SeverityAdvisory},
+				{Kind: verify.KindTornTrailingLine, Severity: verify.SeverityAdvisory},
+			},
+			want: 1,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := fatalCount(tt.errs); got != tt.want {
+				t.Errorf("fatalCount(%+v) = %d, want %d", tt.errs, got, tt.want)
+			}
+		})
+	}
+}

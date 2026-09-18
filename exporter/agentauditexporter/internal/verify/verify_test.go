@@ -152,9 +152,15 @@ func TestVerifyLog_TamperedChainEmitsBothErrors(t *testing.T) {
 	for _, e := range report.Errors {
 		if e.Kind == "chain" {
 			hasChain = true
+			if e.Severity != verify.SeverityFatal {
+				t.Errorf("chain error Severity = %q, want %q", e.Severity, verify.SeverityFatal)
+			}
 		}
 		if e.Kind == "tip_hash_unverifiable" {
 			hasTipUnverifiable = true
+			if e.Severity != verify.SeverityFatal {
+				t.Errorf("tip_hash_unverifiable error Severity = %q, want %q", e.Severity, verify.SeverityFatal)
+			}
 		}
 	}
 	if !hasChain {
@@ -208,9 +214,15 @@ func TestVerifyLog_BothSidesTamperedEmitsUnverifiable(t *testing.T) {
 	for _, e := range report.Errors {
 		if e.Kind == "chain" {
 			hasChain = true
+			if e.Severity != verify.SeverityFatal {
+				t.Errorf("chain error Severity = %q, want %q", e.Severity, verify.SeverityFatal)
+			}
 		}
 		if e.Kind == "tip_hash_unverifiable" {
 			hasTipUnverifiable = true
+			if e.Severity != verify.SeverityFatal {
+				t.Errorf("tip_hash_unverifiable error Severity = %q, want %q", e.Severity, verify.SeverityFatal)
+			}
 		}
 		if e.Kind == "tip_hash_mismatch" {
 			t.Errorf("unexpected tip_hash_mismatch when chain failed: %v", e)
@@ -252,6 +264,9 @@ func TestVerifyLog_WrongKey(t *testing.T) {
 	}
 	var sawChain, sawCheckpoint, sawTipUnverifiable bool
 	for _, e := range report.Errors {
+		if e.Severity != verify.SeverityFatal {
+			t.Errorf("%s error Severity = %q, want %q (wrong key: every kind here should be fatal)", e.Kind, e.Severity, verify.SeverityFatal)
+		}
 		switch e.Kind {
 		case "chain":
 			sawChain = true
@@ -344,6 +359,8 @@ func TestVerifyLog_EntrySignedByDifferentKey(t *testing.T) {
 		t.Errorf("expected a chain error for %s; got %+v", traceID1, e)
 	} else if !strings.Contains(e.Detail, "signature verification failed") {
 		t.Errorf("expected a signature-verification-failed detail, got: %s", e.Detail)
+	} else if e.Severity != verify.SeverityFatal {
+		t.Errorf("chain error Severity = %q, want %q", e.Severity, verify.SeverityFatal)
 	}
 }
 
@@ -409,8 +426,14 @@ func TestVerifyLog_DifferentSignerWithTornTrailingLine(t *testing.T) {
 		switch {
 		case e.Kind == "chain" && e.TraceID == traceID1:
 			sawChain = true
+			if e.Severity != verify.SeverityFatal {
+				t.Errorf("chain error Severity = %q, want %q", e.Severity, verify.SeverityFatal)
+			}
 		case e.Kind == verify.KindTornTrailingLine:
 			sawTornTail = true
+			if e.Severity != verify.SeverityAdvisory {
+				t.Errorf("torn_trailing_line error Severity = %q, want %q", e.Severity, verify.SeverityAdvisory)
+			}
 		}
 	}
 	if !sawChain {
@@ -424,6 +447,13 @@ func TestVerifyLog_DifferentSignerWithTornTrailingLine(t *testing.T) {
 // TestVerifyLog_DuplicateTraceSegment verifies that a log with two entries
 // sharing the same (trace_id, seq_in_trace) produces a "duplicate_trace_segment"
 // error rather than a confusing chain error.
+//
+// Severity is pinned as SeverityFatal, not SeverityAdvisory, even though
+// docs/threat-model.md §7 calls a duplicate segment "not evidence of
+// tampering" (issue #49's deliberate call): that framing is about the
+// segment-split event, not about the entries under it, and chain
+// verification is skipped entirely for a duplicated trace_id — unlike the
+// two advisory kinds, nothing here was actually cryptographically checked.
 func TestVerifyLog_DuplicateTraceSegment(t *testing.T) {
 	logPath, checkpointPath, pub := makeVerifyFixture(t)
 
@@ -446,6 +476,9 @@ func TestVerifyLog_DuplicateTraceSegment(t *testing.T) {
 	for _, e := range report.Errors {
 		if e.Kind == "duplicate_trace_segment" {
 			found = true
+			if e.Severity != verify.SeverityFatal {
+				t.Errorf("duplicate_trace_segment Severity = %q, want %q", e.Severity, verify.SeverityFatal)
+			}
 		}
 		if e.Kind == "chain" {
 			t.Errorf("got misleading chain error for duplicate segment: %v", e)
@@ -453,6 +486,93 @@ func TestVerifyLog_DuplicateTraceSegment(t *testing.T) {
 	}
 	if !found {
 		t.Errorf("expected duplicate_trace_segment error; got: %v", report.Errors)
+	}
+}
+
+// TestVerifyLog_TipHashMismatchIsFatal covers a checkpoint whose claimed
+// tip_hash disagrees with the actual recomputed tip while the underlying
+// chain verifies cleanly — no existing test exercises tip_hash_mismatch as a
+// positive case (TestVerifyLog_BothSidesTamperedEmitsUnverifiable pins the
+// opposite: when the chain ALSO fails, tip_hash_unverifiable fires instead,
+// and the mismatch comparison is never reached). Built by feeding the
+// Accumulator a fabricated tip hash directly: Build signs over whatever
+// TraceTips it is given, so the checkpoint's own signature — and
+// EntryCount, left correct — verify cleanly, isolating the tip_hash
+// cross-check itself.
+func TestVerifyLog_TipHashMismatchIsFatal(t *testing.T) {
+	priv, pubKey, err := sign.GenerateEd25519Key()
+	if err != nil {
+		t.Fatalf("GenerateEd25519Key: %v", err)
+	}
+	signer := sign.NewEd25519Signer(priv)
+
+	recs := []record.AuditRecord{
+		{
+			SchemaVersion: record.SchemaVersion,
+			TraceID:       fixtureTraceID,
+			SpanID:        "0102030405060708",
+			ParentSpanID:  "0000000000000000",
+			SeqInTrace:    0,
+			SpanName:      "root",
+			OtelKind:      "Internal",
+			AuditKind:     record.AuditKindTask,
+			Status:        "Ok",
+		},
+	}
+	genesisSeed, err := chain.GenesisSeed(fixtureTraceID)
+	if err != nil {
+		t.Fatalf("GenesisSeed: %v", err)
+	}
+	entries, err := chain.BuildChain(recs, genesisSeed, signer)
+	if err != nil {
+		t.Fatalf("BuildChain: %v", err)
+	}
+
+	dir := t.TempDir()
+	logPath := filepath.Join(dir, "audit.jsonl")
+	checkpointPath := filepath.Join(dir, "checkpoint.jsonl")
+
+	lf, err := os.Create(logPath)
+	if err != nil {
+		t.Fatalf("create log: %v", err)
+	}
+	for _, e := range chain.ToLogEntries(entries) {
+		line, _ := json.Marshal(e)
+		_, _ = lf.Write(append(line, '\n'))
+	}
+	_ = lf.Close()
+
+	acc := chain.NewAccumulator(signer, 0, chain.ZeroPrevCheckpointHash)
+	fakeTip := strings.Repeat("ab", 32)
+	acc.AddTip(fixtureTraceID, fakeTip, len(entries))
+	cp, err := acc.Build(time.Now())
+	if err != nil {
+		t.Fatalf("Build checkpoint: %v", err)
+	}
+	cf, err := os.Create(checkpointPath)
+	if err != nil {
+		t.Fatalf("create checkpoint: %v", err)
+	}
+	cpLine, _ := json.Marshal(cp)
+	_, _ = cf.Write(append(cpLine, '\n'))
+	_ = cf.Close()
+
+	report, err := verify.VerifyLog(logPath, checkpointPath, pubKey)
+	if err != nil {
+		t.Fatalf("VerifyLog: %v", err)
+	}
+	if len(report.Errors) != 1 {
+		t.Fatalf("expected exactly 1 error (tip_hash_mismatch); got %v", report.Errors)
+	}
+	e := report.Errors[0]
+	if e.Kind != "tip_hash_mismatch" {
+		t.Errorf("expected kind=tip_hash_mismatch, got kind=%s detail=%s", e.Kind, e.Detail)
+	}
+	if e.Severity != verify.SeverityFatal {
+		t.Errorf("expected Severity=%s, got %s", verify.SeverityFatal, e.Severity)
+	}
+	if !strings.Contains(e.Detail, fakeTip) {
+		t.Errorf("expected detail to mention the fabricated tip_hash %s, got: %s", fakeTip, e.Detail)
 	}
 }
 
@@ -574,8 +694,14 @@ func TestVerifyLog_OnlyLogLineIsTorn(t *testing.T) {
 		switch e.Kind {
 		case verify.KindTornTrailingLine:
 			sawTornTail = true
+			if e.Severity != verify.SeverityAdvisory {
+				t.Errorf("torn_trailing_line Severity = %q, want %q", e.Severity, verify.SeverityAdvisory)
+			}
 		case "entry_count_mismatch":
 			sawEntryCountMismatch = true
+			if e.Severity != verify.SeverityFatal {
+				t.Errorf("entry_count_mismatch Severity = %q, want %q", e.Severity, verify.SeverityFatal)
+			}
 		}
 	}
 	if !sawTornTail {
@@ -615,8 +741,14 @@ func TestVerifyLog_WrongKeyWithTornTrailingLine(t *testing.T) {
 		switch e.Kind {
 		case "chain":
 			sawChain = true
+			if e.Severity != verify.SeverityFatal {
+				t.Errorf("chain error Severity = %q, want %q", e.Severity, verify.SeverityFatal)
+			}
 		case verify.KindTornTrailingLine:
 			sawTornTail = true
+			if e.Severity != verify.SeverityAdvisory {
+				t.Errorf("torn_trailing_line Severity = %q, want %q", e.Severity, verify.SeverityAdvisory)
+			}
 		}
 	}
 	if !sawChain {
@@ -672,6 +804,9 @@ func TestVerifyLog_TamperedEntryKeyIDDoesNotBlockVerification(t *testing.T) {
 	if e.Kind != "key_id_field_mismatch" {
 		t.Errorf("expected kind=key_id_field_mismatch, got kind=%s detail=%s", e.Kind, e.Detail)
 	}
+	if e.Severity != verify.SeverityAdvisory {
+		t.Errorf("expected Severity=%s (the signature already proved the content authentic), got %s", verify.SeverityAdvisory, e.Severity)
+	}
 	if !strings.Contains(e.Detail, "bogus-tampered-key-id") || !strings.Contains(e.Detail, realKeyID) {
 		t.Errorf("expected detail to name both the claimed and verified key_id, got: %s", e.Detail)
 	}
@@ -715,6 +850,9 @@ func TestVerifyLog_TamperedCheckpointKeyIDFailsSignature(t *testing.T) {
 	e := report.Errors[0]
 	if e.Kind != "checkpoint" {
 		t.Errorf("expected kind=checkpoint (key_id is signed, so tampering it fails signature verification), got kind=%s detail=%s", e.Kind, e.Detail)
+	}
+	if e.Severity != verify.SeverityFatal {
+		t.Errorf("expected Severity=%s, got %s", verify.SeverityFatal, e.Severity)
 	}
 	if !strings.Contains(e.Detail, "signature verification failed") {
 		t.Errorf("expected a signature-verification-failed detail, got: %s", e.Detail)
@@ -799,10 +937,16 @@ func TestVerifyLog_UnifiedFakeKeyIDDoesNotMaskDifferentSigner(t *testing.T) {
 		switch {
 		case e.TraceID == traceID1 && e.Kind == "key_id_field_mismatch":
 			sawFieldMismatch = true
+			if e.Severity != verify.SeverityAdvisory {
+				t.Errorf("key_id_field_mismatch Severity = %q, want %q", e.Severity, verify.SeverityAdvisory)
+			}
 		case e.TraceID == traceID2 && e.Kind == "chain":
 			sawChain = true
 			if !strings.Contains(e.Detail, "signature verification failed") {
 				t.Errorf("expected a signature-verification-failed detail for %s, got: %s", traceID2, e.Detail)
+			}
+			if e.Severity != verify.SeverityFatal {
+				t.Errorf("chain error Severity = %q, want %q", e.Severity, verify.SeverityFatal)
 			}
 		default:
 			t.Errorf("unexpected error: %+v", e)

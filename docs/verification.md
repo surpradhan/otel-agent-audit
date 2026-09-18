@@ -52,9 +52,29 @@ openssl pkey -in /path/to/private.pem -pubout -outform DER | tail -c 32 | xxd -p
 
 | Code | Meaning |
 |---|---|
-| 0 | All checks pass |
-| 1 | One or more verification failures (see output for details) |
+| 0 | All checks pass, or only advisory findings were reported |
+| 1 | One or more fatal verification failures were reported (see output for details) |
 | 2 | Usage error, I/O error, or key parse error |
+
+Every finding in `Report.Errors` carries a `Severity` of `"fatal"` or
+`"advisory"` (issue #49):
+
+- **fatal** — verification failed, or could not be completed:
+  `chain`, `checkpoint`, `tip_hash_mismatch`, `entry_count_mismatch`,
+  `tip_hash_unverifiable`, `duplicate_trace_segment`.
+- **advisory** — the flagged entries were still fully verified against the
+  supplied key despite the finding: `key_id_field_mismatch`,
+  `torn_trailing_line`. Worth surfacing, but not a reason to treat the log
+  as untrustworthy.
+
+The exit code and the `Status: OK` / `Status: FAILED` line reflect only
+fatal findings. Advisory findings are always printed (human-readable and
+JSON alike) but never affect either.
+
+> **Upgrading:** if existing automation treats any non-empty `Errors` as
+> failure, that behavior has changed — a log with only advisory findings now
+> reports `Status: OK` and exits 0. Check each error's `Severity` field if
+> you need the old, stricter all-errors-fail behavior.
 
 ## Example output (human-readable)
 
@@ -70,7 +90,17 @@ Failure example:
 Traces processed:      42
 Checkpoints processed: 1
 Status: FAILED (1 error(s))
-  [0123456789abcdef0123456789abcdef] chain: seq 2: signature verification failed
+  [0123456789abcdef0123456789abcdef] chain (fatal): seq 2: signature verification failed
+```
+
+Advisory-only example — still `Status: OK` and exit 0, but the finding is
+still printed:
+
+```
+Traces processed:      42
+Checkpoints processed: 1
+Status: OK
+  [0123456789abcdef0123456789abcdef] key_id_field_mismatch (advisory): seq 2: entry key_id deadbeef does not match verified signer c0ffee
 ```
 
 ## JSON output (`-json`)
@@ -83,9 +113,11 @@ Status: FAILED (1 error(s))
 }
 ```
 
-`Errors` is a JSON array of objects: `{"TraceID": "…", "Kind": "…", "Detail": "…"}`.
+`Errors` is a JSON array of objects:
+`{"TraceID": "…", "Kind": "…", "Detail": "…", "Severity": "fatal"|"advisory"}`.
 `TraceID` is empty for checkpoint-level errors and for the log-level
-`torn_trailing_line` finding.
+`torn_trailing_line` finding. See [Exit codes](#exit-codes) above for what
+`Severity` means and how it drives the exit code.
 
 ## Audit policy
 
@@ -145,7 +177,7 @@ checkpoint is always verified directly against the supplied public key
 |----------|-------------------|
 | Correct key supplied | Chain and checkpoint signatures are verified normally |
 | Wrong key supplied | Ordinary `chain` / `checkpoint` signature-failure errors — the verifier cannot and does not try to tell "wrong key" apart from "corrupted" using a single candidate key |
-| An entry verifies, but its claimed `key_id` disagrees with the supplied key | `key_id_field_mismatch` — a non-fatal finding. The signature already proved the content is authentic; the `key_id` metadata is stale or was tampered with, which is worth flagging but not a reason to fail an otherwise-good entry. There is no checkpoint-side equivalent: a checkpoint's `key_id` is signed, so tampering it alone fails its signature check instead (an ordinary `checkpoint` error) |
+| An entry verifies, but its claimed `key_id` disagrees with the supplied key | `key_id_field_mismatch` — `Severity: "advisory"` (see [Exit codes](#exit-codes)). The signature already proved the content is authentic; the `key_id` metadata is stale or was tampered with, which is worth flagging but not a reason to fail an otherwise-good entry. There is no checkpoint-side equivalent: a checkpoint's `key_id` is signed, so tampering it alone fails its signature check instead (an ordinary `checkpoint` error, `Severity: "fatal"`) |
 | Log spans multiple key epochs | No longer refused outright — see [Multi-epoch logs](#multi-epoch-logs) below |
 
 ### Multi-epoch logs

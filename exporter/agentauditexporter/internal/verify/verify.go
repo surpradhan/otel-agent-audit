@@ -28,6 +28,11 @@ type VerifyError struct {
 	TraceID string
 	Kind    string
 	Detail  string
+	// Severity is SeverityFatal or SeverityAdvisory (see those constants'
+	// doc comments). Callers deciding exit codes or a Status: OK/FAILED line
+	// should key off Severity, not merely off whether Errors is non-empty —
+	// an advisory-only report is not a verification failure (issue #49).
+	Severity string
 }
 
 func (e VerifyError) Error() string {
@@ -41,6 +46,20 @@ func (e VerifyError) Error() string {
 // output must label it differently from a checkpoint-level error, since both
 // share an empty TraceID (see cmd/otel-agent-audit-verify's errorLabel).
 const KindTornTrailingLine = "torn_trailing_line"
+
+// SeverityFatal marks a VerifyError that means verification could not be
+// completed, or completed and found the signed content untrustworthy. A
+// report containing any SeverityFatal error should be treated as a
+// verification failure (Status: FAILED, non-zero exit code).
+const SeverityFatal = "fatal"
+
+// SeverityAdvisory marks a VerifyError whose flagged entries were still
+// fully verified against the supplied key despite the finding — the
+// signature already proved the content authentic, so this is worth
+// surfacing but is not by itself a reason to treat the log as untrustworthy.
+// A report containing only SeverityAdvisory errors is not a verification
+// failure.
+const SeverityAdvisory = "advisory"
 
 // Report summarizes a VerifyLog run.
 // TracesProcessed and CheckpointsProcessed count all entries seen (including
@@ -236,6 +255,13 @@ func VerifyLog(logPath, checkpointPath string, pubKey ed25519.PublicKey) (Report
 				TraceID: traceID,
 				Kind:    "duplicate_trace_segment",
 				Detail:  "more than one entry with the same seq_in_trace; likely an at-least-once re-delivery after WAL compaction — see docs/threat-model.md §5",
+				// Fatal, not advisory, despite "not evidence of tampering" in
+				// docs/threat-model.md §7: that framing is about the
+				// segment-split event itself, not a guarantee about the
+				// entries under it — chain verification is skipped entirely
+				// for this trace_id (see below), so unlike the two advisory
+				// kinds, nothing here was actually cryptographically checked.
+				Severity: SeverityFatal,
 			})
 			chainFailed[traceID] = struct{}{}
 			report.TracesProcessed++
@@ -246,9 +272,10 @@ func VerifyLog(logPath, checkpointPath string, pubKey ed25519.PublicKey) (Report
 		tipHash, err := verifyChainReturnTip(entries, pubKey)
 		if err != nil {
 			verifyErrs = append(verifyErrs, VerifyError{
-				TraceID: traceID,
-				Kind:    "chain",
-				Detail:  err.Error(),
+				TraceID:  traceID,
+				Kind:     "chain",
+				Detail:   err.Error(),
+				Severity: SeverityFatal,
 			})
 			chainFailed[traceID] = struct{}{}
 		} else {
@@ -266,6 +293,7 @@ func VerifyLog(logPath, checkpointPath string, pubKey ed25519.PublicKey) (Report
 						Kind:    "key_id_field_mismatch",
 						Detail: fmt.Sprintf("seq %d: entry key_id %s does not match verified signer %s",
 							e.Record.SeqInTrace, e.Signed.KeyID, suppliedKeyID),
+						Severity: SeverityAdvisory,
 					})
 				}
 			}
@@ -279,9 +307,10 @@ func VerifyLog(logPath, checkpointPath string, pubKey ed25519.PublicKey) (Report
 		payload, err := chain.CheckpointSigningPayload(cp)
 		if err != nil {
 			verifyErrs = append(verifyErrs, VerifyError{
-				TraceID: "",
-				Kind:    "checkpoint",
-				Detail:  fmt.Sprintf("seq %d: %v", cp.CheckpointSeq, err),
+				TraceID:  "",
+				Kind:     "checkpoint",
+				Detail:   fmt.Sprintf("seq %d: %v", cp.CheckpointSeq, err),
+				Severity: SeverityFatal,
 			})
 			report.CheckpointsProcessed++
 			continue
@@ -290,9 +319,10 @@ func VerifyLog(logPath, checkpointPath string, pubKey ed25519.PublicKey) (Report
 
 		if err := VerifyCheckpoint(cp, prevHash, pubKey); err != nil {
 			verifyErrs = append(verifyErrs, VerifyError{
-				TraceID: "",
-				Kind:    "checkpoint",
-				Detail:  fmt.Sprintf("seq %d: %v", cp.CheckpointSeq, err),
+				TraceID:  "",
+				Kind:     "checkpoint",
+				Detail:   fmt.Sprintf("seq %d: %v", cp.CheckpointSeq, err),
+				Severity: SeverityFatal,
 			})
 		}
 		// No checkpoint-side key_id_field_mismatch check here: unlike an
@@ -321,31 +351,38 @@ func VerifyLog(logPath, checkpointPath string, pubKey ed25519.PublicKey) (Report
 			entries := traceEntries[tip.TraceID]
 			if len(entries) != tip.EntryCount {
 				verifyErrs = append(verifyErrs, VerifyError{
-					TraceID: tip.TraceID,
-					Kind:    "entry_count_mismatch",
-					Detail:  fmt.Sprintf("checkpoint says %d, log has %d", tip.EntryCount, len(entries)),
+					TraceID:  tip.TraceID,
+					Kind:     "entry_count_mismatch",
+					Detail:   fmt.Sprintf("checkpoint says %d, log has %d", tip.EntryCount, len(entries)),
+					Severity: SeverityFatal,
 				})
 			}
 			if _, ok := chainFailed[tip.TraceID]; ok {
 				// Chain verification failed, so we cannot confirm the tip
 				// hash. Report it explicitly instead of silently skipping.
+				// Fatal: this trace always also carries a chain or
+				// duplicate_trace_segment error (both fatal) in the same
+				// report, since that is the only way chainFailed gets set —
+				// so this can never be the sole reason a report fails.
 				verifyErrs = append(verifyErrs, VerifyError{
-					TraceID: tip.TraceID,
-					Kind:    "tip_hash_unverifiable",
-					Detail:  fmt.Sprintf("chain verification failed; checkpoint tip_hash %s cannot be confirmed", tip.TipHash),
+					TraceID:  tip.TraceID,
+					Kind:     "tip_hash_unverifiable",
+					Detail:   fmt.Sprintf("chain verification failed; checkpoint tip_hash %s cannot be confirmed", tip.TipHash),
+					Severity: SeverityFatal,
 				})
 			} else if actual, ok := verifiedTips[tip.TraceID]; ok && actual != tip.TipHash {
 				verifyErrs = append(verifyErrs, VerifyError{
-					TraceID: tip.TraceID,
-					Kind:    "tip_hash_mismatch",
-					Detail:  fmt.Sprintf("checkpoint tip_hash %s, recomputed %s", tip.TipHash, actual),
+					TraceID:  tip.TraceID,
+					Kind:     "tip_hash_mismatch",
+					Detail:   fmt.Sprintf("checkpoint tip_hash %s, recomputed %s", tip.TipHash, actual),
+					Severity: SeverityFatal,
 				})
 			}
 		}
 	}
 
 	if tornTailDetail != "" {
-		verifyErrs = append(verifyErrs, VerifyError{Kind: KindTornTrailingLine, Detail: tornTailDetail})
+		verifyErrs = append(verifyErrs, VerifyError{Kind: KindTornTrailingLine, Detail: tornTailDetail, Severity: SeverityAdvisory})
 	}
 	report.Errors = verifyErrs
 	return report, nil
