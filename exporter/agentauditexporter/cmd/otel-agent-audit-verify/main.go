@@ -14,9 +14,16 @@
 //
 // Exit codes:
 //
-//	0  all checks pass
-//	1  one or more verification failures (chain or checkpoint)
+//	0  all checks pass, or only advisory findings were reported
+//	1  one or more fatal verification failures were reported
 //	2  usage error, I/O error, or key parse error
+//
+// "Fatal" and "advisory" are verify.VerifyError.Severity: a fatal finding
+// (e.g. chain, checkpoint, tip_hash_mismatch) means verification failed or
+// could not be completed; an advisory finding (key_id_field_mismatch,
+// torn_trailing_line) means the flagged entries were still fully verified
+// despite the finding. Advisory findings are always printed but never
+// affect the exit code or the Status line — see docs/verification.md.
 package main
 
 import (
@@ -38,9 +45,9 @@ func main() {
 
 func run() int {
 	fs := flag.NewFlagSet("otel-agent-audit-verify", flag.ContinueOnError)
-	keyHex  := fs.String("key",      "", "hex-encoded Ed25519 public key (64 hex chars)")
+	keyHex := fs.String("key", "", "hex-encoded Ed25519 public key (64 hex chars)")
 	keyFile := fs.String("key-file", "", "path to PEM file with PUBLIC KEY block")
-	jsonOut := fs.Bool("json",       false, "emit results as JSON")
+	jsonOut := fs.Bool("json", false, "emit results as JSON")
 
 	if err := fs.Parse(os.Args[1:]); err != nil {
 		if errors.Is(err, flag.ErrHelp) {
@@ -63,7 +70,7 @@ func run() int {
 		return 2
 	}
 
-	logPath        := fs.Arg(0)
+	logPath := fs.Arg(0)
 	checkpointPath := fs.Arg(1)
 
 	pubKey, err := loadPublicKey(*keyHex, *keyFile)
@@ -78,6 +85,8 @@ func run() int {
 		return 2
 	}
 
+	fatal := report.FatalCount()
+
 	if *jsonOut {
 		enc := json.NewEncoder(os.Stdout)
 		enc.SetIndent("", "  ")
@@ -88,17 +97,13 @@ func run() int {
 	} else {
 		fmt.Printf("Traces processed:      %d\n", report.TracesProcessed)
 		fmt.Printf("Checkpoints processed: %d\n", report.CheckpointsProcessed)
-		if len(report.Errors) == 0 {
-			fmt.Println("Status: OK")
-		} else {
-			fmt.Printf("Status: FAILED (%d error(s))\n", len(report.Errors))
-			for _, e := range report.Errors {
-				fmt.Printf("  [%s] %s: %s\n", errorLabel(e), e.Kind, e.Detail)
-			}
+		fmt.Println(report.StatusLine())
+		for _, e := range report.Errors {
+			fmt.Printf("  [%s] %s (%s): %s\n", errorLabel(e), e.Kind, e.Severity, e.Detail)
 		}
 	}
 
-	if len(report.Errors) > 0 {
+	if fatal > 0 {
 		return 1
 	}
 	return 0

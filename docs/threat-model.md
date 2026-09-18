@@ -331,6 +331,14 @@ This is an accepted **at-least-once delivery trade-off**. The
 `agentauditselect` processor mitigates it by deduplicating at the trace level
 before forwarding.
 
+`duplicate_trace_segment` is classified `Severity: fatal` (§7): its own chain
+verification is skipped entirely rather than attempted, so — unlike the
+report's two `advisory` findings — nothing about the duplicated trace's
+entries was actually checked. A deliberate choice, not an oversight: routine
+redelivery will therefore show `otel-agent-audit-verify`'s `Status: FAILED`
+today even though the redelivery itself isn't evidence of tampering (issue
+#49).
+
 ---
 
 ## 6. EU AI Act Article 12 — disclaimer
@@ -351,15 +359,15 @@ technical counsel.
 
 ## 7. What the verifier can and cannot conclude
 
-| The verifier says | Meaning |
-|-------------------|---------|
-| `Status: OK` | No tampering detected **for the entries and checkpoints present**; the log is internally consistent with the supplied public key |
-| `entry_count_mismatch` | A checkpoint claims more entries than the log contains — a trace may have been deleted post-seal |
-| `tip_hash_mismatch` | The recomputed chain tip does not match the checkpoint — at least one entry was altered or reordered |
-| `tip_hash_unverifiable` | The chain itself failed verification; the checkpoint tip cannot be independently confirmed |
-| `key_id_field_mismatch` | An entry's signature verified, but its claimed `key_id` does not match the supplied key — the content is authentic (the signature already proved that); the `key_id` metadata is stale or was tampered with. Entry-only: a checkpoint's `key_id` is itself signed, so tampering it fails the checkpoint's signature check instead |
-| `duplicate_trace_segment` | Two independent chains exist for the same `trace_id` — this is an at-least-once delivery artifact, not evidence of tampering |
-| `torn_trailing_line` | The audit log's final line was unparseable — likely an interrupted write from a crash. Its content was never cryptographically verified (that is what "unparseable" means), so this alone does not rule out tampering; entries before it were fully verified |
+| The verifier says | Severity | Meaning |
+|-------------------|----------|---------|
+| `Status: OK` | — | No *fatal* finding for the entries and checkpoints present; the log is internally consistent with the supplied public key. An advisory finding (see below) may still be listed underneath this line — `Status: OK` means zero fatal findings, not necessarily zero findings at all (issue #49; see [docs/verification.md § Exit codes](verification.md#exit-codes)) |
+| `entry_count_mismatch` | fatal | A checkpoint claims more entries than the log contains — a trace may have been deleted post-seal |
+| `tip_hash_mismatch` | fatal | The recomputed chain tip does not match the checkpoint — at least one entry was altered or reordered |
+| `tip_hash_unverifiable` | fatal | The chain itself failed verification; the checkpoint tip cannot be independently confirmed |
+| `key_id_field_mismatch` | advisory | An entry's signature verified, but its claimed `key_id` does not match the supplied key — the content is authentic (the signature already proved that); the `key_id` metadata is stale or was tampered with. Entry-only: a checkpoint's `key_id` is itself signed, so tampering it fails the checkpoint's signature check instead |
+| `duplicate_trace_segment` | fatal | Two independent chains exist for the same `trace_id` — this is an at-least-once delivery artifact, not evidence of tampering **by the segment split itself**. Still fatal, unlike the two advisory findings in this table: chain verification is skipped entirely for this `trace_id`, so nothing about its entries was actually cryptographically checked (issue #49). Practical consequence: routine at-least-once redelivery (§5) will always show `Status: FAILED` today, even though it isn't tampering — there is no severity tier yet between "fully verified, disagreement is metadata-only" (advisory) and "not tampering by itself, but nothing was checked" (fatal) |
+| `torn_trailing_line` | advisory | The audit log's final line was unparseable — likely an interrupted write from a crash. Its content was never cryptographically verified (that is what "unparseable" means), so this alone does not rule out tampering; entries before it were fully verified |
 
 **The verifier cannot detect:**
 - A trace that was **never written** to the log (it is absent, not corrupted)

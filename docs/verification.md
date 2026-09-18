@@ -52,9 +52,36 @@ openssl pkey -in /path/to/private.pem -pubout -outform DER | tail -c 32 | xxd -p
 
 | Code | Meaning |
 |---|---|
-| 0 | All checks pass |
-| 1 | One or more verification failures (see output for details) |
+| 0 | All checks pass, or only advisory findings were reported |
+| 1 | One or more fatal verification failures were reported (see output for details) |
 | 2 | Usage error, I/O error, or key parse error |
+
+Every finding in `Report.Errors` carries a `Severity` of `"fatal"` or
+`"advisory"` (issue #49):
+
+- **fatal** — verification failed, or could not be completed:
+  `chain`, `checkpoint`, `tip_hash_mismatch`, `entry_count_mismatch`,
+  `tip_hash_unverifiable`, `duplicate_trace_segment`.
+- **advisory** — the flagged entries were still fully verified against the
+  supplied key despite the finding: `key_id_field_mismatch`,
+  `torn_trailing_line`. Worth surfacing, but not a reason to treat the log
+  as untrustworthy.
+
+The exit code and the `Status:` line reflect only fatal findings, but the
+`Status:` line always names the advisory count too, so it never undercounts
+what the per-error lines printed below it will show. Advisory findings are
+always printed (human-readable and JSON alike) but never affect the exit
+code. Go callers of the `verify` package directly get the same policy via
+`Report.FatalCount()` and `Report.StatusLine()`, which both
+`otel-agent-audit-verify` and `cmd/demo` call — a single shared
+implementation, not two mirrored ones, so the two CLIs cannot drift apart on
+this decision. `FatalCount` is deliberately fail-closed: an error with an
+empty or unrecognized `Severity` counts as fatal, never advisory.
+
+> **Upgrading:** if existing automation treats any non-empty `Errors` as
+> failure, that behavior has changed — a log with only advisory findings now
+> reports `Status: OK` and exits 0. Check each error's `Severity` field if
+> you need the old, stricter all-errors-fail behavior.
 
 ## Example output (human-readable)
 
@@ -70,7 +97,34 @@ Failure example:
 Traces processed:      42
 Checkpoints processed: 1
 Status: FAILED (1 error(s))
-  [0123456789abcdef0123456789abcdef] chain: seq 2: signature verification failed
+  [0123456789abcdef0123456789abcdef] chain (fatal): seq 2: signature verification failed
+```
+
+Advisory-only example — still exit 0, but the finding is still printed and
+counted in the `Status:` line:
+
+```
+Traces processed:      42
+Checkpoints processed: 1
+Status: OK (1 advisory finding(s))
+  [0123456789abcdef0123456789abcdef] key_id_field_mismatch (advisory): seq 2: entry key_id deadbeef does not match verified signer c0ffee
+```
+
+Mixed example — a fatal finding still fails the run (exit 1) even alongside
+an advisory one. A checkpoint-covered trace whose chain fails verification
+always produces `tip_hash_unverifiable` alongside `chain` (the checkpoint's
+claimed tip can't be confirmed once the chain itself didn't verify), so two
+fatal lines from one bad trace is the normal shape, not a bug; the advisory
+line here has no `TraceID` (see above), so its bracket names the file
+instead:
+
+```
+Traces processed:      42
+Checkpoints processed: 1
+Status: FAILED (2 fatal, 1 advisory)
+  [0123456789abcdef0123456789abcdef] chain (fatal): seq 2: signature verification failed
+  [0123456789abcdef0123456789abcdef] tip_hash_unverifiable (fatal): chain verification failed; checkpoint tip_hash 0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef cannot be confirmed
+  [audit log] torn_trailing_line (advisory): line 43: unparseable, likely a partial write from a crash: unexpected end of JSON input
 ```
 
 ## JSON output (`-json`)
@@ -83,9 +137,19 @@ Status: FAILED (1 error(s))
 }
 ```
 
-`Errors` is a JSON array of objects: `{"TraceID": "…", "Kind": "…", "Detail": "…"}`.
+`Errors` is a JSON array of objects:
+`{"TraceID": "…", "Kind": "…", "Detail": "…", "Severity": "fatal"|"advisory"}`.
 `TraceID` is empty for checkpoint-level errors and for the log-level
-`torn_trailing_line` finding.
+`torn_trailing_line` finding. See [Exit codes](#exit-codes) above for what
+`Severity` means and how it drives the exit code.
+
+`Report` itself carries no separate top-level pass/fail field (e.g. a
+`Status` string or a fatal count) — a `-json` consumer must derive that from
+`Errors[].Severity` the same way the CLI's own `Status:` line does. Adding
+one is a reasonable future enhancement (tracked separately) but was left out
+of this change: it would expand `Report`'s JSON shape beyond what issue #49
+scoped, for a need the CLI's human-readable output doesn't have (it always
+runs `Report.FatalCount()` itself, in Go).
 
 ## Audit policy
 
@@ -145,7 +209,7 @@ checkpoint is always verified directly against the supplied public key
 |----------|-------------------|
 | Correct key supplied | Chain and checkpoint signatures are verified normally |
 | Wrong key supplied | Ordinary `chain` / `checkpoint` signature-failure errors — the verifier cannot and does not try to tell "wrong key" apart from "corrupted" using a single candidate key |
-| An entry verifies, but its claimed `key_id` disagrees with the supplied key | `key_id_field_mismatch` — a non-fatal finding. The signature already proved the content is authentic; the `key_id` metadata is stale or was tampered with, which is worth flagging but not a reason to fail an otherwise-good entry. There is no checkpoint-side equivalent: a checkpoint's `key_id` is signed, so tampering it alone fails its signature check instead (an ordinary `checkpoint` error) |
+| An entry verifies, but its claimed `key_id` disagrees with the supplied key | `key_id_field_mismatch` — `Severity: "advisory"` (see [Exit codes](#exit-codes)). The signature already proved the content is authentic; the `key_id` metadata is stale or was tampered with, which is worth flagging but not a reason to fail an otherwise-good entry. There is no checkpoint-side equivalent: a checkpoint's `key_id` is signed, so tampering it alone fails its signature check instead (an ordinary `checkpoint` error, `Severity: "fatal"`) |
 | Log spans multiple key epochs | No longer refused outright — see [Multi-epoch logs](#multi-epoch-logs) below |
 
 ### Multi-epoch logs
