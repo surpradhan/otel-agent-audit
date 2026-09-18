@@ -49,27 +49,3 @@ func TestErrorLabel(t *testing.T) {
 		})
 	}
 }
-
-// TestStatusLine pins the exact "Status: ..." text for every combination of
-// fatal/advisory counts (issue #49) — only the fatal count decides OK vs
-// FAILED, but the advisory count is always surfaced too, so the headline
-// never undercounts what the per-error lines printed below it will show.
-func TestStatusLine(t *testing.T) {
-	tests := []struct {
-		name            string
-		fatal, advisory int
-		want            string
-	}{
-		{name: "clean", fatal: 0, advisory: 0, want: "Status: OK"},
-		{name: "advisory only", fatal: 0, advisory: 2, want: "Status: OK (2 advisory finding(s))"},
-		{name: "fatal only", fatal: 1, advisory: 0, want: "Status: FAILED (1 error(s))"},
-		{name: "mixed", fatal: 1, advisory: 2, want: "Status: FAILED (1 fatal, 2 advisory)"},
-	}
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			if got := statusLine(tt.fatal, tt.advisory); got != tt.want {
-				t.Errorf("statusLine(%d, %d) = %q, want %q", tt.fatal, tt.advisory, got, tt.want)
-			}
-		})
-	}
-}

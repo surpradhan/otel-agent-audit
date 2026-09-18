@@ -88,6 +88,28 @@ func (r Report) FatalCount() int {
 	return n
 }
 
+// StatusLine returns the "Status: ..." summary line for r, e.g. "Status: OK",
+// "Status: OK (2 advisory finding(s))", "Status: FAILED (1 error(s))", or
+// "Status: FAILED (1 fatal, 2 advisory)". Only FatalCount decides OK vs
+// FAILED, but the advisory count is always named too, so the line never
+// undercounts what a caller's per-error printout will show underneath it.
+// Both otel-agent-audit-verify and cmd/demo call this — a single, shared
+// implementation instead of each CLI approximating it (issue #49).
+func (r Report) StatusLine() string {
+	fatal := r.FatalCount()
+	advisory := len(r.Errors) - fatal
+	switch {
+	case fatal == 0 && advisory == 0:
+		return "Status: OK"
+	case fatal == 0:
+		return fmt.Sprintf("Status: OK (%d advisory finding(s))", advisory)
+	case advisory == 0:
+		return fmt.Sprintf("Status: FAILED (%d error(s))", fatal)
+	default:
+		return fmt.Sprintf("Status: FAILED (%d fatal, %d advisory)", fatal, advisory)
+	}
+}
+
 // pubKeyID returns hex(SHA256(pubKey)) — the same fingerprint scheme used by
 // sign.NewEd25519Signer so the verifier can compare key_id fields without
 // needing to reconstruct a full Ed25519Signer.

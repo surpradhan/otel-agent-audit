@@ -72,9 +72,11 @@ The exit code and the `Status:` line reflect only fatal findings, but the
 what the per-error lines printed below it will show. Advisory findings are
 always printed (human-readable and JSON alike) but never affect the exit
 code. Go callers of the `verify` package directly get the same policy via
-`Report.FatalCount()`, which both `otel-agent-audit-verify` and `cmd/demo`
-call — it is deliberately fail-closed (an error with an empty or
-unrecognized `Severity` counts as fatal, never advisory).
+`Report.FatalCount()` and `Report.StatusLine()`, which both
+`otel-agent-audit-verify` and `cmd/demo` call — a single shared
+implementation, not two mirrored ones, so the two CLIs cannot drift apart on
+this decision. `FatalCount` is deliberately fail-closed: an error with an
+empty or unrecognized `Severity` counts as fatal, never advisory.
 
 > **Upgrading:** if existing automation treats any non-empty `Errors` as
 > failure, that behavior has changed — a log with only advisory findings now
@@ -109,14 +111,20 @@ Status: OK (1 advisory finding(s))
 ```
 
 Mixed example — a fatal finding still fails the run (exit 1) even alongside
-an advisory one:
+an advisory one. A checkpoint-covered trace whose chain fails verification
+always produces `tip_hash_unverifiable` alongside `chain` (the checkpoint's
+claimed tip can't be confirmed once the chain itself didn't verify), so two
+fatal lines from one bad trace is the normal shape, not a bug; the advisory
+line here has no `TraceID` (see above), so its bracket names the file
+instead:
 
 ```
 Traces processed:      42
 Checkpoints processed: 1
-Status: FAILED (1 fatal, 1 advisory)
+Status: FAILED (2 fatal, 1 advisory)
   [0123456789abcdef0123456789abcdef] chain (fatal): seq 2: signature verification failed
-  [1123456789abcdef0123456789abcdef] torn_trailing_line (advisory): line 43: unparseable, likely a partial write from a crash: unexpected end of JSON input
+  [0123456789abcdef0123456789abcdef] tip_hash_unverifiable (fatal): chain verification failed; checkpoint tip_hash 89abcdef0123456789abcdef0123456789abcdef0123456789abcdef01234 cannot be confirmed
+  [audit log] torn_trailing_line (advisory): line 43: unparseable, likely a partial write from a crash: unexpected end of JSON input
 ```
 
 ## JSON output (`-json`)

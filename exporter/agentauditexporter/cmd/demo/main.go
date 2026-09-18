@@ -198,15 +198,12 @@ func run() error {
 	fmt.Printf("Traces processed:      %d\n", report.TracesProcessed)
 	fmt.Printf("Checkpoints processed: %d\n", report.CheckpointsProcessed)
 	// Only a fatal finding fails the demo — an advisory-only report (e.g.
-	// key_id_field_mismatch) is not a verification failure. See
-	// verify.Report.FatalCount's doc comment and issue #49; this mirrors
-	// otel-agent-audit-verify's own CLI so the two stay in sync.
+	// key_id_field_mismatch) is not a verification failure. StatusLine is the
+	// exact same method otel-agent-audit-verify's own CLI calls, not just a
+	// mirrored implementation, so the two genuinely cannot drift apart on
+	// this decision again (issue #49).
 	fatal := report.FatalCount()
-	if fatal == 0 {
-		fmt.Println("Status: OK")
-	} else {
-		fmt.Printf("Status: FAILED (%d error(s))\n", fatal)
-	}
+	fmt.Println(report.StatusLine())
 	for _, e := range report.Errors {
 		fmt.Printf("  [%s] %s (%s): %s\n", e.TraceID, e.Kind, e.Severity, e.Detail)
 	}

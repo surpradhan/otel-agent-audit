@@ -137,6 +137,58 @@ func TestReport_FatalCount(t *testing.T) {
 	}
 }
 
+// TestReport_StatusLine pins the exact "Status: ..." text for every
+// combination of fatal/advisory error counts (issue #49) — only fatal
+// findings decide OK vs FAILED, but the advisory count is always named too,
+// so the line never undercounts what a caller's per-error printout shows
+// underneath it. Both otel-agent-audit-verify and cmd/demo call this method
+// directly, so pinning it here covers both CLIs' Status-line text at once.
+func TestReport_StatusLine(t *testing.T) {
+	tests := []struct {
+		name string
+		errs []verify.VerifyError
+		want string
+	}{
+		{
+			name: "clean",
+			errs: nil,
+			want: "Status: OK",
+		},
+		{
+			name: "advisory only",
+			errs: []verify.VerifyError{
+				{Kind: "key_id_field_mismatch", Severity: verify.SeverityAdvisory},
+				{Kind: verify.KindTornTrailingLine, Severity: verify.SeverityAdvisory},
+			},
+			want: "Status: OK (2 advisory finding(s))",
+		},
+		{
+			name: "fatal only",
+			errs: []verify.VerifyError{
+				{Kind: "chain", Severity: verify.SeverityFatal},
+			},
+			want: "Status: FAILED (1 error(s))",
+		},
+		{
+			name: "mixed",
+			errs: []verify.VerifyError{
+				{Kind: "chain", Severity: verify.SeverityFatal},
+				{Kind: "key_id_field_mismatch", Severity: verify.SeverityAdvisory},
+				{Kind: verify.KindTornTrailingLine, Severity: verify.SeverityAdvisory},
+			},
+			want: "Status: FAILED (1 fatal, 2 advisory)",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			report := verify.Report{Errors: tt.errs}
+			if got := report.StatusLine(); got != tt.want {
+				t.Errorf("Report{Errors: %+v}.StatusLine() = %q, want %q", tt.errs, got, tt.want)
+			}
+		})
+	}
+}
+
 func TestVerifyLog_HappyPath(t *testing.T) {
 	logPath, checkpointPath, pub := makeVerifyFixture(t)
 	report, err := verify.VerifyLog(logPath, checkpointPath, pub)

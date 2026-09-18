@@ -45,9 +45,9 @@ func main() {
 
 func run() int {
 	fs := flag.NewFlagSet("otel-agent-audit-verify", flag.ContinueOnError)
-	keyHex  := fs.String("key",      "", "hex-encoded Ed25519 public key (64 hex chars)")
+	keyHex := fs.String("key", "", "hex-encoded Ed25519 public key (64 hex chars)")
 	keyFile := fs.String("key-file", "", "path to PEM file with PUBLIC KEY block")
-	jsonOut := fs.Bool("json",       false, "emit results as JSON")
+	jsonOut := fs.Bool("json", false, "emit results as JSON")
 
 	if err := fs.Parse(os.Args[1:]); err != nil {
 		if errors.Is(err, flag.ErrHelp) {
@@ -70,7 +70,7 @@ func run() int {
 		return 2
 	}
 
-	logPath        := fs.Arg(0)
+	logPath := fs.Arg(0)
 	checkpointPath := fs.Arg(1)
 
 	pubKey, err := loadPublicKey(*keyHex, *keyFile)
@@ -97,7 +97,7 @@ func run() int {
 	} else {
 		fmt.Printf("Traces processed:      %d\n", report.TracesProcessed)
 		fmt.Printf("Checkpoints processed: %d\n", report.CheckpointsProcessed)
-		fmt.Println(statusLine(fatal, len(report.Errors)-fatal))
+		fmt.Println(report.StatusLine())
 		for _, e := range report.Errors {
 			fmt.Printf("  [%s] %s (%s): %s\n", errorLabel(e), e.Kind, e.Severity, e.Detail)
 		}
@@ -107,24 +107,6 @@ func run() int {
 		return 1
 	}
 	return 0
-}
-
-// statusLine returns the "Status: ..." line for a report given its fatal and
-// advisory error counts (report.FatalCount() and len(report.Errors) minus
-// that, respectively). Only fatal findings decide OK vs FAILED (issue #49);
-// an advisory count is still surfaced in the count so the headline never
-// undercounts what the lines printed below it will show.
-func statusLine(fatal, advisory int) string {
-	switch {
-	case fatal == 0 && advisory == 0:
-		return "Status: OK"
-	case fatal == 0:
-		return fmt.Sprintf("Status: OK (%d advisory finding(s))", advisory)
-	case advisory == 0:
-		return fmt.Sprintf("Status: FAILED (%d error(s))", fatal)
-	default:
-		return fmt.Sprintf("Status: FAILED (%d fatal, %d advisory)", fatal, advisory)
-	}
 }
 
 // errorLabel returns the "[...]" prefix for one report line: the trace ID
