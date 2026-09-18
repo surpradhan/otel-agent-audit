@@ -43,8 +43,8 @@ import (
 // (TestRotation_EpochASliceReportsClean,
 // TestRotation_BoundaryTraceDeletionIsInvisible) still pin that defect
 // unchanged — which is exactly why splitting is no longer the recommended
-// approach; see docs/verification.md § "Multi-epoch logs". Assertions marked
-// BUG(#19) remain the open defect: full rotation-aware verification — a
+// approach; see docs/verification.md § "Multi-epoch logs". Assertions whose
+// BUG(...) tag cites #19 remain the open defect: full rotation-aware verification — a
 // first-class multi-key API with clean, non-noisy attestation across the
 // boundary — is still #19's design question, not solved here. Whoever
 // implements it should flip those assertions rather than delete them.
