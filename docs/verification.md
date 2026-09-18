@@ -123,7 +123,7 @@ Traces processed:      42
 Checkpoints processed: 1
 Status: FAILED (2 fatal, 1 advisory)
   [0123456789abcdef0123456789abcdef] chain (fatal): seq 2: signature verification failed
-  [0123456789abcdef0123456789abcdef] tip_hash_unverifiable (fatal): chain verification failed; checkpoint tip_hash 89abcdef0123456789abcdef0123456789abcdef0123456789abcdef01234 cannot be confirmed
+  [0123456789abcdef0123456789abcdef] tip_hash_unverifiable (fatal): chain verification failed; checkpoint tip_hash 0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef cannot be confirmed
   [audit log] torn_trailing_line (advisory): line 43: unparseable, likely a partial write from a crash: unexpected end of JSON input
 ```
 
