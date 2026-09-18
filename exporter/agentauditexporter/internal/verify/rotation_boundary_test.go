@@ -296,7 +296,7 @@ func TestRotation_EpochASliceReportsClean(t *testing.T) {
 	if report.CheckpointsProcessed != 1 {
 		t.Errorf("CheckpointsProcessed = %d, want 1", report.CheckpointsProcessed)
 	}
-	// BUG(#19): the boundary trace has lost its only coverage and nothing says so.
+	// BUG(#19, #35): the boundary trace has lost its only coverage and nothing says so.
 	// A rotation-aware run must report the uncovered trace here; flip this when it does.
 	if len(report.Errors) != 0 {
 		t.Errorf("epoch A slice: got %d errors, want 0 (today's behaviour): %+v",
@@ -321,8 +321,9 @@ func TestRotation_BoundaryTraceDeletionIsInvisible(t *testing.T) {
 	writeCheckpoints(t, cpPath, f.cp1)
 
 	report, err := verify.VerifyLog(logPath, cpPath, f.pubA)
-	// BUG(#19): deleting the boundary trace outright is indistinguishable from an
-	// honest log. Every assertion below pins that, and every one should change.
+	// BUG(#19, #35): deleting the boundary trace outright is indistinguishable
+	// from an honest log. Every assertion below pins that, and every one should
+	// change.
 	if err != nil {
 		t.Fatalf("epoch A slice with the boundary trace deleted: %v", err)
 	}
@@ -359,7 +360,7 @@ func TestRotation_BoundaryTraceDeletionIsInvisible(t *testing.T) {
 // against pubB — both are genuinely signed by A — so this now reports
 // ordinary chain errors rather than bailing out. Without the entries, it
 // reports two errors that both look like tampering on a perfectly clean
-// rotation (BUG(#19), unchanged by issue #46).
+// rotation (BUG(#19, #35), unchanged by issue #46).
 func TestRotation_EpochBAloneSymptoms(t *testing.T) {
 	f := newRotationFixture(t)
 	cpPath := filepath.Join(f.dir, "epoch_b.jsonl")
@@ -401,8 +402,8 @@ func TestRotation_EpochBAloneSymptoms(t *testing.T) {
 			t.Errorf("expected 2 chain errors (both traces signed by A, checked against pubB); got %d in %+v",
 				chainErrs, report.Errors)
 		}
-		// cp2 alone has no epoch-A tail to chain from — same BUG(#19) as the
-		// "without the entries" case below.
+		// cp2 alone has no epoch-A tail to chain from — same BUG(#19, #35) as
+		// the "without the entries" case below.
 		if !sawPrevMismatch {
 			t.Errorf("expected a prev_checkpoint_hash mismatch; got %+v", report.Errors)
 		}
@@ -432,7 +433,7 @@ func TestRotation_EpochBAloneSymptoms(t *testing.T) {
 				countMismatch = true
 			}
 		}
-		// BUG(#19): VerifyLog seeds prevHash with chain.ZeroPrevCheckpointHash
+		// BUG(#19, #35): VerifyLog seeds prevHash with chain.ZeroPrevCheckpointHash
 		// unconditionally and offers no way to supply the previous epoch's tail, so
 		// every epoch after the first reports this. It is the same error that detects
 		// checkpoint-stream truncation, and the documented procedure teaches operators
@@ -441,7 +442,7 @@ func TestRotation_EpochBAloneSymptoms(t *testing.T) {
 			t.Errorf("want a prev_checkpoint_hash mismatch against the zero sentinel (today's behaviour); errors: %+v",
 				report.Errors)
 		}
-		// BUG(#19): cp2 claims the boundary trace, the slice has no entries for it.
+		// BUG(#19, #35): cp2 claims the boundary trace, the slice has no entries for it.
 		if !countMismatch {
 			t.Errorf("want entry_count_mismatch (today's behaviour); errors: %+v", report.Errors)
 		}
