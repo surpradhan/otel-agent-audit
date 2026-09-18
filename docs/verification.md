@@ -67,9 +67,14 @@ Every finding in `Report.Errors` carries a `Severity` of `"fatal"` or
   `torn_trailing_line`. Worth surfacing, but not a reason to treat the log
   as untrustworthy.
 
-The exit code and the `Status: OK` / `Status: FAILED` line reflect only
-fatal findings. Advisory findings are always printed (human-readable and
-JSON alike) but never affect either.
+The exit code and the `Status:` line reflect only fatal findings, but the
+`Status:` line always names the advisory count too, so it never undercounts
+what the per-error lines printed below it will show. Advisory findings are
+always printed (human-readable and JSON alike) but never affect the exit
+code. Go callers of the `verify` package directly get the same policy via
+`Report.FatalCount()`, which both `otel-agent-audit-verify` and `cmd/demo`
+call — it is deliberately fail-closed (an error with an empty or
+unrecognized `Severity` counts as fatal, never advisory).
 
 > **Upgrading:** if existing automation treats any non-empty `Errors` as
 > failure, that behavior has changed — a log with only advisory findings now
@@ -93,14 +98,25 @@ Status: FAILED (1 error(s))
   [0123456789abcdef0123456789abcdef] chain (fatal): seq 2: signature verification failed
 ```
 
-Advisory-only example — still `Status: OK` and exit 0, but the finding is
-still printed:
+Advisory-only example — still exit 0, but the finding is still printed and
+counted in the `Status:` line:
 
 ```
 Traces processed:      42
 Checkpoints processed: 1
-Status: OK
+Status: OK (1 advisory finding(s))
   [0123456789abcdef0123456789abcdef] key_id_field_mismatch (advisory): seq 2: entry key_id deadbeef does not match verified signer c0ffee
+```
+
+Mixed example — a fatal finding still fails the run (exit 1) even alongside
+an advisory one:
+
+```
+Traces processed:      42
+Checkpoints processed: 1
+Status: FAILED (1 fatal, 1 advisory)
+  [0123456789abcdef0123456789abcdef] chain (fatal): seq 2: signature verification failed
+  [1123456789abcdef0123456789abcdef] torn_trailing_line (advisory): line 43: unparseable, likely a partial write from a crash: unexpected end of JSON input
 ```
 
 ## JSON output (`-json`)
@@ -118,6 +134,14 @@ Status: OK
 `TraceID` is empty for checkpoint-level errors and for the log-level
 `torn_trailing_line` finding. See [Exit codes](#exit-codes) above for what
 `Severity` means and how it drives the exit code.
+
+`Report` itself carries no separate top-level pass/fail field (e.g. a
+`Status` string or a fatal count) — a `-json` consumer must derive that from
+`Errors[].Severity` the same way the CLI's own `Status:` line does. Adding
+one is a reasonable future enhancement (tracked separately) but was left out
+of this change: it would expand `Report`'s JSON shape beyond what issue #49
+scoped, for a need the CLI's human-readable output doesn't have (it always
+runs `Report.FatalCount()` itself, in Go).
 
 ## Audit policy
 

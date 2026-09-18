@@ -78,6 +78,65 @@ func makeVerifyFixture(t *testing.T) (logPath, checkpointPath string, pub []byte
 	return logPath, checkpointPath, []byte(pubKey)
 }
 
+// TestReport_FatalCount pins the exit-code/Status-line policy (issue #49):
+// only non-advisory errors count, and — deliberately — an error with an
+// empty or unrecognized Severity counts as fatal (fail-closed), not
+// advisory, since a tamper-evidence tool should never silently treat an
+// unclassified finding as safe to ignore.
+func TestReport_FatalCount(t *testing.T) {
+	tests := []struct {
+		name string
+		errs []verify.VerifyError
+		want int
+	}{
+		{
+			name: "no errors",
+			errs: nil,
+			want: 0,
+		},
+		{
+			name: "all advisory",
+			errs: []verify.VerifyError{
+				{Kind: "key_id_field_mismatch", Severity: verify.SeverityAdvisory},
+				{Kind: verify.KindTornTrailingLine, Severity: verify.SeverityAdvisory},
+			},
+			want: 0,
+		},
+		{
+			name: "all fatal",
+			errs: []verify.VerifyError{
+				{Kind: "chain", Severity: verify.SeverityFatal},
+				{Kind: "checkpoint", Severity: verify.SeverityFatal},
+			},
+			want: 2,
+		},
+		{
+			name: "mixed severities counts only non-advisory",
+			errs: []verify.VerifyError{
+				{Kind: "chain", Severity: verify.SeverityFatal},
+				{Kind: "key_id_field_mismatch", Severity: verify.SeverityAdvisory},
+				{Kind: verify.KindTornTrailingLine, Severity: verify.SeverityAdvisory},
+			},
+			want: 1,
+		},
+		{
+			name: "empty Severity fails closed as fatal",
+			errs: []verify.VerifyError{
+				{Kind: "some_future_kind", Severity: ""},
+			},
+			want: 1,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			report := verify.Report{Errors: tt.errs}
+			if got := report.FatalCount(); got != tt.want {
+				t.Errorf("Report{Errors: %+v}.FatalCount() = %d, want %d", tt.errs, got, tt.want)
+			}
+		})
+	}
+}
+
 func TestVerifyLog_HappyPath(t *testing.T) {
 	logPath, checkpointPath, pub := makeVerifyFixture(t)
 	report, err := verify.VerifyLog(logPath, checkpointPath, pub)

@@ -70,6 +70,24 @@ type Report struct {
 	Errors               []VerifyError
 }
 
+// FatalCount returns how many of r.Errors are not SeverityAdvisory. Callers
+// deciding exit codes or a Status: OK/FAILED line should key off this, not
+// len(r.Errors) — an advisory-only report is not a verification failure
+// (issue #49). Deliberately fail-closed: an error whose Severity is empty or
+// some future, unrecognized value counts as fatal here, not advisory — the
+// two kinds this package treats as advisory (KindTornTrailingLine and
+// key_id_field_mismatch) are the only ones that get the benefit of the
+// doubt, and only because they always carry an explicit SeverityAdvisory.
+func (r Report) FatalCount() int {
+	n := 0
+	for _, e := range r.Errors {
+		if e.Severity != SeverityAdvisory {
+			n++
+		}
+	}
+	return n
+}
+
 // pubKeyID returns hex(SHA256(pubKey)) — the same fingerprint scheme used by
 // sign.NewEd25519Signer so the verifier can compare key_id fields without
 // needing to reconstruct a full Ed25519Signer.

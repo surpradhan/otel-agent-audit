@@ -50,50 +50,25 @@ func TestErrorLabel(t *testing.T) {
 	}
 }
 
-// TestFatalCount pins the exit-code/Status-line policy (issue #49): only
-// verify.SeverityFatal errors count, so a report holding solely advisory
-// findings counts zero, and mixing severities counts only the fatal ones.
-func TestFatalCount(t *testing.T) {
+// TestStatusLine pins the exact "Status: ..." text for every combination of
+// fatal/advisory counts (issue #49) — only the fatal count decides OK vs
+// FAILED, but the advisory count is always surfaced too, so the headline
+// never undercounts what the per-error lines printed below it will show.
+func TestStatusLine(t *testing.T) {
 	tests := []struct {
-		name string
-		errs []verify.VerifyError
-		want int
+		name            string
+		fatal, advisory int
+		want            string
 	}{
-		{
-			name: "no errors",
-			errs: nil,
-			want: 0,
-		},
-		{
-			name: "all advisory",
-			errs: []verify.VerifyError{
-				{Kind: "key_id_field_mismatch", Severity: verify.SeverityAdvisory},
-				{Kind: verify.KindTornTrailingLine, Severity: verify.SeverityAdvisory},
-			},
-			want: 0,
-		},
-		{
-			name: "all fatal",
-			errs: []verify.VerifyError{
-				{Kind: "chain", Severity: verify.SeverityFatal},
-				{Kind: "checkpoint", Severity: verify.SeverityFatal},
-			},
-			want: 2,
-		},
-		{
-			name: "mixed severities counts only fatal",
-			errs: []verify.VerifyError{
-				{Kind: "chain", Severity: verify.SeverityFatal},
-				{Kind: "key_id_field_mismatch", Severity: verify.SeverityAdvisory},
-				{Kind: verify.KindTornTrailingLine, Severity: verify.SeverityAdvisory},
-			},
-			want: 1,
-		},
+		{name: "clean", fatal: 0, advisory: 0, want: "Status: OK"},
+		{name: "advisory only", fatal: 0, advisory: 2, want: "Status: OK (2 advisory finding(s))"},
+		{name: "fatal only", fatal: 1, advisory: 0, want: "Status: FAILED (1 error(s))"},
+		{name: "mixed", fatal: 1, advisory: 2, want: "Status: FAILED (1 fatal, 2 advisory)"},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			if got := fatalCount(tt.errs); got != tt.want {
-				t.Errorf("fatalCount(%+v) = %d, want %d", tt.errs, got, tt.want)
+			if got := statusLine(tt.fatal, tt.advisory); got != tt.want {
+				t.Errorf("statusLine(%d, %d) = %q, want %q", tt.fatal, tt.advisory, got, tt.want)
 			}
 		})
 	}

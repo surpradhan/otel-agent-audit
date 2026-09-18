@@ -85,7 +85,7 @@ func run() int {
 		return 2
 	}
 
-	fatal := fatalCount(report.Errors)
+	fatal := report.FatalCount()
 
 	if *jsonOut {
 		enc := json.NewEncoder(os.Stdout)
@@ -97,11 +97,7 @@ func run() int {
 	} else {
 		fmt.Printf("Traces processed:      %d\n", report.TracesProcessed)
 		fmt.Printf("Checkpoints processed: %d\n", report.CheckpointsProcessed)
-		if fatal == 0 {
-			fmt.Println("Status: OK")
-		} else {
-			fmt.Printf("Status: FAILED (%d error(s))\n", fatal)
-		}
+		fmt.Println(statusLine(fatal, len(report.Errors)-fatal))
 		for _, e := range report.Errors {
 			fmt.Printf("  [%s] %s (%s): %s\n", errorLabel(e), e.Kind, e.Severity, e.Detail)
 		}
@@ -113,18 +109,22 @@ func run() int {
 	return 0
 }
 
-// fatalCount returns how many of errs have Severity == verify.SeverityFatal.
-// The exit code and the Status line are driven by this count, not len(errs)
-// — an advisory finding (verify.SeverityAdvisory) is always printed but
-// never fails the run (issue #49).
-func fatalCount(errs []verify.VerifyError) int {
-	n := 0
-	for _, e := range errs {
-		if e.Severity == verify.SeverityFatal {
-			n++
-		}
+// statusLine returns the "Status: ..." line for a report given its fatal and
+// advisory error counts (report.FatalCount() and len(report.Errors) minus
+// that, respectively). Only fatal findings decide OK vs FAILED (issue #49);
+// an advisory count is still surfaced in the count so the headline never
+// undercounts what the lines printed below it will show.
+func statusLine(fatal, advisory int) string {
+	switch {
+	case fatal == 0 && advisory == 0:
+		return "Status: OK"
+	case fatal == 0:
+		return fmt.Sprintf("Status: OK (%d advisory finding(s))", advisory)
+	case advisory == 0:
+		return fmt.Sprintf("Status: FAILED (%d error(s))", fatal)
+	default:
+		return fmt.Sprintf("Status: FAILED (%d fatal, %d advisory)", fatal, advisory)
 	}
-	return n
 }
 
 // errorLabel returns the "[...]" prefix for one report line: the trace ID
