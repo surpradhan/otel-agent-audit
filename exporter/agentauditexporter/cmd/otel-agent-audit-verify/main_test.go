@@ -267,7 +267,8 @@ func TestWriteReport_NoteBoundsWhatItShows(t *testing.T) {
 		if body[0] != `  "id-00"` || body[maxNoteIDs-1] != `  "id-09"` {
 			t.Errorf("want the first %d ids in order; got first %q and last shown %q", maxNoteIDs, body[0], body[maxNoteIDs-1])
 		}
-		if want := "  ... and 15 more not shown (-json lists them all)"; body[maxNoteIDs] != want {
+		want := fmt.Sprintf("  ... and 15 more not shown; the ids above are the first %d in sort order (-json lists them all)", maxNoteIDs)
+		if body[maxNoteIDs] != want {
 			t.Errorf("marker line = %q, want %q", body[maxNoteIDs], want)
 		}
 	})
@@ -281,7 +282,8 @@ func TestWriteReport_NoteBoundsWhatItShows(t *testing.T) {
 
 	t.Run("one over the limit: one is counted, not shown", func(t *testing.T) {
 		body := noteBody(t, renderReport(report(numbered(maxNoteIDs+1)...)))
-		if len(body) != maxNoteIDs+1 || body[maxNoteIDs] != "  ... and 1 more not shown (-json lists them all)" {
+		want := fmt.Sprintf("  ... and 1 more not shown; the ids above are the first %d in sort order (-json lists them all)", maxNoteIDs)
+		if len(body) != maxNoteIDs+1 || body[maxNoteIDs] != want {
 			t.Errorf("want %d id lines and a marker for one more; got %q", maxNoteIDs, body)
 		}
 	})
@@ -302,6 +304,17 @@ func TestWriteReport_NoteBoundsWhatItShows(t *testing.T) {
 		body = noteBody(t, renderReport(report(strings.Repeat("a", maxNoteIDBytes+1))))
 		if want := `  "` + strings.Repeat("a", maxNoteIDBytes) + `" [truncated: 1 more byte(s)]`; len(body) != 1 || body[0] != want {
 			t.Errorf("an id one byte over must be cut with a marker; got %q", body)
+		}
+	})
+
+	t.Run("the limit counts bytes, not characters", func(t *testing.T) {
+		// A hundred characters of three bytes each are under the limit counted as
+		// characters and over it counted as bytes. Forty-two of them fit in 128 bytes.
+		id := strings.Repeat(string(rune(0x2603)), 100)
+		body := noteBody(t, renderReport(report(id)))
+		want := `  "` + strings.Repeat(fmt.Sprintf("\\u%04x", 0x2603), 42) + `" [truncated: 174 more byte(s)]`
+		if len(body) != 1 || body[0] != want {
+			t.Errorf("cut line = %q, want %q (the limit is in bytes)", body, want)
 		}
 	})
 
@@ -342,6 +355,18 @@ func TestWriteReport_WritesAsItGoes(t *testing.T) {
 
 	if lines := strings.Count(w.buf.String(), "\n"); w.writes < lines {
 		t.Errorf("%d writes for %d lines: the report was assembled in memory and written at once", w.writes, lines)
+	}
+}
+
+// TestQuoteUntrusted_CutWithNoBoundaryInReach: if no character boundary lies
+// within the limit (a run of continuation bytes, which valid UTF-8 never
+// contains and the JSON decoder never lets through, so this is defence in depth),
+// nothing of the id is shown and the whole length is reported as left out: still
+// bounded, still printable ASCII, and never a piece of a broken character.
+func TestQuoteUntrusted_CutWithNoBoundaryInReach(t *testing.T) {
+	id := string([]byte{0xf0}) + strings.Repeat(string([]byte{0x80}), 200)
+	if got, want := quoteUntrusted(id, maxNoteIDBytes), `"" [truncated: 201 more byte(s)]`; got != want {
+		t.Errorf("quoteUntrusted = %q, want %q", got, want)
 	}
 }
 
@@ -476,16 +501,27 @@ func runCLI(t *testing.T, args ...string) (stdout string, exitCode int) {
 	return stdout, exitCode
 }
 
+// writeJSONLines writes each of vs as one JSON line to path.
+func writeJSONLines(t *testing.T, path string, vs ...any) {
+	t.Helper()
+	var b strings.Builder
+	for _, v := range vs {
+		line, err := json.Marshal(v)
+		if err != nil {
+			t.Fatalf("marshal for %s: %v", path, err)
+		}
+		b.Write(line)
+		b.WriteByte('\n')
+	}
+	if err := os.WriteFile(path, []byte(b.String()), 0o600); err != nil {
+		t.Fatalf("write %s: %v", path, err)
+	}
+}
+
 // writeJSONLine writes v as a single JSON line to path.
 func writeJSONLine(t *testing.T, path string, v any) {
 	t.Helper()
-	line, err := json.Marshal(v)
-	if err != nil {
-		t.Fatalf("marshal for %s: %v", path, err)
-	}
-	if err := os.WriteFile(path, append(line, '\n'), 0o600); err != nil {
-		t.Fatalf("write %s: %v", path, err)
-	}
+	writeJSONLines(t, path, v)
 }
 
 // writeSingleKeyFixture writes a one-trace log and its checkpoint, both signed
@@ -661,18 +697,41 @@ func TestRun_OtherClaimedKeyIDs(t *testing.T) {
 		}
 	})
 
-	t.Run("-json is not bounded: every claimed id is listed", func(t *testing.T) {
+	t.Run("the Note is bounded but -json lists every claimed id in full", func(t *testing.T) {
 		logPath, cpPath, pubHex := writeSingleKeyFixture(t)
+		base := readEntry(t, logPath)
+		// More claimed ids than the Note lists, one of them longer than it shows.
 		long := strings.Repeat("z", 3*maxNoteIDBytes)
-		setEntryKeyID(t, logPath, long)
+		claims := []string{long}
+		for i := 0; i < maxNoteIDs+2; i++ {
+			claims = append(claims, fmt.Sprintf("claim-%02d", i))
+		}
+		entries := make([]any, len(claims))
+		for i, id := range claims {
+			e := base
+			e.Record.TraceID = fmt.Sprintf("%032x", i+1)
+			e.Signed.KeyID = id
+			entries[i] = e
+		}
+		writeJSONLines(t, logPath, entries...)
+		want := slices.Clone(claims)
+		slices.Sort(want)
 
 		out, _ := runCLI(t, "-json", "-key", pubHex, logPath, cpPath)
 		var report verify.Report
 		if err := json.Unmarshal([]byte(out), &report); err != nil {
 			t.Fatalf("output is not a JSON report: %v", err)
 		}
-		if want := []string{long}; !slices.Equal(report.OtherClaimedKeyIDs, want) {
-			t.Errorf("-json must carry the whole claimed id (%d bytes), got %d bytes", len(long), len(strings.Join(report.OtherClaimedKeyIDs, "")))
+		if !slices.Equal(report.OtherClaimedKeyIDs, want) {
+			t.Errorf("-json must carry all %d claimed ids in full, got %d ids", len(want), len(report.OtherClaimedKeyIDs))
+		}
+
+		human, _ := runCLI(t, "-key", pubHex, logPath, cpPath)
+		if header := fmt.Sprintf("Note: the log claims %d key_id(s)", len(want)); !strings.Contains(human, header) {
+			t.Errorf("the Note's header must give the true count (%q); output:\n%s", header, human)
+		}
+		if body := noteBody(t, human); len(body) != maxNoteIDs+1 {
+			t.Errorf("the Note lists at most %d ids plus a marker line, got %d lines: %q", maxNoteIDs, len(body), body)
 		}
 	})
 }

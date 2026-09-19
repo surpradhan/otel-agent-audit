@@ -33,6 +33,7 @@
 package main
 
 import (
+	"bufio"
 	"crypto/ed25519"
 	"encoding/hex"
 	"encoding/json"
@@ -104,7 +105,9 @@ func run() int {
 			return 2
 		}
 	} else {
-		writeReport(os.Stdout, report)
+		bw := bufio.NewWriter(os.Stdout)
+		writeReport(bw, report)
+		_ = bw.Flush()
 	}
 
 	if fatal > 0 {
@@ -151,7 +154,7 @@ func writeReport(w io.Writer, report verify.Report) {
 		p("  %s\n", quoteUntrusted(id, maxNoteIDBytes))
 	}
 	if more := n - len(shown); more > 0 {
-		p("  ... and %d more not shown (-json lists them all)\n", more)
+		p("  ... and %d more not shown; the ids above are the first %d in sort order (-json lists them all)\n", more, len(shown))
 	}
 	p("  These are unverified claims: an entry's key_id sits outside its signature, and a checkpoint that failed verification against the supplied key is only a claim too.\n")
 	if report.FatalCount() > 0 {
@@ -170,16 +173,13 @@ func writeReport(w io.Writer, report verify.Report) {
 // out as those characters inside the quotes, unchanged. If s is longer than
 // maxBytes only a prefix, cut on a rune boundary, is shown, followed by the
 // number of bytes left out; that note sits outside the quotes, so it is the tool
-// speaking.
+// speaking. maxBytes must not be negative.
 func quoteUntrusted(s string, maxBytes int) string {
 	omitted := 0
 	if len(s) > maxBytes {
 		cut := maxBytes
 		for cut > 0 && !utf8.RuneStart(s[cut]) {
 			cut--
-		}
-		if cut == 0 {
-			cut = maxBytes
 		}
 		s, omitted = s[:cut], len(s)-cut
 	}

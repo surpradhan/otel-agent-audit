@@ -71,15 +71,15 @@ The exit code and the `Status:` line reflect only fatal findings, but the
 `Status:` line always names the advisory count too, so it never undercounts
 what the per-error lines printed below it will show. Advisory findings are
 always printed (human-readable and JSON alike) but never affect the exit
-code. A `Note:` listing other claimed key_ids (issue #50; see [Multi-epoch
-logs](#multi-epoch-logs)) is not a finding at all and likewise never affects
-the exit code or the `Status:` line. Go callers of the `verify` package
-directly get the same policy via
+code. Go callers of the `verify` package directly get the same policy via
 `Report.FatalCount()` and `Report.StatusLine()`, which both
 `otel-agent-audit-verify` and `cmd/demo` call — a single shared
 implementation, not two mirrored ones, so the two CLIs cannot drift apart on
 this decision. `FatalCount` is deliberately fail-closed: an error with an
-empty or unrecognized `Severity` counts as fatal, never advisory.
+empty or unrecognized `Severity` counts as fatal, never advisory. A `Note:`
+listing other claimed key_ids (issue #50; see [Multi-epoch
+logs](#multi-epoch-logs)) is not a finding at all and never affects the exit
+code or the `Status:` line.
 
 > **Upgrading:** if existing automation treats any non-empty `Errors` as
 > failure, that behavior has changed — a log with only advisory findings now
@@ -136,8 +136,9 @@ other epoch's key; the `Note:` block after it lists the `key_id` the log claims
 besides the supplied key's. It is a hint, not a finding: it never changes the
 `Status:` line or the exit code, and it is built from claims (see
 [Multi-epoch logs](#multi-epoch-logs)). The listed values are untrusted text,
-so the Note prints each one quoted and escaped, lists at most 10 of them, and
-shows at most 128 bytes of each (`-json` lists every id in full):
+so the Note prints each one quoted and escaped, lists at most the first 10 of
+them in sorted order (saying how many it left out), and shows at most the first
+128 bytes of each (`-json` lists every id in full):
 
 ```
 Traces processed:      2
