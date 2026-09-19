@@ -1262,10 +1262,12 @@ func TestVerifyLog_OtherClaimedKeyIDs_IgnoresEmptyKeyIDs(t *testing.T) {
 // the field's shape across both sources at once. Claims are deliberately out of
 // order and repeated — "eeee" by two entries, "bbbb" by an entry and by a
 // checkpoint — and one entry claims the supplied key itself, which is never
-// "other". There are six distinct claims because the field is built from a map
-// and Go randomizes map iteration: with only three, an implementation that
-// forgot to sort would still pass this test one run in six; with six, one in
-// 720.
+// "other". The checkpoints contribute "ffff", "dddd", "cccc" in that
+// descending order. The field is built from a map, and Go leaves map iteration
+// order unspecified; on the runtime this was written against it only rotates
+// the insertion order, and no rotation of a sequence containing those descents
+// is ascending, so an implementation that forgot to sort fails on every run
+// rather than passing by chance.
 func TestVerifyLog_OtherClaimedKeyIDs_SortedDeduplicatedAndExcludesSuppliedKey(t *testing.T) {
 	dir := t.TempDir()
 	logPath := filepath.Join(dir, "audit.jsonl")
@@ -1292,7 +1294,7 @@ func TestVerifyLog_OtherClaimedKeyIDs_SortedDeduplicatedAndExcludesSuppliedKey(t
 		t.Fatalf("build checkpoint: %v", err)
 	}
 	var cps []chain.Checkpoint
-	for _, claimed := range []string{"bbbb", "dddd", "ffff", "cccc"} {
+	for _, claimed := range []string{"ffff", "bbbb", "dddd", "cccc"} {
 		c := cp
 		c.KeyID = claimed
 		cps = append(cps, c)
@@ -1307,6 +1309,113 @@ func TestVerifyLog_OtherClaimedKeyIDs_SortedDeduplicatedAndExcludesSuppliedKey(t
 	if !slices.Equal(report.OtherClaimedKeyIDs, want) {
 		t.Errorf("OtherClaimedKeyIDs = %q, want %q (sorted, de-duplicated, without the supplied key %s)",
 			report.OtherClaimedKeyIDs, want, keyIDOf(pub))
+	}
+}
+
+// TestReport_OtherClaimedKeyIDsJSONFieldName pins the wire name that the docs
+// and -json consumers rely on: a non-empty list marshals under exactly
+// "OtherClaimedKeyIDs", as a plain array.
+func TestReport_OtherClaimedKeyIDsJSONFieldName(t *testing.T) {
+	out, err := json.Marshal(verify.Report{
+		TracesProcessed:      1,
+		CheckpointsProcessed: 1,
+		OtherClaimedKeyIDs:   []string{"aa", "bb"},
+	})
+	if err != nil {
+		t.Fatalf("marshal report: %v", err)
+	}
+	var fields map[string]json.RawMessage
+	if err := json.Unmarshal(out, &fields); err != nil {
+		t.Fatalf("unmarshal report JSON: %v", err)
+	}
+	if got := string(fields["OtherClaimedKeyIDs"]); got != `["aa","bb"]` {
+		t.Errorf(`JSON key "OtherClaimedKeyIDs" = %q, want ["aa","bb"]; full output: %s`, got, out)
+	}
+}
+
+// TestVerifyLog_OtherClaimedKeyIDs_ReadsEveryEntryOfATrace: claims are read
+// from every entry, not only a trace's first or last. Here just the middle
+// entry of a three-entry trace claims a foreign key_id; the trace itself still
+// verifies, so the report stays free of fatal findings.
+func TestVerifyLog_OtherClaimedKeyIDs_ReadsEveryEntryOfATrace(t *testing.T) {
+	dir := t.TempDir()
+	logPath := filepath.Join(dir, "audit.jsonl")
+	checkpointPath := filepath.Join(dir, "checkpoint.jsonl") // never created: a missing file reads as empty
+
+	priv, pub, err := sign.GenerateEd25519Key()
+	if err != nil {
+		t.Fatalf("GenerateEd25519Key: %v", err)
+	}
+	const traceID = "01010101010101010101010101010101"
+	var recs []record.AuditRecord
+	for seq, spanID := range []string{"0000000000000001", "0000000000000002", "0000000000000003"} {
+		recs = append(recs, record.AuditRecord{
+			SchemaVersion: record.SchemaVersion,
+			TraceID:       traceID,
+			SpanID:        spanID,
+			ParentSpanID:  "0000000000000000",
+			SeqInTrace:    seq,
+			SpanName:      "span",
+			OtelKind:      "Internal",
+			AuditKind:     record.AuditKindTask,
+			Status:        "Ok",
+		})
+	}
+	seed, err := chain.GenesisSeed(traceID)
+	if err != nil {
+		t.Fatalf("GenesisSeed: %v", err)
+	}
+	built, err := chain.BuildChain(recs, seed, sign.NewEd25519Signer(priv))
+	if err != nil {
+		t.Fatalf("BuildChain: %v", err)
+	}
+	entries := chain.ToLogEntries(built)
+	entries[1].Signed.KeyID = "middle-claim"
+	writeLogEntries(t, logPath, entries)
+
+	report, err := verify.VerifyLog(logPath, checkpointPath, pub)
+	if err != nil {
+		t.Fatalf("VerifyLog: %v", err)
+	}
+	if want := []string{"middle-claim"}; !slices.Equal(report.OtherClaimedKeyIDs, want) {
+		t.Errorf("OtherClaimedKeyIDs = %q, want %q", report.OtherClaimedKeyIDs, want)
+	}
+	if n := report.FatalCount(); n != 0 {
+		t.Errorf("FatalCount = %d, want 0 (the trace verifies; only its metadata disagrees): %+v", n, report.Errors)
+	}
+}
+
+// TestVerifyLog_OtherClaimedKeyIDs_ReadsClaimsFromDuplicateSegments pins design
+// choice "claims are taken as-is": the field reports what the log claims, not
+// what verified, so a claim inside a trace whose chain verification is skipped
+// (duplicate_trace_segment) is still listed.
+func TestVerifyLog_OtherClaimedKeyIDs_ReadsClaimsFromDuplicateSegments(t *testing.T) {
+	logPath, checkpointPath, pub := makeVerifyFixture(t)
+	setFixtureEntryKeyID(t, logPath, "dup-claim")
+	data, err := os.ReadFile(logPath)
+	if err != nil {
+		t.Fatalf("read log: %v", err)
+	}
+	line := strings.TrimRight(string(data), "\n")
+	if err := os.WriteFile(logPath, []byte(line+"\n"+line+"\n"), 0o600); err != nil {
+		t.Fatalf("write log: %v", err)
+	}
+
+	report, err := verify.VerifyLog(logPath, checkpointPath, pub)
+	if err != nil {
+		t.Fatalf("VerifyLog: %v", err)
+	}
+	var sawDuplicate bool
+	for _, e := range report.Errors {
+		if e.Kind == "duplicate_trace_segment" {
+			sawDuplicate = true
+		}
+	}
+	if !sawDuplicate {
+		t.Fatalf("fixture is wrong: expected a duplicate_trace_segment error; got %+v", report.Errors)
+	}
+	if want := []string{"dup-claim"}; !slices.Equal(report.OtherClaimedKeyIDs, want) {
+		t.Errorf("OtherClaimedKeyIDs = %q, want %q", report.OtherClaimedKeyIDs, want)
 	}
 }
 

@@ -72,12 +72,15 @@ type Report struct {
 	// OtherClaimedKeyIDs lists, sorted and de-duplicated, the non-empty key_id
 	// values claimed by log entries or checkpoints that differ from the key
 	// this run verified against; empty (and omitted from JSON) when every claim
-	// matches. It is a hint that part of the log may be signed by a key this
-	// run was not given (a rotation, a wrong key, or an edited key_id field),
-	// never a finding: it does not add to Errors and FatalCount, StatusLine
-	// and the CLI's exit code ignore it. Claims are taken as-is — an entry's
-	// key_id is unauthenticated (see VerifyLog), and a checkpoint that did not
-	// verify against the supplied key is only a claim too (issue #50).
+	// matches. It hints that part of the log may have been signed by a key this
+	// run was not given (a rotation, or the wrong key), or that a key_id field
+	// was edited — never a finding: it does not add to Errors, and FatalCount,
+	// StatusLine and the CLI's exit code ignore it. Claims are untrusted text
+	// taken as-is: an entry's key_id is unauthenticated (see VerifyLog), and a
+	// checkpoint that did not verify against the supplied key is only a claim
+	// too, so an empty list does not show that the log is single-epoch.
+	// Provisional: issue #19's rotation-aware verification may supersede or
+	// reshape it (issue #50).
 	OtherClaimedKeyIDs []string `json:",omitempty"`
 }
 

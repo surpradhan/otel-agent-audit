@@ -27,9 +27,9 @@
 //
 // Separately, when the log's entries or checkpoints claim key_ids other than
 // the supplied key's, the human-readable output ends with an informational
-// "Note:" listing them, and -json carries them as OtherClaimedKeyIDs (issue
-// #50). That is a hint, not a finding: it never affects the exit code or the
-// Status line either.
+// "Note:" listing them (escaped: they are untrusted text), and -json carries
+// them as OtherClaimedKeyIDs (issue #50). That is a hint, not a finding: it
+// never affects the exit code or the Status line either.
 package main
 
 import (
@@ -40,6 +40,7 @@ import (
 	"flag"
 	"fmt"
 	"os"
+	"strconv"
 	"strings"
 
 	"github.com/surpradhan/otel-agent-audit/exporter/agentauditexporter/internal/sign"
@@ -114,7 +115,9 @@ func run() int {
 // formatReport renders the human-readable (non-JSON) report. The trailing
 // "Note:" block appears only when the log claims key_ids other than the
 // supplied key's (issue #50); it is a hint, never a finding, and does not
-// affect the Status line or the exit code.
+// affect the Status line or the exit code. Only its wording depends on
+// whether anything failed: advice to try another epoch's key makes sense only
+// next to findings, and even then must not read as explaining them away.
 func formatReport(report verify.Report) string {
 	var b strings.Builder
 	fmt.Fprintf(&b, "Traces processed:      %d\n", report.TracesProcessed)
@@ -126,12 +129,26 @@ func formatReport(report verify.Report) string {
 	if n := len(report.OtherClaimedKeyIDs); n > 0 {
 		fmt.Fprintf(&b, "Note: the log claims %d key_id(s) other than the supplied key's:\n", n)
 		for _, id := range report.OtherClaimedKeyIDs {
-			fmt.Fprintf(&b, "  %s\n", id)
+			fmt.Fprintf(&b, "  %s\n", escapeUntrusted(id))
 		}
-		fmt.Fprintln(&b, "  That may be a key rotation (re-run with the other epoch's key against the full, unsplit files), a wrong key, or an edited key_id.")
-		fmt.Fprintln(&b, "  Informational only: entry key_ids are unauthenticated, and this never affects Status or the exit code. See \"Multi-epoch logs\" in docs/verification.md.")
+		fmt.Fprintln(&b, "  These are unverified claims: an entry's key_id sits outside its signature, and a checkpoint that failed verification against the supplied key is only a claim too.")
+		if report.FatalCount() > 0 {
+			fmt.Fprintln(&b, "  This does not explain or excuse the findings above. Only if you know a key rotation happened, verify again with the other epoch's key (obtained independently of this log) against the same full, unsplit files.")
+		} else {
+			fmt.Fprintln(&b, "  Everything that could be read verified against the supplied key, so this concerns key_id metadata only.")
+		}
+		fmt.Fprintln(&b, "  Informational only: this never affects Status or the exit code. See \"Multi-epoch logs\" in docs/verification.md.")
 	}
 	return b.String()
+}
+
+// escapeUntrusted renders s with control and non-ASCII characters escaped in
+// Go string-literal style (enclosing quotes dropped), so text read from the
+// log cannot forge output lines or drive the terminal. A key_id in its normal
+// form, 64 lowercase hex characters, comes out unchanged.
+func escapeUntrusted(s string) string {
+	q := strconv.QuoteToASCII(s)
+	return q[1 : len(q)-1]
 }
 
 // errorLabel returns the "[...]" prefix for one report line: the trace ID
