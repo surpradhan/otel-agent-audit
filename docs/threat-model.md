@@ -369,6 +369,17 @@ technical counsel.
 | `duplicate_trace_segment` | fatal | Two independent chains exist for the same `trace_id` — this is an at-least-once delivery artifact, not evidence of tampering **by the segment split itself**. Still fatal, unlike the two advisory findings in this table: chain verification is skipped entirely for this `trace_id`, so nothing about its entries was actually cryptographically checked (issue #49). Practical consequence: routine at-least-once redelivery (§5) will always show `Status: FAILED` today, even though it isn't tampering — there is no severity tier yet between "fully verified, disagreement is metadata-only" (advisory) and "not tampering by itself, but nothing was checked" (fatal) |
 | `torn_trailing_line` | advisory | The audit log's final line was unparseable — likely an interrupted write from a crash. Its content was never cryptographically verified (that is what "unparseable" means), so this alone does not rule out tampering; entries before it were fully verified |
 
+Alongside its findings the verifier can list, without treating it as one, any
+`key_id` values the log's entries or checkpoints claim other than the supplied
+key's (`Report.OtherClaimedKeyIDs`; a `Note:` block in the CLI — issue #50). It
+exists so an operator is pointed at "try the other key" rather than left with
+bare signature failures; it is not itself evidence of a rotation, a wrong key,
+or tampering, and it never affects `Status:` or the exit code. It is built from
+claims: an entry's `key_id` is unauthenticated (editing one changes this hint,
+and raises the advisory `key_id_field_mismatch` if the entry still verifies, but
+never the fatal/OK verdict), and a checkpoint that did not verify against the
+supplied key is only a claim too.
+
 **The verifier cannot detect:**
 - A trace that was **never written** to the log (it is absent, not corrupted)
 - Tampering that occurred before the span reached the collector

@@ -24,6 +24,12 @@
 // torn_trailing_line) means the flagged entries were still fully verified
 // despite the finding. Advisory findings are always printed but never
 // affect the exit code or the Status line — see docs/verification.md.
+//
+// Separately, when the log's entries or checkpoints claim key_ids other than
+// the supplied key's, the human-readable output ends with an informational
+// "Note:" listing them, and -json carries them as OtherClaimedKeyIDs (issue
+// #50). That is a hint, not a finding: it never affects the exit code or the
+// Status line either.
 package main
 
 import (
@@ -34,6 +40,7 @@ import (
 	"flag"
 	"fmt"
 	"os"
+	"strings"
 
 	"github.com/surpradhan/otel-agent-audit/exporter/agentauditexporter/internal/sign"
 	"github.com/surpradhan/otel-agent-audit/exporter/agentauditexporter/internal/verify"
@@ -95,18 +102,36 @@ func run() int {
 			return 2
 		}
 	} else {
-		fmt.Printf("Traces processed:      %d\n", report.TracesProcessed)
-		fmt.Printf("Checkpoints processed: %d\n", report.CheckpointsProcessed)
-		fmt.Println(report.StatusLine())
-		for _, e := range report.Errors {
-			fmt.Printf("  [%s] %s (%s): %s\n", errorLabel(e), e.Kind, e.Severity, e.Detail)
-		}
+		fmt.Print(formatReport(report))
 	}
 
 	if fatal > 0 {
 		return 1
 	}
 	return 0
+}
+
+// formatReport renders the human-readable (non-JSON) report. The trailing
+// "Note:" block appears only when the log claims key_ids other than the
+// supplied key's (issue #50); it is a hint, never a finding, and does not
+// affect the Status line or the exit code.
+func formatReport(report verify.Report) string {
+	var b strings.Builder
+	fmt.Fprintf(&b, "Traces processed:      %d\n", report.TracesProcessed)
+	fmt.Fprintf(&b, "Checkpoints processed: %d\n", report.CheckpointsProcessed)
+	fmt.Fprintln(&b, report.StatusLine())
+	for _, e := range report.Errors {
+		fmt.Fprintf(&b, "  [%s] %s (%s): %s\n", errorLabel(e), e.Kind, e.Severity, e.Detail)
+	}
+	if n := len(report.OtherClaimedKeyIDs); n > 0 {
+		fmt.Fprintf(&b, "Note: the log claims %d key_id(s) other than the supplied key's:\n", n)
+		for _, id := range report.OtherClaimedKeyIDs {
+			fmt.Fprintf(&b, "  %s\n", id)
+		}
+		fmt.Fprintln(&b, "  That may be a key rotation (re-run with the other epoch's key against the full, unsplit files), a wrong key, or an edited key_id.")
+		fmt.Fprintln(&b, "  Informational only: entry key_ids are unauthenticated, and this never affects Status or the exit code. See \"Multi-epoch logs\" in docs/verification.md.")
+	}
+	return b.String()
 }
 
 // errorLabel returns the "[...]" prefix for one report line: the trace ID

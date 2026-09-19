@@ -25,7 +25,7 @@ otel-agent-audit-verify [-key <hex>] [-key-file <pem>] [-json] <log-file> <check
 |---|---|
 | `-key <hex>` | Hex-encoded Ed25519 public key (64 hex chars = 32 bytes) |
 | `-key-file <pem>` | Path to PEM file with `PUBLIC KEY` block (PKIX/SubjectPublicKeyInfo) |
-| `-json` | Emit results as JSON (`{"TracesProcessed":…,"CheckpointsProcessed":…,"Errors":[…]}`) |
+| `-json` | Emit results as JSON (`{"TracesProcessed":…,"CheckpointsProcessed":…,"Errors":[…]}`, plus `"OtherClaimedKeyIDs":[…]` when the log claims key_ids other than the supplied key's — see *JSON output* below) |
 
 Exactly one of `-key` or `-key-file` is required; using both is an error.
 
@@ -71,7 +71,9 @@ The exit code and the `Status:` line reflect only fatal findings, but the
 `Status:` line always names the advisory count too, so it never undercounts
 what the per-error lines printed below it will show. Advisory findings are
 always printed (human-readable and JSON alike) but never affect the exit
-code. Go callers of the `verify` package directly get the same policy via
+code. A `Note:` listing other claimed key_ids (issue #50; see [Multi-epoch
+logs](#multi-epoch-logs)) is not a finding at all and likewise never affects
+either. Go callers of the `verify` package directly get the same policy via
 `Report.FatalCount()` and `Report.StatusLine()`, which both
 `otel-agent-audit-verify` and `cmd/demo` call — a single shared
 implementation, not two mirrored ones, so the two CLIs cannot drift apart on
@@ -127,21 +129,71 @@ Status: FAILED (2 fatal, 1 advisory)
   [audit log] torn_trailing_line (advisory): line 43: unparseable, likely a partial write from a crash: unexpected end of JSON input
 ```
 
+Other-key hint example — a rotated log verified against only one of its two
+keys, captured from a real run. The fatal line is the checkpoint signed by the
+other epoch's key; the `Note:` block after it lists the `key_id` the log claims
+besides the supplied key's. It is a hint, not a finding: it never changes the
+`Status:` line or the exit code, and it is built from claims (see
+[Multi-epoch logs](#multi-epoch-logs)):
+
+```
+Traces processed:      2
+Checkpoints processed: 2
+Status: FAILED (1 error(s))
+  [checkpoint] checkpoint (fatal): seq 2: checkpoint: signature verification failed
+Note: the log claims 1 key_id(s) other than the supplied key's:
+  977c6b977ce1d7a2065ecbe9b4be7aad72b052f9d989f808419fc611e2756c22
+  That may be a key rotation (re-run with the other epoch's key against the full, unsplit files), a wrong key, or an edited key_id.
+  Informational only: entry key_ids are unauthenticated, and this never affects Status or the exit code. See "Multi-epoch logs" in docs/verification.md.
+```
+
 ## JSON output (`-json`)
 
 ```json
 {
-  "TracesProcessed": 42,
+  "TracesProcessed": 1,
   "CheckpointsProcessed": 1,
-  "Errors": []
+  "Errors": null
 }
 ```
 
-`Errors` is a JSON array of objects:
+`Errors` is `null` when there are no findings and otherwise a JSON array of
+objects:
 `{"TraceID": "…", "Kind": "…", "Detail": "…", "Severity": "fatal"|"advisory"}`.
 `TraceID` is empty for checkpoint-level errors and for the log-level
 `torn_trailing_line` finding. See [Exit codes](#exit-codes) above for what
 `Severity` means and how it drives the exit code.
+
+`OtherClaimedKeyIDs` (issue #50) is present only when the log's entries or
+checkpoints claim `key_id` values other than the supplied key's, and is then a
+sorted, de-duplicated array of them; it is absent otherwise, so the report for
+an ordinary single-key log is byte-for-byte what it was before the field
+existed. It is a hint that part of the log may be signed by a key this run was
+not given — a key rotation, the wrong key, or an edited `key_id` field — and is
+deliberately not a finding: it is never added to `Errors`, and it never affects
+`Severity`, the `Status:` line, or the exit code. The same caution applies to
+what it is built from: an entry's `key_id` is unauthenticated, and a checkpoint
+that did not verify against the supplied key is only a claim too (see
+[Key-id verification](#key-id-verification)). The same rotated log as in the
+human-readable example above:
+
+```json
+{
+  "TracesProcessed": 2,
+  "CheckpointsProcessed": 2,
+  "Errors": [
+    {
+      "TraceID": "",
+      "Kind": "checkpoint",
+      "Detail": "seq 2: checkpoint: signature verification failed",
+      "Severity": "fatal"
+    }
+  ],
+  "OtherClaimedKeyIDs": [
+    "977c6b977ce1d7a2065ecbe9b4be7aad72b052f9d989f808419fc611e2756c22"
+  ]
+}
+```
 
 `Report` itself carries no separate top-level pass/fail field (e.g. a
 `Status` string or a fatal count) — a `-json` consumer must derive that from
@@ -208,9 +260,9 @@ checkpoint is always verified directly against the supplied public key
 | Scenario | Verifier behaviour |
 |----------|-------------------|
 | Correct key supplied | Chain and checkpoint signatures are verified normally |
-| Wrong key supplied | Ordinary `chain` / `checkpoint` signature-failure errors — the verifier cannot and does not try to tell "wrong key" apart from "corrupted" using a single candidate key |
+| Wrong key supplied | Ordinary `chain` / `checkpoint` signature-failure errors — the verifier cannot and does not try to tell "wrong key" apart from "corrupted" using a single candidate key. The report does add a non-gating hint naming the key_ids the log claims besides the supplied key's (`OtherClaimedKeyIDs`; the CLI's `Note:` block) — see [Multi-epoch logs](#multi-epoch-logs) |
 | An entry verifies, but its claimed `key_id` disagrees with the supplied key | `key_id_field_mismatch` — `Severity: "advisory"` (see [Exit codes](#exit-codes)). The signature already proved the content is authentic; the `key_id` metadata is stale or was tampered with, which is worth flagging but not a reason to fail an otherwise-good entry. There is no checkpoint-side equivalent: a checkpoint's `key_id` is signed, so tampering it alone fails its signature check instead (an ordinary `checkpoint` error, `Severity: "fatal"`) |
-| Log spans multiple key epochs | No longer refused outright — see [Multi-epoch logs](#multi-epoch-logs) below |
+| Log spans multiple key epochs | No longer refused outright — see [Multi-epoch logs](#multi-epoch-logs) below. The other epoch's claimed key_ids appear in the same non-gating hint (`OtherClaimedKeyIDs` / the `Note:` block) |
 
 ### Multi-epoch logs
 
@@ -257,7 +309,16 @@ two real defects (issue #35):
   previous epoch's tail, so every epoch after the first reports a spurious
   `prev_checkpoint_hash` mismatch against the zero sentinel.
 
-To identify which keys you need in the first place:
+To identify which keys you need in the first place, start from the hint the
+verifier already gives: whenever the log's entries or checkpoints claim
+`key_id`s other than the supplied key's, the human-readable output ends with a
+`Note:` listing them and `-json` carries them as `OtherClaimedKeyIDs` (issue
+#50; examples above). It is a hint only — never a finding, never part of the
+verdict — and it is built from claims: an entry's `key_id` is unauthenticated,
+and a checkpoint that did not verify against the supplied key is only a claim
+too (see [Key-id verification](#key-id-verification)). It also leaves out the
+supplied key's own claims by design. For the complete picture, list every
+distinct claimed `key_id` yourself:
 
 ```bash
 jq -r '.signed.key_id' audit.jsonl | sort -u
