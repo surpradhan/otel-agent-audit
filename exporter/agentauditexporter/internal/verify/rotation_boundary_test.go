@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -48,6 +49,11 @@ import (
 // first-class multi-key API with clean, non-noisy attestation across the
 // boundary — is still #19's design question, not solved here. Whoever
 // implements it should flip those assertions rather than delete them.
+//
+// Issue #50 added one thing to the report itself, which
+// TestRotation_OtherClaimedKeyIDsHintsAtTheOtherEpoch pins: a non-gating
+// Report.OtherClaimedKeyIDs hint naming the key_ids the log claims other than
+// the supplied key's. It changes no verdict and does not attempt #19's design.
 //
 // The shape under test, which is what a real rotation produces: Start rehydrates
 // sequence and previous-hash state from the last checkpoint and re-adds pending
@@ -447,6 +453,76 @@ func TestRotation_EpochBAloneSymptoms(t *testing.T) {
 			t.Errorf("want entry_count_mismatch (today's behaviour); errors: %+v", report.Errors)
 		}
 	})
+}
+
+// TestRotation_OtherClaimedKeyIDsHintsAtTheOtherEpoch (issue #50). A single-key
+// run over a rotated log still fails with only ordinary signature errors
+// (TestRotation_WholeLogAgainstOneKey); OtherClaimedKeyIDs is the non-gating
+// hint that says why: the log claims a key this run was not given.
+//
+// In this fixture — the shape a rotate-by-restart really produces — every entry
+// claims key A and only cp2 claims key B, so verifying with A is hinted by the
+// checkpoint side alone. Each source is also run on its own (an empty
+// checkpoint file, an empty log) so that dropping either one from the claim
+// collection fails a specific case here.
+func TestRotation_OtherClaimedKeyIDsHintsAtTheOtherEpoch(t *testing.T) {
+	f := newRotationFixture(t)
+	keyA, keyB := f.cp1.KeyID, f.cp2.KeyID
+	if keyA == "" || keyB == "" || keyA == keyB {
+		t.Fatalf("fixture is wrong: the epochs must claim two distinct, non-empty key_ids; got %q and %q", keyA, keyB)
+	}
+	for traceID, entries := range f.entries {
+		for _, e := range entries {
+			if e.Signed.KeyID != keyA {
+				t.Fatalf("fixture is wrong: entry of %s claims %q, want epoch A's %q", traceID, e.Signed.KeyID, keyA)
+			}
+		}
+	}
+
+	emptyLog := filepath.Join(f.dir, "empty_audit.jsonl")
+	emptyCheckpoints := filepath.Join(f.dir, "empty_checkpoint.jsonl")
+	for _, p := range []string{emptyLog, emptyCheckpoints} {
+		if err := os.WriteFile(p, nil, 0o600); err != nil {
+			t.Fatalf("write %s: %v", p, err)
+		}
+	}
+
+	tests := []struct {
+		name    string
+		logPath string
+		cpPath  string
+		key     []byte
+		want    []string
+	}{
+		{"whole log, key A: only cp2 claims B", f.logPath, f.cpPath, f.pubA, []string{keyB}},
+		{"whole log, key B: the entries and cp1 claim A", f.logPath, f.cpPath, f.pubB, []string{keyA}},
+		{"entries only, key B", f.logPath, emptyCheckpoints, f.pubB, []string{keyA}},
+		{"entries only, key A: every claim matches", f.logPath, emptyCheckpoints, f.pubA, nil},
+		{"checkpoints only, key A", emptyLog, f.cpPath, f.pubA, []string{keyB}},
+		{"checkpoints only, key B", emptyLog, f.cpPath, f.pubB, []string{keyA}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			report, err := verify.VerifyLog(tt.logPath, tt.cpPath, tt.key)
+			if err != nil {
+				t.Fatalf("VerifyLog: %v", err)
+			}
+			if !slices.Equal(report.OtherClaimedKeyIDs, tt.want) {
+				t.Errorf("OtherClaimedKeyIDs = %q, want %q", report.OtherClaimedKeyIDs, tt.want)
+			}
+		})
+	}
+
+	// The hint changes no verdict: the whole log against key A still yields
+	// exactly the one checkpoint signature failure that
+	// TestRotation_WholeLogAgainstOneKey pins.
+	report, err := verify.VerifyLog(f.logPath, f.cpPath, f.pubA)
+	if err != nil {
+		t.Fatalf("VerifyLog: %v", err)
+	}
+	if len(report.Errors) != 1 || report.FatalCount() != 1 {
+		t.Errorf("expected exactly one fatal error (cp2, signed by B); got %+v", report.Errors)
+	}
 }
 
 func readTraceEntries(t *testing.T, path, traceID string) []chain.LogEntry {

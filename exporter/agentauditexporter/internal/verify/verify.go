@@ -68,6 +68,20 @@ type Report struct {
 	TracesProcessed      int
 	CheckpointsProcessed int
 	Errors               []VerifyError
+
+	// OtherClaimedKeyIDs lists, sorted and de-duplicated, the non-empty key_id
+	// values claimed by log entries or checkpoints that differ from the key
+	// this run verified against; empty (and omitted from JSON) when every claim
+	// matches. It hints that part of the log may have been signed by a key this
+	// run was not given (a rotation, or the wrong key), or that a key_id field
+	// was edited — never a finding: it does not add to Errors, and FatalCount,
+	// StatusLine and the CLI's exit code ignore it. Claims are untrusted text
+	// taken as-is: an entry's key_id is unauthenticated (see VerifyLog), and a
+	// checkpoint that did not verify against the supplied key is only a claim
+	// too, so an empty list does not show that the log is single-epoch.
+	// Provisional: issue #19's rotation-aware verification may supersede or
+	// reshape it (issue #50).
+	OtherClaimedKeyIDs []string `json:",omitempty"`
 }
 
 // FatalCount returns how many of r.Errors are not SeverityAdvisory. Callers
@@ -116,6 +130,36 @@ func (r Report) StatusLine() string {
 func pubKeyID(pubKey ed25519.PublicKey) string {
 	h := sha256.Sum256(pubKey)
 	return hex.EncodeToString(h[:])
+}
+
+// otherClaimedKeyIDs returns the sorted, de-duplicated non-empty key_id values
+// claimed by any entry or checkpoint that differ from suppliedKeyID, or nil if
+// there are none. Claims are read as-is, whether or not the entry or
+// checkpoint carrying them verifies — see Report.OtherClaimedKeyIDs.
+func otherClaimedKeyIDs(traceEntries map[string][]chain.LogEntry, checkpoints []chain.Checkpoint, suppliedKeyID string) []string {
+	seen := map[string]struct{}{}
+	claim := func(id string) {
+		if id != "" && id != suppliedKeyID {
+			seen[id] = struct{}{}
+		}
+	}
+	for _, entries := range traceEntries {
+		for _, e := range entries {
+			claim(e.Signed.KeyID)
+		}
+	}
+	for _, cp := range checkpoints {
+		claim(cp.KeyID)
+	}
+	if len(seen) == 0 {
+		return nil
+	}
+	ids := make([]string, 0, len(seen))
+	for id := range seen {
+		ids = append(ids, id)
+	}
+	sort.Strings(ids)
+	return ids
 }
 
 // VerifyChain verifies the hash chain of a set of log entries for a single trace.
@@ -232,11 +276,14 @@ func VerifyCheckpoint(cp chain.Checkpoint, prevSignPayloadHash string, pubKey ed
 //     (wrong key, key rotation, or genuine tampering) produces the ordinary
 //     "chain" / "checkpoint" signature-failure error. VerifyLog cannot and
 //     does not try to tell those causes apart using a single candidate key.
-//     To check whether a log spans a key rotation, compare claimed key_id
-//     values by hand (see docs/verification.md "Multi-epoch logs") — always
-//     against the full, unsplit log and checkpoint files, since filtering by
-//     key_id can exclude the very checkpoint that covers a rotation-boundary
-//     trace (issue #35).
+//     Report.OtherClaimedKeyIDs is a non-gating hint alongside them: the
+//     key_id values the log claims other than the supplied key's, taken as-is
+//     (see that field; an empty list does not show the log is single-epoch),
+//     never affecting Errors or the verdict. For the full picture, compare
+//     claimed key_id values by hand (see docs/verification.md "Multi-epoch
+//     logs") — always against the full, unsplit log and checkpoint files,
+//     since filtering by key_id can exclude the very checkpoint that covers a
+//     rotation-boundary trace (issue #35).
 //
 // Policy for traces not covered by any checkpoint: counted in TracesProcessed
 // but not reported as errors (they are "unchecked-by-checkpoint"). Rationale:
@@ -267,10 +314,12 @@ func VerifyLog(logPath, checkpointPath string, pubKey ed25519.PublicKey) (Report
 	}
 
 	// suppliedKeyID is the fingerprint of the key this run verifies against.
-	// Compared against each entry/checkpoint's claimed key_id only AFTER that
-	// entry/checkpoint's signature has been independently verified below —
-	// see VerifyLog's doc comment.
+	// key_id_field_mismatch compares an entry's claimed key_id against it only
+	// AFTER that entry's signature has been independently verified below;
+	// OtherClaimedKeyIDs compares every claim against it as-is, but only ever
+	// as a hint that never touches Errors. See VerifyLog's doc comment.
 	suppliedKeyID := pubKeyID(pubKey)
+	report.OtherClaimedKeyIDs = otherClaimedKeyIDs(traceEntries, checkpoints, suppliedKeyID)
 
 	// Verify each trace chain in sorted order for deterministic error output.
 	traceIDs := make([]string, 0, len(traceEntries))
