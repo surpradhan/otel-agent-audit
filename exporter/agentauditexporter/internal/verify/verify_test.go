@@ -1474,6 +1474,42 @@ func TestVerifyLog_OtherClaimedKeyIDs_IgnoresATornTrailingLine(t *testing.T) {
 	})
 }
 
+// TestVerifyLog_OtherClaimedKeyIDs_ComparesKeyIDsExactly: key_ids are compared
+// and de-duplicated byte for byte, the same way key_id_field_mismatch compares
+// them. A claim that differs from the supplied key's fingerprint only in case is
+// therefore a different claim and is listed, and "abcd" and "ABCD" stay two.
+func TestVerifyLog_OtherClaimedKeyIDs_ComparesKeyIDsExactly(t *testing.T) {
+	dir := t.TempDir()
+	logPath := filepath.Join(dir, "audit.jsonl")
+	checkpointPath := filepath.Join(dir, "checkpoint.jsonl") // never created: a missing file reads as empty
+
+	priv, pub, err := sign.GenerateEd25519Key()
+	if err != nil {
+		t.Fatalf("GenerateEd25519Key: %v", err)
+	}
+	signer := sign.NewEd25519Signer(priv)
+	shouted := strings.ToUpper(keyIDOf(pub))
+	if shouted == keyIDOf(pub) {
+		t.Skip("the key_id has no letters, so upper-casing it changes nothing")
+	}
+
+	writeLogEntries(t, logPath, []chain.LogEntry{
+		makeClaimedEntry(t, signer, "01010101010101010101010101010101", "abcd"),
+		makeClaimedEntry(t, signer, "02020202020202020202020202020202", "ABCD"),
+		makeClaimedEntry(t, signer, "03030303030303030303030303030303", shouted),
+	})
+
+	report, err := verify.VerifyLog(logPath, checkpointPath, pub)
+	if err != nil {
+		t.Fatalf("VerifyLog: %v", err)
+	}
+	want := []string{"abcd", "ABCD", shouted}
+	slices.Sort(want)
+	if !slices.Equal(report.OtherClaimedKeyIDs, want) {
+		t.Errorf("OtherClaimedKeyIDs = %q, want %q (comparison is exact: case matters)", report.OtherClaimedKeyIDs, want)
+	}
+}
+
 // TestVerifyLog_HappyPath_V3Log is the current-format counterpart of the legacy
 // test below: a log written at record.SchemaVersion must carry decimal-string
 // timestamps on disk — the whole point of v3 — and verify cleanly.

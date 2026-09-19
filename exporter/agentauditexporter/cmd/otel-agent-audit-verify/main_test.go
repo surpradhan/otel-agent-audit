@@ -8,6 +8,7 @@ import (
 	"os"
 	"path/filepath"
 	"slices"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -67,8 +68,11 @@ func TestFormatReport_NoteFollowsTheFindings(t *testing.T) {
 	}
 	for _, phrase := range []string{
 		"unverified claims",
+		"only a claim too",
 		"does not explain or excuse the findings above",
+		"Only if you know a key rotation happened",
 		"obtained independently of this log",
+		"full, unsplit files",
 		"never affects Status or the exit code",
 		"docs/verification.md",
 	} {
@@ -107,6 +111,9 @@ func TestFormatReport_NoteWithoutFatalFindings(t *testing.T) {
 	}
 	if !strings.Contains(got, "key_id metadata only") {
 		t.Errorf("with nothing failed the Note should say this concerns metadata only; got:\n%s", got)
+	}
+	if !strings.Contains(got, "that could be read verified against the supplied key") {
+		t.Errorf("with nothing failed the Note should say what was verified, and only what could be read; got:\n%s", got)
 	}
 	for _, phrase := range []string{"rotation", "wrong key", "verify again", "explain or excuse"} {
 		if strings.Contains(got, phrase) {
@@ -151,26 +158,32 @@ func TestFormatReport_NoteEscapesUntrustedIDs(t *testing.T) {
 	}
 }
 
-// TestEscapeUntrusted_LeavesNormalKeyIDsUnchanged: a key_id in its normal form
-// (64 lowercase hex characters) must print exactly as it is stored, so the
-// escaping never gets in the way of matching an id against a known key.
-func TestEscapeUntrusted_LeavesNormalKeyIDsUnchanged(t *testing.T) {
-	id := strings.Repeat("0123456789abcdef", 4)
-	if got := escapeUntrusted(id); got != id {
-		t.Errorf("escapeUntrusted(%q) = %q, want it unchanged", id, got)
+// TestEscapeUntrusted_LeavesPlainASCIIAlone: a key_id in its normal form (64
+// lowercase hex characters) must print exactly as it is stored, so the
+// escaping never gets in the way of matching an id against a known key. No
+// printable ASCII is altered either, spaces included: an id padded with spaces,
+// or made only of them, must stay visible as what it is rather than being
+// trimmed into an invisible or blank line.
+func TestEscapeUntrusted_LeavesPlainASCIIAlone(t *testing.T) {
+	for _, in := range []string{strings.Repeat("0123456789abcdef", 4), " a ", " ", "a b"} {
+		if got := escapeUntrusted(in); got != in {
+			t.Errorf("escapeUntrusted(%q) = %q, want it unchanged", in, got)
+		}
 	}
 }
 
-// TestEscapeUntrusted_EscapesEveryUnsafeClass pins each class of character
-// escapeUntrusted promises to escape, one row per class, with the exact escaped
-// form and the property that matters: every byte that comes out is printable
-// ASCII, so nothing in it can forge a line or drive a terminal. The classes are
-// the ones a narrower implementation lets through: 8-bit C1 controls that some
-// terminals honour, line and paragraph separators, bidi overrides, invalid
-// UTF-8, and printable non-ASCII such as a Cyrillic look-alike of a hex digit.
-// Inputs and expectations are built from code points and bytes rather than
-// written as escape sequences, so this file never itself contains the
-// characters under test.
+// TestEscapeUntrusted_EscapesEveryUnsafeClass pins the classes of character
+// escapeUntrusted promises to escape, with the exact escaped form and the
+// property that matters: every byte that comes out is printable ASCII, so
+// nothing in it can forge a line or drive a terminal. The classes are the ones a
+// narrower implementation lets through: 8-bit C1 controls that some terminals
+// honour, line and paragraph separators, bidi overrides, invalid UTF-8, and
+// printable non-ASCII such as a Cyrillic look-alike of a hex digit. Those
+// inputs, and the expected numeric escapes (formatted with fmt.Sprintf), are
+// built from code points and bytes so this file never itself contains the
+// characters under test; the newline, carriage-return, backslash and
+// double-quote rows use ordinary escape sequences. This is a sample of classes;
+// TestEscapeUntrusted_SweepsEveryCodePoint covers the whole range.
 func TestEscapeUntrusted_EscapesEveryUnsafeClass(t *testing.T) {
 	around := func(mid string) string { return "a" + mid + "b" }
 	esc := func(kind string, width, v int) string {
@@ -207,6 +220,42 @@ func TestEscapeUntrusted_EscapesEveryUnsafeClass(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+// TestEscapeUntrusted_SweepsEveryCodePoint backs the class table above with a
+// sweep instead of a sample. For every Unicode code point (surrogates aside,
+// which cannot occur in valid UTF-8) and every lone byte 0x80-0xff, the output
+// is printable ASCII only. For every C0 and C1 control, DEL and NUL included,
+// the escaped form also reads back as exactly its input, so two different ids
+// can never render as the same line and no control character is left for a
+// terminal to act on.
+func TestEscapeUntrusted_SweepsEveryCodePoint(t *testing.T) {
+	const maxRune = 0x10FFFF
+	printable := func(t *testing.T, in, got string) {
+		t.Helper()
+		for i := 0; i < len(got); i++ {
+			if c := got[i]; c < 0x20 || c > 0x7e {
+				t.Fatalf("escapeUntrusted(%q) = %q contains the non-printable-ASCII byte %#x at offset %d", in, got, c, i)
+			}
+		}
+	}
+	for r := rune(0); r <= maxRune; r++ {
+		if r >= 0xD800 && r <= 0xDFFF {
+			continue
+		}
+		in := "a" + string(r) + "b"
+		got := escapeUntrusted(in)
+		printable(t, in, got)
+		if r < 0x20 || (r >= 0x7f && r <= 0x9f) {
+			if back, err := strconv.Unquote(`"` + got + `"`); err != nil || back != in {
+				t.Errorf("escapeUntrusted(%q) = %q does not read back as its input: Unquote gave %q, %v", in, got, back, err)
+			}
+		}
+	}
+	for b := 0x80; b <= 0xff; b++ {
+		in := "a" + string([]byte{byte(b)}) + "b"
+		printable(t, in, escapeUntrusted(in))
 	}
 }
 
