@@ -1260,9 +1260,12 @@ func TestVerifyLog_OtherClaimedKeyIDs_IgnoresEmptyKeyIDs(t *testing.T) {
 
 // TestVerifyLog_OtherClaimedKeyIDs_SortedDeduplicatedAndExcludesSuppliedKey pins
 // the field's shape across both sources at once. Claims are deliberately out of
-// order and repeated — "ffff" by two entries, "bbbb" by an entry and by a
-// checkpoint, "dddd" by a checkpoint alone — and one entry claims the supplied
-// key itself, which is never "other".
+// order and repeated — "eeee" by two entries, "bbbb" by an entry and by a
+// checkpoint — and one entry claims the supplied key itself, which is never
+// "other". There are six distinct claims because the field is built from a map
+// and Go randomizes map iteration: with only three, an implementation that
+// forgot to sort would still pass this test one run in six; with six, one in
+// 720.
 func TestVerifyLog_OtherClaimedKeyIDs_SortedDeduplicatedAndExcludesSuppliedKey(t *testing.T) {
 	dir := t.TempDir()
 	logPath := filepath.Join(dir, "audit.jsonl")
@@ -1275,10 +1278,11 @@ func TestVerifyLog_OtherClaimedKeyIDs_SortedDeduplicatedAndExcludesSuppliedKey(t
 	signer := sign.NewEd25519Signer(priv)
 
 	writeLogEntries(t, logPath, []chain.LogEntry{
-		makeClaimedEntry(t, signer, "01010101010101010101010101010101", "ffff"),
+		makeClaimedEntry(t, signer, "01010101010101010101010101010101", "eeee"),
 		makeClaimedEntry(t, signer, "02020202020202020202020202020202", "bbbb"),
-		makeClaimedEntry(t, signer, "03030303030303030303030303030303", "ffff"),
+		makeClaimedEntry(t, signer, "03030303030303030303030303030303", "eeee"),
 		makeClaimedEntry(t, signer, "04040404040404040404040404040404", keyIDOf(pub)),
+		makeClaimedEntry(t, signer, "05050505050505050505050505050505", "aaaa"),
 	})
 
 	acc := chain.NewAccumulator(signer, 0, chain.ZeroPrevCheckpointHash)
@@ -1287,16 +1291,19 @@ func TestVerifyLog_OtherClaimedKeyIDs_SortedDeduplicatedAndExcludesSuppliedKey(t
 	if err != nil {
 		t.Fatalf("build checkpoint: %v", err)
 	}
-	cpB, cpD := cp, cp
-	cpB.KeyID = "bbbb"
-	cpD.KeyID = "dddd"
-	writeCheckpoints(t, checkpointPath, cpB, cpD)
+	var cps []chain.Checkpoint
+	for _, claimed := range []string{"bbbb", "dddd", "ffff", "cccc"} {
+		c := cp
+		c.KeyID = claimed
+		cps = append(cps, c)
+	}
+	writeCheckpoints(t, checkpointPath, cps...)
 
 	report, err := verify.VerifyLog(logPath, checkpointPath, pub)
 	if err != nil {
 		t.Fatalf("VerifyLog: %v", err)
 	}
-	want := []string{"bbbb", "dddd", "ffff"}
+	want := []string{"aaaa", "bbbb", "cccc", "dddd", "eeee", "ffff"}
 	if !slices.Equal(report.OtherClaimedKeyIDs, want) {
 		t.Errorf("OtherClaimedKeyIDs = %q, want %q (sorted, de-duplicated, without the supplied key %s)",
 			report.OtherClaimedKeyIDs, want, keyIDOf(pub))
