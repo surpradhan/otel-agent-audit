@@ -136,7 +136,8 @@ other epoch's key; the `Note:` block after it lists the `key_id` the log claims
 besides the supplied key's. It is a hint, not a finding: it never changes the
 `Status:` line or the exit code, and it is built from claims (see
 [Multi-epoch logs](#multi-epoch-logs)). The listed values are untrusted text,
-so the Note prints them escaped:
+so the Note prints each one quoted and escaped, lists at most 10 of them, and
+shows at most 128 bytes of each (`-json` lists every id in full):
 
 ```
 Traces processed:      2
@@ -144,9 +145,10 @@ Checkpoints processed: 2
 Status: FAILED (1 error(s))
   [checkpoint] checkpoint (fatal): seq 2: checkpoint: signature verification failed
 Note: the log claims 1 key_id(s) other than the supplied key's:
-  977c6b977ce1d7a2065ecbe9b4be7aad72b052f9d989f808419fc611e2756c22
+  "977c6b977ce1d7a2065ecbe9b4be7aad72b052f9d989f808419fc611e2756c22"
   These are unverified claims: an entry's key_id sits outside its signature, and a checkpoint that failed verification against the supplied key is only a claim too.
   This does not explain or excuse the findings above. Only if you know a key rotation happened, verify again with the other epoch's key (obtained independently of this log) against the same full, unsplit files.
+  Each such run still reports the other epoch's entries and checkpoints as failures; a single run that reconciles both epochs is not implemented yet.
   Informational only: this never affects Status or the exit code. See "Multi-epoch logs" in docs/verification.md.
 ```
 
@@ -183,12 +185,13 @@ this run was not given — a key rotation, or the wrong key — or that a `key_i
 field was edited, and is deliberately not a finding: it is never added to
 `Errors`, and it never affects `Severity`, the `Status:` line, or the exit
 code. The same caution applies to what it is built from: the values are
-untrusted text (the CLI escapes them in its `Note:` block), an entry's `key_id`
-is unauthenticated, and a checkpoint that did not verify against the supplied
-key is only a claim too (see [Key-id verification](#key-id-verification)) — so
-an absent hint does not show that a log is single-epoch. The field is
-provisional: issue #19's rotation-aware verification may supersede or reshape
-it. The same rotated log as in the human-readable example above:
+untrusted text (the CLI's `Note:` block quotes, escapes and bounds them), an
+entry's `key_id` is unauthenticated, and a checkpoint that did not verify
+against the supplied key is only a claim too (see [Key-id
+verification](#key-id-verification)) — so an absent hint does not show that a
+log is single-epoch. The field is provisional: issue #19's rotation-aware
+verification may supersede or reshape it. The same rotated log as in the
+human-readable example above:
 
 ```json
 {
@@ -302,9 +305,12 @@ key regardless of what it claims to be signed by:
 
 - Entries and checkpoints from the epoch matching your key verify normally.
 - Entries and checkpoints from a *different* epoch produce ordinary `chain` /
-  `checkpoint` signature-failure errors. That is expected — it means "not
-  signed by this key," not additional tampering. Run the verifier again with
-  the other epoch's key for a clean report on that half.
+  `checkpoint` signature-failure errors. When you know the log spans a
+  rotation, that is expected — it means "not signed by this key," not
+  additional tampering. Run the verifier again with the other epoch's key to
+  verify that epoch's half; that run in turn reports the first epoch's entries
+  and checkpoints as failures, because no single run reconciles both epochs yet
+  (issue #19).
 - The checkpoint cross-checks (`entry_count_mismatch`, `tip_hash_mismatch`)
   still run for **every** checkpoint's `trace_tips`, including checkpoints
   whose own signature didn't verify against your key. This is what catches a
