@@ -136,9 +136,7 @@ other epoch's key; the `Note:` block after it lists the `key_id` the log claims
 besides the supplied key's. It is a hint, not a finding: it never changes the
 `Status:` line or the exit code, and it is built from claims (see
 [Multi-epoch logs](#multi-epoch-logs)). The listed values are untrusted text,
-so the Note prints them escaped. When nothing failed (an edited entry `key_id`
-on an otherwise valid log, say) the Note drops the advice to try another key
-and says the hint concerns `key_id` metadata only:
+so the Note prints them escaped:
 
 ```
 Traces processed:      2
@@ -151,6 +149,10 @@ Note: the log claims 1 key_id(s) other than the supplied key's:
   This does not explain or excuse the findings above. Only if you know a key rotation happened, verify again with the other epoch's key (obtained independently of this log) against the same full, unsplit files.
   Informational only: this never affects Status or the exit code. See "Multi-epoch logs" in docs/verification.md.
 ```
+
+When nothing failed (an edited entry `key_id` on an otherwise valid log, say)
+the Note drops the advice to try another key and says the hint concerns
+`key_id` metadata only.
 
 ## JSON output (`-json`)
 

@@ -1419,6 +1419,61 @@ func TestVerifyLog_OtherClaimedKeyIDs_ReadsClaimsFromDuplicateSegments(t *testin
 	}
 }
 
+// TestVerifyLog_OtherClaimedKeyIDs_IgnoresATornTrailingLine: a torn final line
+// is unparsed evidence, not an entry, so whatever key_id text it happens to
+// contain is not a claim. Only what the parser actually read counts — for the
+// audit log (reported as torn_trailing_line) and for the checkpoint file
+// (silently dropped) alike.
+func TestVerifyLog_OtherClaimedKeyIDs_IgnoresATornTrailingLine(t *testing.T) {
+	appendTornLine := func(t *testing.T, path, torn string) {
+		t.Helper()
+		f, err := os.OpenFile(path, os.O_APPEND|os.O_WRONLY, 0o600)
+		if err != nil {
+			t.Fatalf("open %s for append: %v", path, err)
+		}
+		_, _ = f.WriteString(torn + "\n")
+		_ = f.Close()
+	}
+
+	t.Run("audit log", func(t *testing.T) {
+		logPath, checkpointPath, pub := makeVerifyFixture(t)
+		appendTornLine(t, logPath, `{"record":{"trace_id":"broken"},"signed":{"key_id":"torn-log-claim"`)
+
+		report, err := verify.VerifyLog(logPath, checkpointPath, pub)
+		if err != nil {
+			t.Fatalf("VerifyLog: %v", err)
+		}
+		var sawTornTail bool
+		for _, e := range report.Errors {
+			if e.Kind == verify.KindTornTrailingLine {
+				sawTornTail = true
+			}
+		}
+		if !sawTornTail {
+			t.Fatalf("fixture is wrong: expected a torn_trailing_line finding; got %+v", report.Errors)
+		}
+		if len(report.OtherClaimedKeyIDs) != 0 {
+			t.Errorf("OtherClaimedKeyIDs = %q, want empty: a torn line is not a claim", report.OtherClaimedKeyIDs)
+		}
+	})
+
+	t.Run("checkpoint file", func(t *testing.T) {
+		logPath, checkpointPath, pub := makeVerifyFixture(t)
+		appendTornLine(t, checkpointPath, `{"key_id":"torn-checkpoint-claim"`)
+
+		report, err := verify.VerifyLog(logPath, checkpointPath, pub)
+		if err != nil {
+			t.Fatalf("VerifyLog: %v", err)
+		}
+		if report.CheckpointsProcessed != 1 {
+			t.Fatalf("fixture is wrong: CheckpointsProcessed = %d, want 1 (the torn line must have been dropped)", report.CheckpointsProcessed)
+		}
+		if len(report.OtherClaimedKeyIDs) != 0 {
+			t.Errorf("OtherClaimedKeyIDs = %q, want empty: a torn line is not a claim", report.OtherClaimedKeyIDs)
+		}
+	})
+}
+
 // TestVerifyLog_HappyPath_V3Log is the current-format counterpart of the legacy
 // test below: a log written at record.SchemaVersion must carry decimal-string
 // timestamps on disk — the whole point of v3 — and verify cleanly.

@@ -278,11 +278,12 @@ func VerifyCheckpoint(cp chain.Checkpoint, prevSignPayloadHash string, pubKey ed
 //     does not try to tell those causes apart using a single candidate key.
 //     Report.OtherClaimedKeyIDs is a non-gating hint alongside them: the
 //     key_id values the log claims other than the supplied key's, taken as-is
-//     (see that field), never affecting Errors or the verdict. For the full
-//     picture, compare claimed key_id values by hand (see docs/verification.md
-//     "Multi-epoch logs") — always against the full, unsplit log and
-//     checkpoint files, since filtering by key_id can exclude the very
-//     checkpoint that covers a rotation-boundary trace (issue #35).
+//     (see that field; an empty list does not show the log is single-epoch),
+//     never affecting Errors or the verdict. For the full picture, compare
+//     claimed key_id values by hand (see docs/verification.md "Multi-epoch
+//     logs") — always against the full, unsplit log and checkpoint files,
+//     since filtering by key_id can exclude the very checkpoint that covers a
+//     rotation-boundary trace (issue #35).
 //
 // Policy for traces not covered by any checkpoint: counted in TracesProcessed
 // but not reported as errors (they are "unchecked-by-checkpoint"). Rationale:

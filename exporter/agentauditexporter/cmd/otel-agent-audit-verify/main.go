@@ -135,7 +135,7 @@ func formatReport(report verify.Report) string {
 		if report.FatalCount() > 0 {
 			fmt.Fprintln(&b, "  This does not explain or excuse the findings above. Only if you know a key rotation happened, verify again with the other epoch's key (obtained independently of this log) against the same full, unsplit files.")
 		} else {
-			fmt.Fprintln(&b, "  Everything that could be read verified against the supplied key, so this concerns key_id metadata only.")
+			fmt.Fprintln(&b, "  All entries and checkpoints that could be read verified against the supplied key; these claims concern key_id metadata only.")
 		}
 		fmt.Fprintln(&b, "  Informational only: this never affects Status or the exit code. See \"Multi-epoch logs\" in docs/verification.md.")
 	}
@@ -143,9 +143,10 @@ func formatReport(report verify.Report) string {
 }
 
 // escapeUntrusted renders s with control and non-ASCII characters escaped in
-// Go string-literal style (enclosing quotes dropped), so text read from the
-// log cannot forge output lines or drive the terminal. A key_id in its normal
-// form, 64 lowercase hex characters, comes out unchanged.
+// Go string-literal style (enclosing quotes dropped; a backslash or double
+// quote is escaped too), so text read from the log cannot forge output lines
+// or drive the terminal. A key_id in its normal form, 64 lowercase hex
+// characters, comes out unchanged.
 func escapeUntrusted(s string) string {
 	q := strconv.QuoteToASCII(s)
 	return q[1 : len(q)-1]

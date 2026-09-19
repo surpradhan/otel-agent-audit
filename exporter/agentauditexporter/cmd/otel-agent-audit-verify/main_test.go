@@ -3,6 +3,7 @@ package main
 import (
 	"encoding/hex"
 	"encoding/json"
+	"fmt"
 	"io"
 	"os"
 	"path/filepath"
@@ -107,7 +108,7 @@ func TestFormatReport_NoteWithoutFatalFindings(t *testing.T) {
 	if !strings.Contains(got, "key_id metadata only") {
 		t.Errorf("with nothing failed the Note should say this concerns metadata only; got:\n%s", got)
 	}
-	for _, phrase := range []string{"key rotation", "verify again", "explain or excuse"} {
+	for _, phrase := range []string{"rotation", "wrong key", "verify again", "explain or excuse"} {
 		if strings.Contains(got, phrase) {
 			t.Errorf("with nothing failed the Note must not mention %q; got:\n%s", phrase, got)
 		}
@@ -157,6 +158,55 @@ func TestEscapeUntrusted_LeavesNormalKeyIDsUnchanged(t *testing.T) {
 	id := strings.Repeat("0123456789abcdef", 4)
 	if got := escapeUntrusted(id); got != id {
 		t.Errorf("escapeUntrusted(%q) = %q, want it unchanged", id, got)
+	}
+}
+
+// TestEscapeUntrusted_EscapesEveryUnsafeClass pins each class of character
+// escapeUntrusted promises to escape, one row per class, with the exact escaped
+// form and the property that matters: every byte that comes out is printable
+// ASCII, so nothing in it can forge a line or drive a terminal. The classes are
+// the ones a narrower implementation lets through: 8-bit C1 controls that some
+// terminals honour, line and paragraph separators, bidi overrides, invalid
+// UTF-8, and printable non-ASCII such as a Cyrillic look-alike of a hex digit.
+// Inputs and expectations are built from code points and bytes rather than
+// written as escape sequences, so this file never itself contains the
+// characters under test.
+func TestEscapeUntrusted_EscapesEveryUnsafeClass(t *testing.T) {
+	around := func(mid string) string { return "a" + mid + "b" }
+	esc := func(kind string, width, v int) string {
+		return "a" + fmt.Sprintf("\\%s%0*x", kind, width, v) + "b"
+	}
+	tests := []struct {
+		name string
+		in   string
+		want string
+	}{
+		{"newline", around(string(rune(0x0a))), "a\\nb"},
+		{"carriage return", around(string(rune(0x0d))), "a\\rb"},
+		{"NUL", around(string(rune(0x00))), esc("x", 2, 0x00)},
+		{"DEL", around(string(rune(0x7f))), esc("x", 2, 0x7f)},
+		{"C1 control CSI (U+009B)", around(string(rune(0x9b))), esc("u", 4, 0x9b)},
+		{"line separator (U+2028)", around(string(rune(0x2028))), esc("u", 4, 0x2028)},
+		{"paragraph separator (U+2029)", around(string(rune(0x2029))), esc("u", 4, 0x2029)},
+		{"bidi override (U+202E)", around(string(rune(0x202e))), esc("u", 4, 0x202e)},
+		{"invalid UTF-8 byte", around(string([]byte{0xff})), esc("x", 2, 0xff)},
+		{"Cyrillic look-alike of a hex digit (U+0430)", around(string(rune(0x430))), esc("u", 4, 0x430)},
+		{"non-BMP character (U+1F600)", around(string(rune(0x1f600))), esc("U", 8, 0x1f600)},
+		{"backslash", around("\\"), "a\\\\b"},
+		{"double quote", around("\""), "a\\\"b"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := escapeUntrusted(tt.in)
+			if got != tt.want {
+				t.Errorf("escapeUntrusted(%q) = %q, want %q", tt.in, got, tt.want)
+			}
+			for i := 0; i < len(got); i++ {
+				if c := got[i]; c < 0x20 || c > 0x7e {
+					t.Errorf("escapeUntrusted(%q) = %q contains the non-printable-ASCII byte %#x at offset %d", tt.in, got, c, i)
+				}
+			}
+		})
 	}
 }
 
@@ -262,6 +312,15 @@ func readEntry(t *testing.T, logPath string) chain.LogEntry {
 	return e
 }
 
+// setEntryKeyID rewrites the single entry in logPath to claim keyID. An entry's
+// key_id sits outside what it signs, so the entry still verifies.
+func setEntryKeyID(t *testing.T, logPath, keyID string) {
+	t.Helper()
+	e := readEntry(t, logPath)
+	e.Signed.KeyID = keyID
+	writeJSONLine(t, logPath, e)
+}
+
 // TestRun_OtherClaimedKeyIDs drives the real CLI entry point end to end. The
 // property that matters most about the hint, that it never changes the exit
 // code, is implemented in run, not in formatReport, so only a test of run can
@@ -281,9 +340,7 @@ func TestRun_OtherClaimedKeyIDs(t *testing.T) {
 
 	t.Run("hint only (edited entry key_id): still exit 0 and Status: OK", func(t *testing.T) {
 		logPath, cpPath, pubHex := writeSingleKeyFixture(t)
-		e := readEntry(t, logPath)
-		e.Signed.KeyID = "bogus-key-id"
-		writeJSONLine(t, logPath, e)
+		setEntryKeyID(t, logPath, "bogus-key-id")
 
 		out, code := runCLI(t, "-key", pubHex, logPath, cpPath)
 		if code != 0 {
@@ -335,10 +392,30 @@ func TestRun_OtherClaimedKeyIDs(t *testing.T) {
 		}
 		var got []string
 		if err := json.Unmarshal(fields["OtherClaimedKeyIDs"], &got); err != nil {
-			t.Fatalf(`JSON key "OtherClaimedKeyIDs" is missing or not an array of strings: %v; output:\n%s`, err, out)
+			t.Fatalf("JSON key \"OtherClaimedKeyIDs\" is missing or not an array of strings: %v; output:\n%s", err, out)
 		}
 		if want := []string{realKeyID}; !slices.Equal(got, want) {
-			t.Errorf(`JSON key "OtherClaimedKeyIDs" = %q, want %q; output:\n%s`, got, want, out)
+			t.Errorf("JSON key \"OtherClaimedKeyIDs\" = %q, want %q; output:\n%s", got, want, out)
+		}
+	})
+
+	t.Run("-json with a hint but no fatal finding: exit 0 and the hint is still reported", func(t *testing.T) {
+		logPath, cpPath, pubHex := writeSingleKeyFixture(t)
+		setEntryKeyID(t, logPath, "bogus-key-id")
+
+		out, code := runCLI(t, "-json", "-key", pubHex, logPath, cpPath)
+		if code != 0 {
+			t.Errorf("exit code = %d, want 0: a hint alone must not fail verification in -json mode either; output:\n%s", code, out)
+		}
+		var report verify.Report
+		if err := json.Unmarshal([]byte(out), &report); err != nil {
+			t.Fatalf("output is not a JSON report: %v\n%s", err, out)
+		}
+		if want := []string{"bogus-key-id"}; !slices.Equal(report.OtherClaimedKeyIDs, want) {
+			t.Errorf("OtherClaimedKeyIDs = %q, want %q; output:\n%s", report.OtherClaimedKeyIDs, want, out)
+		}
+		if len(report.Errors) != 1 || report.Errors[0].Kind != "key_id_field_mismatch" {
+			t.Errorf("want exactly the advisory key_id_field_mismatch and nothing else; got %+v", report.Errors)
 		}
 	})
 }
