@@ -189,6 +189,7 @@ OCB resolves them straight from the Go module proxy.
 | [docs/verification.md](docs/verification.md) | Verifier CLI reference, key distribution, exit codes |
 | [docs/audit-record-schema.md](docs/audit-record-schema.md) | Versioned record schema, field-by-field; entry construction protocol |
 | [docs/guardrail-mapping.md](docs/guardrail-mapping.md) | How policy/guardrail spans map to audit records |
+| [docs/otel-canonical-profile-comparison.md](docs/otel-canonical-profile-comparison.md) | This repo's serialization run against `otel-span/canonical/1`: what agrees, what differs, where either side is weaker |
 
 ---
 

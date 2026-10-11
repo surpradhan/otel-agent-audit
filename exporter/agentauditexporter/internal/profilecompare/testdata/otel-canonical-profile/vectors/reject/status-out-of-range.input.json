@@ -1,0 +1,13 @@
+{
+ "attributes": [],
+ "span": {
+  "end_time_unix_nano": "1754300000123456789",
+  "kind": 0,
+  "name": "x",
+  "parent_span_id": "",
+  "span_id": "b7ad6b7169203331",
+  "start_time_unix_nano": "1754300000000000000",
+  "status_code": 3,
+  "trace_id": "0af7651916cd43dd8448eb211c80319c"
+ }
+}
