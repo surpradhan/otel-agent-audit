@@ -1,0 +1,74 @@
+{
+ "_profile": "otel-span/canonical/1",
+ "batch": {
+  "batch_root_sha256": "674aaa14f390189d289d6ded88a03151c7880e42da4f475910eb2b0fef01546f",
+  "members": [
+   "minimal",
+   "basic-attrs",
+   "status-error"
+  ]
+ },
+ "pass": {
+  "basic-attrs": {
+   "attributes_sha256": "4dc5c4d0acb4725b905bafd0d8736f34b8e007cb170bdd980766ced40c8f05f0",
+   "span_sha256": "f9f83d0baf7cdce210a1943fdd5f6881b8d6aed3d97ded838e4f900ae02d82cf"
+  },
+  "bytes-attr": {
+   "attributes_sha256": "e0934f7272ac523c2da239ae008859975cff1c0a3ea39a83cb39d1e3787ab27c",
+   "span_sha256": "ae8190b3d9c6e8f74c14ba43406df967d2b111d12fcdfb0184bfa9e7f1282ae4"
+  },
+  "double-forms": {
+   "attributes_sha256": "8cb54d135ac05060e0000d8bc20d5d1cd7126504542064f914af49796c506ee1",
+   "span_sha256": "e8e8a08c1aa215d84fda4ccb36b065c359d3b4f41aeadb2034a3bffb2bbfa571"
+  },
+  "int64-boundary": {
+   "attributes_sha256": "2d25c26d776753a5b9f98b76e667624452d401f2ca3f024b4021a28cb63683b7",
+   "span_sha256": "b01ede5ad10d936e543b8ed65fd50fca8de7b6aeaa7ec79859116229d275e944"
+  },
+  "minimal": {
+   "attributes_sha256": "44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a",
+   "span_sha256": "81d96745dfebfb00594c190fc5d3c10da2427b2738c93cf4bb001dd5f44d5903"
+  },
+  "nested": {
+   "attributes_sha256": "5d6e0d4e390e001cbca109217ae723cfc6f1256f282bf2daabe02a7e53d83971",
+   "span_sha256": "4d19c220b8eb1806da18e02ab121ca4a7a63684923f6baaa277de818afb99e52"
+  },
+  "status-error": {
+   "attributes_sha256": "9ad6b3be00c14b75b7c393bacdeacc22eb8e6e58f657ad76368af01b861d19cc",
+   "span_sha256": "704e7112bf2b61eb82efe2f7dad67d8bba6c0d6195aa2cd1a287022e3ea8141e"
+  },
+  "unicode-sort": {
+   "attributes_sha256": "7d0e0a0f036b1def8df2769f6437c71c8d8a4c60a5b334c38733637b4be0288f",
+   "span_sha256": "4c2386f6aab04c76648b8578bc332fa0e5adfdff29a5e926f82f95c483847556"
+  }
+ },
+ "reject": {
+  "duplicate-attr-key": {
+   "reject_code": "DUPLICATE_ATTRIBUTE_KEY"
+  },
+  "empty-batch": {
+   "reject_code": "EMPTY_BATCH"
+  },
+  "int-overflow": {
+   "reject_code": "INT_OUT_OF_RANGE"
+  },
+  "kind-out-of-range": {
+   "reject_code": "KIND_OUT_OF_RANGE"
+  },
+  "short-span-id": {
+   "reject_code": "ID_BAD_LENGTH"
+  },
+  "status-out-of-range": {
+   "reject_code": "STATUS_OUT_OF_RANGE"
+  },
+  "timestamp-leading-zero": {
+   "reject_code": "TIMESTAMP_NOT_DECIMAL"
+  },
+  "timestamp-number": {
+   "reject_code": "TIMESTAMP_NOT_STRING"
+  },
+  "uppercase-hex": {
+   "reject_code": "ID_NOT_LOWERCASE_HEX"
+  }
+ }
+}

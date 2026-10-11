@@ -3,6 +3,7 @@ module github.com/surpradhan/otel-agent-audit/exporter/agentauditexporter
 go 1.25.0
 
 require (
+	github.com/gowebpki/jcs v1.0.1
 	go.opentelemetry.io/collector/component v1.60.0
 	go.opentelemetry.io/collector/consumer v1.60.0
 	go.opentelemetry.io/collector/exporter v1.60.0

@@ -1,0 +1,1 @@
+{"attributes_sha256":"9ad6b3be00c14b75b7c393bacdeacc22eb8e6e58f657ad76368af01b861d19cc","end_time_unix_nano":"1754300000123456789","kind":2,"name":"tool.execute","parent_span_id":"b7ad6b7169203331","span_id":"4444444444444444","start_time_unix_nano":"1754300000000000000","status_code":2,"trace_id":"0af7651916cd43dd8448eb211c80319c"}
