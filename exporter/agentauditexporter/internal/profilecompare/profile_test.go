@@ -30,7 +30,8 @@ package profilecompare
 //   - a missing parent_span_id means no parent, an explicit null does not;
 //   - a double literal that overflows (1e999) is NONFINITE_DOUBLE;
 //   - a kvlist is accepted as an object (SPEC.md) or as a list of pairs (the
-//     reject inputs).
+//     reject inputs), and so is the top-level attribute collection, where
+//     canonical.py takes a list only.
 //
 // Departures from canonical.py, all toward SPEC.md or stricter:
 //

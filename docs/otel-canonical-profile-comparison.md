@@ -16,8 +16,7 @@ what differs on purpose, and where either side is the weaker one.
 
 Every claim below is tagged **run** (a test in that package exercises it) or
 **read** (taken from reading the profile's reference code, `canonical.py` and
-`validate.mjs`; those two validators were deliberately not executed, and their
-files were read as data only).
+`validate.mjs`, which were read as data only and deliberately not executed).
 
 ## Result
 
