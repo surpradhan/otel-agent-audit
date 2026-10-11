@@ -513,3 +513,13 @@ func TestProfileEdge_DecodeOrderedRejectsTrailingData(t *testing.T) {
 		t.Errorf("surrounding whitespace should be fine: %v", err)
 	}
 }
+
+// Both references load JSON last-wins, so a repeated parent_span_id member is
+// decided by its last occurrence. The parent id has its own lookup in
+// canonicalSpan, separate from the shared field helper, so it is pinned here too.
+func TestProfileEdge_RepeatedParentSpanIDMemberIsLastWins(t *testing.T) {
+	badThenEmpty := append(spanWithMany(t, "parent_span_id", `"zz"`), kvp{"parent_span_id", ""})
+	mustHash(t, badThenEmpty, `{}`)
+	emptyThenBad := append(spanWithMany(t, "parent_span_id", `""`), kvp{"parent_span_id", "zz"})
+	wantReject(t, emptyThenBad, `{}`, "ID_BAD_LENGTH")
+}

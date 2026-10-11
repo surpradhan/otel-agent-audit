@@ -346,7 +346,7 @@ func checkTimestamp(v any) (string, error) {
 	return s, nil
 }
 
-// checkSmallInt accepts a JSON integer literal in [0, max].
+// checkSmallInt accepts a JSON integer literal in [0, hi].
 func checkSmallInt(v any, hi int64, code string) (int64, error) {
 	n, ok := v.(json.Number)
 	if !ok {
