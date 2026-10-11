@@ -10,9 +10,26 @@ package profilecompare
 // exporter to use, and nothing in internal/record or internal/canonical is
 // touched.
 //
-// Where SPEC.md is silent and the reference canonical.py decides, the
-// reference's behaviour is mirrored and the choice is called out, so a vector
-// that passes here passes for the reason the profile intends.
+// Where SPEC.md is silent this follows canonical.py, the Python reference, and
+// marks the choice at the line that makes it. "The reference" below always means
+// canonical.py: the Node reference (validate.mjs) differs from it in places
+// (check order, a null parent_span_id, a boolean timestamp), see the comparison
+// doc. Choices that come from canonical.py, not SPEC.md:
+//
+//   - the order the checks run in;
+//   - kind and status_code must be integer literals in range, so a bool, a
+//     float or a string is "out of range";
+//   - a repeated member in the span core is last-wins;
+//   - a missing parent_span_id means no parent, an explicit null does not;
+//   - a double literal that overflows (1e999) is NONFINITE_DOUBLE;
+//   - a kvlist is accepted as an object (SPEC.md) or as a list of pairs (the
+//     reject inputs).
+//
+// Two deliberate departures from canonical.py, both toward SPEC.md or stricter:
+// base64 content is validated (including line breaks and trailing bits), and a
+// wrapper object with a repeated tag is BAD_WRAPPER where both references would
+// load it last-wins. Names are hashed after encoding/json has decoded them, so
+// invalid UTF-8 or a lone surrogate arrives as U+FFFD, not "as given".
 
 import (
 	"bytes"
@@ -127,25 +144,18 @@ func readValue(dec *json.Decoder) (any, error) {
 }
 
 var (
-	hexRE = regexp.MustCompile(`^[0-9a-f]+$`)
-	decRE = regexp.MustCompile(`^(0|[1-9][0-9]*)$`)
-	intRE = regexp.MustCompile(`^-?(0|[1-9][0-9]*)$`)
-	// jsonIntRE matches a JSON number token that is an integer literal: no
-	// fraction, no exponent. "2.0" and "2e0" are floats to the reference.
-	jsonIntRE = regexp.MustCompile(`^-?[0-9]+$`)
-
+	hexRE    = regexp.MustCompile(`^[0-9a-f]+$`)
+	decRE    = regexp.MustCompile(`^(0|[1-9][0-9]*)$`)
+	intRE    = regexp.MustCompile(`^-?(0|[1-9][0-9]*)$`)
 	int64Min = new(big.Int).Neg(new(big.Int).Lsh(big.NewInt(1), 63))
 	int64Max = new(big.Int).Sub(new(big.Int).Lsh(big.NewInt(1), 63), big.NewInt(1))
 )
 
-// jstr encodes s as a JSON string without HTML escaping. jcs.Transform
-// re-serializes it, so this only has to be valid JSON.
+// jstr encodes s as a JSON string. jcs.Transform re-serializes it, so this only
+// has to be valid JSON.
 func jstr(s string) string {
-	var b bytes.Buffer
-	enc := json.NewEncoder(&b)
-	enc.SetEscapeHTML(false)
-	_ = enc.Encode(s)
-	return string(bytes.TrimRight(b.Bytes(), "\n"))
+	b, _ := json.Marshal(s) // cannot fail for a string
+	return string(b)
 }
 
 // attrObject validates pairs (SPEC.md section 3) and returns the attribute
@@ -319,13 +329,16 @@ func checkTimestamp(v any) (string, error) {
 }
 
 // checkSmallInt accepts a JSON integer literal in [0, max].
-func checkSmallInt(v any, max int64, code string) (int64, error) {
+func checkSmallInt(v any, hi int64, code string) (int64, error) {
 	n, ok := v.(json.Number)
-	if !ok || !jsonIntRE.MatchString(string(n)) {
+	if !ok {
 		return 0, reject(code)
 	}
+	// ParseInt accepts only an integer literal, so 2.0 and 2e0 are refused here as
+	// the reference refuses them (a float is not an int), and a bool or string
+	// never reaches this far.
 	i, err := strconv.ParseInt(string(n), 10, 64)
-	if err != nil || i < 0 || i > max {
+	if err != nil || i < 0 || i > hi {
 		return 0, reject(code)
 	}
 	return i, nil
@@ -345,7 +358,7 @@ type profileSpan struct {
 }
 
 // canonicalSpan builds the profile's canonical object and hash from raw span
-// fields and attributes, checking the rules in the order the reference does:
+// fields and attributes, checking the rules in the order canonical.py does:
 // attributes, kind, status_code, trace_id, span_id, parent_span_id, name,
 // start_time_unix_nano, end_time_unix_nano. SPEC.md does not define that
 // precedence; it only matters for an input with more than one defect, and no
@@ -382,8 +395,11 @@ func canonicalSpan(span obj, attributes any) (profileSpan, error) {
 	if err != nil {
 		return profileSpan{}, err
 	}
-	parent := field("parent_span_id")
-	if parent == nil {
+	// A missing parent_span_id is "no parent". An explicit JSON null is not:
+	// SPEC.md allows only the empty string, and canonical.py rejects null as
+	// ID_BAD_LENGTH (validate.mjs would accept it).
+	parent, hasParent := span.last("parent_span_id")
+	if !hasParent {
 		parent = ""
 	}
 	parentID, err := checkID(parent, 16, true)

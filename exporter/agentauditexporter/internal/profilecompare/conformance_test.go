@@ -5,9 +5,11 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"sort"
+	"strings"
 	"testing"
 
 	"github.com/gowebpki/jcs"
@@ -126,8 +128,8 @@ func TestProfile_PassVectors_Construction(t *testing.T) {
 			if err != nil {
 				t.Fatalf("canonicalSpan: %v", err)
 			}
-			if want := readVector(t, "pass/"+name+".canonical.json"); !bytes.Equal(got.CanonicalBytes, want) {
-				t.Errorf("built bytes differ from shipped:\n got  %s\n want %s", got.CanonicalBytes, want)
+			if shipped := readVector(t, "pass/"+name+".canonical.json"); !bytes.Equal(got.CanonicalBytes, shipped) {
+				t.Errorf("built bytes differ from shipped:\n got  %s\n want %s", got.CanonicalBytes, shipped)
 			}
 			if got.SpanSHA256 != want.SpanSHA256 || got.AttrSHA256 != want.AttributesSHA256 {
 				t.Errorf("hashes: got span=%s attrs=%s, want span=%s attrs=%s",
@@ -189,11 +191,11 @@ func TestProfile_BatchRoot(t *testing.T) {
 	}
 }
 
-// The published batch vector has exactly three members, which cannot tell the
-// RFC 6962 split rule ("largest power of two strictly less than n") from the
-// near miss "less than or equal to": the two agree for every n that is not a
-// power of two, and n == 3 is not one. A mutant that made that change survived
-// the vendored vectors, so these tests cover the sizes they do not.
+// The vendored batch vector has exactly three members, so the vectors only ever
+// exercise subtrees of size 1, 2 and 3. A split rule capped at 2 ("largest power
+// of two strictly less than n, but never more than 2") agrees with RFC 6962 for
+// every one of those, and it survived the vendored vectors when tried as a
+// mutant. These tests cover the larger sizes.
 
 // pairwiseRoot computes the same tree bottom-up: hash adjacent nodes level by
 // level, carrying an unpaired last node up unchanged. For RFC 6962 trees this
@@ -247,5 +249,67 @@ func TestProfile_BatchRoot_SingleSpan(t *testing.T) {
 	want := sha256.Sum256(append([]byte{0x00}, h[:]...))
 	if got != hex.EncodeToString(want[:]) {
 		t.Errorf("single-span root: got %s, want %x", got, want)
+	}
+}
+
+// The vendored vectors are the oracle, so they must be exactly what
+// PROVENANCE.md says they are: every listed file present with the listed sha256,
+// and no other file in the directory. Without this a consistent edit to a vector
+// and its expected.json, or a stray added file, would pass every other test.
+func TestVendoredVectors_MatchProvenance(t *testing.T) {
+	const root = "testdata/otel-canonical-profile"
+	prov, err := os.ReadFile(filepath.Join(root, "PROVENANCE.md"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, block, found := strings.Cut(string(prov), "## sha256 of each file")
+	if !found {
+		t.Fatal("PROVENANCE.md has no sha256 section")
+	}
+	_, block, _ = strings.Cut(block, "```\n")
+	block, _, _ = strings.Cut(block, "```")
+
+	listed := map[string]string{}
+	for _, line := range strings.Split(strings.TrimSpace(block), "\n") {
+		sum, path, ok := strings.Cut(line, "  ")
+		if !ok || len(sum) != 64 {
+			t.Fatalf("malformed PROVENANCE.md line %q", line)
+		}
+		listed[path] = sum
+	}
+	if len(listed) != 27 {
+		t.Fatalf("PROVENANCE.md lists %d files, want 27", len(listed))
+	}
+
+	onDisk := map[string]bool{}
+	err = filepath.WalkDir(root, func(p string, d fs.DirEntry, err error) error {
+		if err != nil || d.IsDir() {
+			return err
+		}
+		rel, _ := filepath.Rel(root, p)
+		if rel == "PROVENANCE.md" {
+			return nil
+		}
+		onDisk[rel] = true
+		b, rerr := os.ReadFile(p)
+		if rerr != nil {
+			return rerr
+		}
+		want, ok := listed[rel]
+		switch {
+		case !ok:
+			t.Errorf("%s is in the directory but not in PROVENANCE.md", rel)
+		case sha256Hex(b) != want:
+			t.Errorf("%s: sha256 %s, PROVENANCE.md says %s", rel, sha256Hex(b), want)
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for path := range listed {
+		if !onDisk[path] {
+			t.Errorf("%s is listed in PROVENANCE.md but missing", path)
+		}
 	}
 }

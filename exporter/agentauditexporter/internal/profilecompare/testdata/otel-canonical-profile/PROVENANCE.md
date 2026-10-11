@@ -3,7 +3,8 @@
 These files are a verbatim copy of the conformance vectors for `otel-span/canonical/1`:
 
 - Source: https://github.com/MarkovianProtocol/otel-canonical-profile
-- Commit: `4f8c4c5` (2026-08-05)
+- Commit: `4f8c4c5a55d3bf79fd402c6c6e49bff9e6afe45d` (2026-08-05)
+- SPEC at that commit (not vendored): https://github.com/MarkovianProtocol/otel-canonical-profile/blob/4f8c4c5a55d3bf79fd402c6c6e49bff9e6afe45d/SPEC.md
 - Licence: Apache-2.0 (`LICENSE` beside this file, unmodified)
 - Copied: 2026-10-11, via the GitHub API at that commit
 - Integrity: every file's git blob hash was checked against the hash GitHub reports for

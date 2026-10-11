@@ -1,9 +1,12 @@
 package profilecompare
 
 import (
+	"encoding/base64"
 	"encoding/json"
 	"strings"
 	"testing"
+
+	"github.com/gowebpki/jcs"
 )
 
 // These tests cover profile behaviour the vendored vectors do not reach. They
@@ -130,7 +133,11 @@ func TestProfileEdge_OverflowingDoubleLiteralIsNonfinite(t *testing.T) {
 	wantReject(t, spanWith(t, "name", `"x"`), `{"a":{"d":-1e999}}`, "NONFINITE_DOUBLE")
 }
 
-// Wrong-typed values are structural defects, not range defects.
+// A wrong-typed attribute value is BAD_WRAPPER. A wrong-typed span field gets the
+// named code of its own rule (kind, status_code, ids, timestamps), as canonical.py
+// does, although SPEC.md section 6 describes BAD_WRAPPER as the catch-all for a
+// span field that is structurally malformed. That ambiguity is recorded in the
+// comparison doc.
 func TestProfileEdge_WrongTypes(t *testing.T) {
 	x := spanWith(t, "name", `"x"`)
 	wantReject(t, x, `{"a":{"d":true}}`, "BAD_WRAPPER")
@@ -192,8 +199,9 @@ func TestProfileEdge_TimestampPastUint64IsAccepted(t *testing.T) {
 }
 
 // With several defects the code reported depends on check order, which SPEC.md
-// does not define. This pins the order used here (the reference's) so a change
-// is deliberate.
+// does not define, and the two references disagree on (canonical.py checks the
+// ids before the name, validate.mjs the name before the ids). This pins
+// canonical.py's order, the one used here, so a change is deliberate.
 func TestProfileEdge_RejectPrecedence(t *testing.T) {
 	bad := spanWith(t, "kind", `9`)
 	bad = append(obj{}, bad...)
@@ -242,3 +250,191 @@ func TestProfileEdge_DuplicateSpanCoreMemberIsLastWins(t *testing.T) {
 
 // json9 is the JSON number 9, as decodeOrdered would produce it.
 func json9() any { return json.Number("9") }
+
+// An empty id, or one of the wrong length in any of the three id fields, is
+// ID_BAD_LENGTH; only parent_span_id may be empty.
+func TestProfileEdge_EmptyAndShortIDs(t *testing.T) {
+	for _, tc := range []struct{ key, val string }{
+		{"trace_id", `""`},
+		{"trace_id", `"0af7"`},
+		{"span_id", `""`},
+		{"span_id", `"b7ad"`},
+		{"parent_span_id", `"b7ad"`},
+		{"parent_span_id", `"b7ad6b71692033311"`},
+	} {
+		t.Run(tc.key+"="+tc.val, func(t *testing.T) {
+			wantReject(t, spanWith(t, tc.key, tc.val), `{}`, "ID_BAD_LENGTH")
+		})
+	}
+	wantReject(t, spanWith(t, "parent_span_id", `"B7AD6B7169203331"`), `{}`, "ID_NOT_LOWERCASE_HEX")
+}
+
+// A missing parent_span_id and an empty one both mean "no parent" and hash alike.
+// An explicit null, or any non-string, is not the empty string. canonical.py
+// rejects it as ID_BAD_LENGTH; validate.mjs would accept null (read, not run).
+func TestProfileEdge_ParentSpanIDMissingNullAndEmpty(t *testing.T) {
+	v, err := decodeOrdered([]byte(baseSpan))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var missing obj
+	for _, m := range v.(obj) {
+		if m.key != "parent_span_id" {
+			missing = append(missing, m)
+		}
+	}
+	empty := mustHash(t, spanWith(t, "parent_span_id", `""`), `{}`)
+	if got := mustHash(t, missing, `{}`); got.SpanSHA256 != empty.SpanSHA256 {
+		t.Errorf("missing parent hashes %s, empty parent %s", got.SpanSHA256, empty.SpanSHA256)
+	}
+	wantReject(t, spanWith(t, "parent_span_id", `null`), `{}`, "ID_BAD_LENGTH")
+	wantReject(t, spanWith(t, "parent_span_id", `7`), `{}`, "ID_BAD_LENGTH")
+}
+
+// A malformed element inside an array wrapper is rejected, not skipped.
+func TestProfileEdge_MalformedArrayElementIsRejected(t *testing.T) {
+	x := spanWith(t, "name", `"x"`)
+	wantReject(t, x, `{"k":{"a":[{"s":"ok"},{"i":"007"}]}}`, "INT_OUT_OF_RANGE")
+	wantReject(t, x, `{"k":{"a":[{"q":1}]}}`, "BAD_WRAPPER")
+	wantReject(t, x, `{"k":{"a":[{"s":"ok"},"plain"]}}`, "BAD_WRAPPER")
+	mustHash(t, x, `{"k":{"a":[{"s":"ok"},{"i":"7"}]}}`)
+}
+
+// A wrapper object that repeats its tag is BAD_WRAPPER here. Both references load
+// JSON last-wins and would accept {"s":"a","s":"b"} as {"s":"b"}; this is a
+// deliberate departure, because two spellings of one wrapper is exactly what a
+// canonical form is meant to remove.
+func TestProfileEdge_WrapperWithRepeatedTagIsRejected(t *testing.T) {
+	wantReject(t, spanWith(t, "name", `"x"`), `{"k":{"s":"a","s":"b"}}`, "BAD_WRAPPER")
+}
+
+// Python's re `$` also matches before a trailing newline, so under canonical.py's
+// regexes "123\n" would pass as a timestamp and 31 hex digits plus "\n" as a
+// 32-character id (read, and confirmed with the same patterns in Python). SPEC.md
+// says "digits only" and "lowercase hex", and Go's `$` is end-of-text only.
+func TestProfileEdge_TrailingNewlineIsNotADigitOrHexCharacter(t *testing.T) {
+	wantReject(t, spanWith(t, "trace_id", `"0af7651916cd43dd8448eb211c80319\n"`), `{}`, "ID_NOT_LOWERCASE_HEX")
+	wantReject(t, spanWith(t, "span_id", `"b7ad6b716920333\n"`), `{}`, "ID_NOT_LOWERCASE_HEX")
+	wantReject(t, spanWith(t, "end_time_unix_nano", `"123\n"`), `{}`, "TIMESTAMP_NOT_DECIMAL")
+	wantReject(t, spanWith(t, "name", `"x"`), `{"k":{"i":"5\n"}}`, "INT_OUT_OF_RANGE")
+}
+
+// The hash is over the string the span carries, and encoding/json replaces
+// invalid UTF-8 and a lone surrogate with U+FFFD while decoding, so a name that
+// is not valid Unicode arrives already replaced. SPEC.md section 2 says "as
+// given". Recorded as a limitation of this implementation, not fixed.
+func TestProfileEdge_InvalidUnicodeNameIsReplacedBeforeHashing(t *testing.T) {
+	lone := mustHash(t, spanWith(t, "name", `"\ud800"`), `{}`)
+	replaced := mustHash(t, spanWith(t, "name", `"�"`), `{}`)
+	if lone.SpanSHA256 != replaced.SpanSHA256 {
+		t.Error("a lone surrogate no longer hashes as U+FFFD: the limitation is gone, update the doc")
+	}
+}
+
+// QQ== and QR== are two spellings of one byte (the second has non-zero trailing
+// bits). A non-strict decoder accepts both and yields the same bytes, while the
+// canonical form hashes the string, so a validator that did not refuse QR== would
+// give one byte value two hashes. canonical.py does not validate base64, so it
+// would hash both (read, not run).
+func TestProfileEdge_NonCanonicalBase64SpellingsDecodeAlikeButHashDifferently(t *testing.T) {
+	a, errA := base64.StdEncoding.DecodeString("QQ==")
+	b, errB := base64.StdEncoding.DecodeString("QR==")
+	if errA != nil || errB != nil || string(a) != string(b) {
+		t.Fatalf("a non-strict decoder should read both as the same byte: %q (%v), %q (%v)", a, errA, b, errB)
+	}
+	ja, err := jcs.Transform([]byte(`{"k":{"y":"QQ=="}}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	jb, err := jcs.Transform([]byte(`{"k":{"y":"QR=="}}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if sha256Hex(ja) == sha256Hex(jb) {
+		t.Error("the two spellings should hash differently")
+	}
+}
+
+// RFC 8785 is what makes attribute order and number spelling irrelevant. Every
+// vendored attrs file is already key-sorted and number-canonical, so building
+// from the shipped bytes cannot show the normalisation working. Here the same
+// attributes arrive in reverse order, and the doubles arrive in non-canonical
+// spellings, and the published hashes must still come out.
+func TestProfileEdge_AttributeInputIsNormalisedByJCS(t *testing.T) {
+	exp := loadExpected(t)
+
+	for _, name := range sortedKeys(exp.Pass) {
+		t.Run("reversed/"+name, func(t *testing.T) {
+			attrs, err := decodeOrdered(readVector(t, "pass/"+name+".attrs.json"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			span, err := decodeOrdered(readVector(t, "pass/"+name+".canonical.json"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			in := attrs.(obj)
+			rev := make(obj, len(in))
+			for i, m := range in {
+				rev[len(in)-1-i] = m
+			}
+			got, err := canonicalSpan(span.(obj), rev)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got.AttrSHA256 != exp.Pass[name].AttributesSHA256 || got.SpanSHA256 != exp.Pass[name].SpanSHA256 {
+				t.Errorf("reversed attribute order changed the hash: attrs %s span %s", got.AttrSHA256, got.SpanSHA256)
+			}
+		})
+	}
+
+	// double-forms ships as 100, 0, 1e+21, 10000000000000000, 5e-7, 0.000001.
+	x := spanWith(t, "name", `"x"`)
+	spelled := `{"a.integral":{"d":100.0},"b.negzero":{"d":-0.0},"c.big":{"d":1E21},` +
+		`"d.sixteen":{"d":1e16},"e.small":{"d":5E-7},"f.edge":{"d":1E-6}}`
+	if got := mustHash(t, x, spelled).AttrSHA256; got != exp.Pass["double-forms"].AttributesSHA256 {
+		t.Errorf("non-canonical double spellings changed the attribute hash: got %s, want %s",
+			got, exp.Pass["double-forms"].AttributesSHA256)
+	}
+}
+
+// A lowercase letter outside a-f is not hex, and an id one character too long is
+// not the right length, whichever field it is in.
+func TestProfileEdge_NonHexAndOverlongIDs(t *testing.T) {
+	wantReject(t, spanWith(t, "span_id", `"b7ad6b716920333g"`), `{}`, "ID_NOT_LOWERCASE_HEX")
+	wantReject(t, spanWith(t, "trace_id", `"0af7651916cd43dd8448eb211c80319z"`), `{}`, "ID_NOT_LOWERCASE_HEX")
+	wantReject(t, spanWith(t, "parent_span_id", `"b7ad6b716920333g"`), `{}`, "ID_NOT_LOWERCASE_HEX")
+	wantReject(t, spanWith(t, "span_id", `"b7ad6b71692033310"`), `{}`, "ID_BAD_LENGTH")
+	wantReject(t, spanWith(t, "trace_id", `"0af7651916cd43dd8448eb211c80319c0"`), `{}`, "ID_BAD_LENGTH")
+}
+
+// Numbers are normalised by RFC 8785, so different spellings of one double give one
+// hash, and a different double gives a different one.
+func TestProfileEdge_EquivalentDoubleSpellingsHashAlike(t *testing.T) {
+	x := spanWith(t, "name", `"x"`)
+	one := mustHash(t, x, `{"k":{"d":1}}`).AttrSHA256
+	for _, spelling := range []string{`1.0`, `1E0`, `1e0`, `10E-1`, `0.1e1`} {
+		if got := mustHash(t, x, `{"k":{"d":`+spelling+`}}`).AttrSHA256; got != one {
+			t.Errorf("double spelled %s hashes differently from 1", spelling)
+		}
+	}
+	if mustHash(t, x, `{"k":{"d":2}}`).AttrSHA256 == one {
+		t.Error("a different double hashed alike")
+	}
+	// 1.0 as a double and "1" as an int are different typed values.
+	if mustHash(t, x, `{"k":{"i":"1"}}`).AttrSHA256 == one {
+		t.Error(`int "1" and double 1 hashed alike`)
+	}
+}
+
+// decodeOrdered refuses anything after the first JSON value.
+func TestProfileEdge_DecodeOrderedRejectsTrailingData(t *testing.T) {
+	for _, bad := range []string{`{} x`, `{}{}`, `1 2`, `{"a":1`, ``} {
+		if _, err := decodeOrdered([]byte(bad)); err == nil {
+			t.Errorf("decodeOrdered(%q) accepted malformed input", bad)
+		}
+	}
+	if _, err := decodeOrdered([]byte(` {"a":[1,"b",null,true]} `)); err != nil {
+		t.Errorf("surrounding whitespace should be fine: %v", err)
+	}
+}

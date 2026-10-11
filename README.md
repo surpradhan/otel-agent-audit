@@ -216,3 +216,7 @@ drift-guard conventions.
 ## License
 
 MIT. See [LICENSE](LICENSE).
+
+The conformance vectors vendored under
+`exporter/agentauditexporter/internal/profilecompare/testdata/otel-canonical-profile/`
+are Apache-2.0, from a third party. Their `LICENSE` and `PROVENANCE.md` sit beside them.

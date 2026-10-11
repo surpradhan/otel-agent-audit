@@ -11,10 +11,13 @@ package profilecompare
 // form commits to and what each refuses.
 //
 // Tests named TestFinding_* characterise behaviour of this repo that the
-// profile treats as an error. They assert what the code does today. If one
-// fails because the behaviour was fixed, update the test and the doc together;
-// fixing most of them changes canonical bytes and so needs a schema_version
-// bump under CLAUDE.md's chain-format discipline.
+// profile treats as an error. They follow the repo's existing convention for a
+// pinned, tracked defect (see internal/verify/rotation_boundary_test.go): each
+// carries a BUG(#n) tag naming its open issue and asserts what the code does
+// today, and whoever fixes the issue should flip the assertion rather than delete
+// the test. Fixing #58 changes canonical bytes and so needs a schema_version bump
+// under CLAUDE.md's chain-format discipline; the others change behaviour on
+// malformed input only. The prefix lets `-run TestFinding_` select just these.
 
 import (
 	"encoding/json"
@@ -63,6 +66,9 @@ type vectorCase struct {
 func loadCases(t *testing.T) []vectorCase {
 	t.Helper()
 	exp := loadExpected(t)
+	if len(exp.Pass) != 8 {
+		t.Fatalf("expected 8 pass vectors, found %d: the vendored set changed", len(exp.Pass))
+	}
 	var out []vectorCase
 	for _, name := range sortedKeys(exp.Pass) {
 		canon := readVector(t, "pass/"+name+".canonical.json")
@@ -139,7 +145,9 @@ func TestCompare_HashesNeverCoincide(t *testing.T) {
 }
 
 // status.message is outside the profile's hash scope. It is outside this
-// repo's record too: Status carries the code name only.
+// repo's record too: Status carries the code name only. Both sides are checked:
+// the profile with OTLP's nested status object and with a flat field, this repo
+// by setting a real message on a pdata span.
 func TestCompare_StatusMessageIsOutsideBothForms(t *testing.T) {
 	c := loadCases(t)[0]
 	with := c.pdata
@@ -147,6 +155,17 @@ func TestCompare_StatusMessageIsOutsideBothForms(t *testing.T) {
 	with.Status().SetMessage("upstream timed out after 30s")
 	if after := ours(t, with); string(after) != string(before) {
 		t.Errorf("a status message changed this repo's record:\n%s\n%s", before, after)
+	}
+
+	x := spanWith(t, "name", `"x"`)
+	base := mustHash(t, x, `{}`).SpanSHA256
+	for _, v := range []struct{ key, val string }{
+		{"status", `{"code":1,"message":"upstream timed out after 30s"}`},
+		{"status_message", `"upstream timed out after 30s"`},
+	} {
+		if got := mustHash(t, spanWith(t, v.key, v.val), `{}`).SpanSHA256; got != base {
+			t.Errorf("a status message in field %q changed the profile's span hash", v.key)
+		}
 	}
 }
 
@@ -187,27 +206,44 @@ func TestCompare_AttributesOutsideTheAllowlistAreNotCommitted(t *testing.T) {
 // Reachable for the allowlisted keys that are numeric in the semantic
 // conventions (gen_ai.usage.input_tokens and gen_ai.usage.output_tokens).
 func TestFinding_AttributeTypesCollide(t *testing.T) {
+	// BUG(#58): attribute types are lost before hashing. Flip the collisions below
+	// when the record carries the type.
 	const key = "gen_ai.usage.input_tokens"
 	mk := func(set func(m pcommon.Map)) []byte {
 		s := ptrace.NewSpan()
 		set(s.Attributes())
 		return ours(t, s)
 	}
+	// carries guards against a vacuous pass: identical bytes only mean something
+	// if the attribute actually reached the record.
+	carries := func(rec []byte, want string) {
+		t.Helper()
+		if !strings.Contains(string(rec), want) {
+			t.Fatalf("record does not carry %s (is the key still allowlisted?): %s", want, rec)
+		}
+	}
 	intOne := mk(func(m pcommon.Map) { m.PutInt(key, 1) })
 	strOne := mk(func(m pcommon.Map) { m.PutStr(key, "1") })
 	dblOne := mk(func(m pcommon.Map) { m.PutDouble(key, 1.0) })
+	carries(intOne, `"key":"gen_ai.usage.input_tokens","value":"1"`)
+	carries(strOne, `"key":"gen_ai.usage.input_tokens","value":"1"`)
+	carries(dblOne, `"key":"gen_ai.usage.input_tokens","value":"1"`)
 	if string(intOne) != string(strOne) || string(intOne) != string(dblOne) {
 		t.Errorf("int 1, string \"1\" and double 1.0 no longer collide:\n%s\n%s\n%s", intOne, strOne, dblOne)
 	}
 
 	boolTrue := mk(func(m pcommon.Map) { m.PutBool("gen_ai.system", true) })
 	strTrue := mk(func(m pcommon.Map) { m.PutStr("gen_ai.system", "true") })
+	carries(boolTrue, `"key":"gen_ai.system","value":"true"`)
+	carries(strTrue, `"key":"gen_ai.system","value":"true"`)
 	if string(boolTrue) != string(strTrue) {
 		t.Error(`bool true and string "true" no longer collide`)
 	}
 
 	rawBytes := mk(func(m pcommon.Map) { m.PutEmptyBytes("gen_ai.system").FromRaw([]byte{0xde, 0xad, 0xbe, 0xef}) })
 	b64Text := mk(func(m pcommon.Map) { m.PutStr("gen_ai.system", "3q2+7w==") })
+	carries(rawBytes, `"key":"gen_ai.system","value":"3q2+7w=="`)
+	carries(b64Text, `"key":"gen_ai.system","value":"3q2+7w=="`)
 	if string(rawBytes) != string(b64Text) {
 		t.Error("bytes and their base64 text no longer collide")
 	}
@@ -238,6 +274,8 @@ func TestFinding_AttributeTypesCollide(t *testing.T) {
 // the hash. The profile makes this a reject so that two stores that merge
 // differently cannot both accept the span and hash it differently.
 func TestFinding_DuplicateAttributeKeyIsFirstWins(t *testing.T) {
+	// BUG(#59): a duplicate attribute key is silently first-wins. Flip this when
+	// the span is refused, quarantined or the conflict recorded.
 	otlp := `{"resourceSpans":[{"scopeSpans":[{"spans":[{` +
 		`"traceId":"0af7651916cd43dd8448eb211c80319c","spanId":"b7ad6b7169203331","name":"x",` +
 		`"attributes":[` +
@@ -264,6 +302,8 @@ func TestFinding_DuplicateAttributeKeyIsFirstWins(t *testing.T) {
 // and a number outside the OTLP enum has no name. Distinct unknown numbers
 // therefore collapse to the same empty string instead of being refused.
 func TestFinding_OutOfRangeEnumsCollapseToEmpty(t *testing.T) {
+	// BUG(#60): out-of-range kind and status serialize as "". Flip this when they
+	// are refused or quarantined.
 	mk := func(kind, status int) map[string]any {
 		s := ptrace.NewSpan()
 		s.SetKind(ptrace.SpanKind(kind))
@@ -347,6 +387,8 @@ func TestCompare_ReadPathVersusProfileRejects(t *testing.T) {
 // id therefore seeds the same chain as its lowercase spelling while the record
 // bytes differ, and a 4-byte id seeds without error.
 func TestFinding_GenesisSeedDoesNotEnforceItsDocumentedIDRule(t *testing.T) {
+	// BUG(#61): the documented trace-id rule is not enforced. Flip this when the
+	// rule is enforced or the comment is corrected.
 	lower, err := chain.GenesisSeed("0af7651916cd43dd8448eb211c80319c")
 	if err != nil {
 		t.Fatal(err)
@@ -367,21 +409,28 @@ func TestFinding_GenesisSeedDoesNotEnforceItsDocumentedIDRule(t *testing.T) {
 }
 
 // The profile rejects an empty batch ("nothing to commit"). The nearest thing
-// here is a checkpoint over zero trace tips, which Accumulator.Build writes
-// without complaint (chain's own TestAccumulator_BuildEmpty relies on it).
-// The analogy is loose: a checkpoint is a delta over sealed traces, not a batch
-// of one export request.
-func TestCompare_EmptyCheckpointIsAccepted(t *testing.T) {
+// here is a checkpoint over zero trace tips. Accumulator.Stage, the call the
+// exporter persists through, does not refuse one (chain's own
+// TestAccumulator_BuildEmpty relies on the same for Build, a test-only API).
+// The exporter never asks for one: Shutdown checkpoints only when tips are
+// pending, and the interval trigger needs pending >= checkpointInterval
+// (exporter.go, Shutdown and shouldCheckpoint). So this is a property of the
+// accumulator, not of what the exporter writes, and the analogy is loose: a
+// checkpoint is a delta over sealed traces, not a batch from one export request.
+func TestCompare_AccumulatorDoesNotRefuseZeroTips(t *testing.T) {
 	priv, _, err := sign.GenerateEd25519Key()
 	if err != nil {
 		t.Fatal(err)
 	}
 	acc := chain.NewAccumulator(sign.NewEd25519Signer(priv), 0, chain.ZeroPrevCheckpointHash)
-	cp, err := acc.Build(time.Unix(0, 0))
-	if err != nil {
-		t.Fatalf("an empty checkpoint is now refused (%v): update the doc", err)
+	if acc.PendingCount() != 0 {
+		t.Fatal("a new accumulator should have no pending tips")
 	}
-	if len(cp.TraceTips) != 0 || cp.CheckpointSeq != 1 {
-		t.Errorf("unexpected empty checkpoint: %+v", cp)
+	staged, err := acc.Stage(time.Unix(0, 0))
+	if err != nil {
+		t.Fatalf("a zero-tip checkpoint is now refused (%v): update the doc", err)
+	}
+	if len(staged.Checkpoint.TraceTips) != 0 || staged.Checkpoint.CheckpointSeq != 1 {
+		t.Errorf("unexpected zero-tip checkpoint: %+v", staged.Checkpoint)
 	}
 }
