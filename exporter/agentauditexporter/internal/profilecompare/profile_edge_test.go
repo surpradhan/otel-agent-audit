@@ -198,16 +198,75 @@ func TestProfileEdge_TimestampPastUint64IsAccepted(t *testing.T) {
 	mustHash(t, spanWith(t, "end_time_unix_nano", `"0"`), `{}`)
 }
 
+// spanWithMany is spanWith for several members at once; pairs is key, value, key,
+// value, and so on, each value raw JSON.
+func spanWithMany(t *testing.T, pairs ...string) obj {
+	t.Helper()
+	if len(pairs)%2 != 0 {
+		t.Fatal("spanWithMany needs key/value pairs")
+	}
+	o := spanWith(t, "name", `"x"`)
+	for i := 0; i < len(pairs); i += 2 {
+		nv, err := decodeOrdered([]byte(pairs[i+1]))
+		if err != nil {
+			t.Fatalf("bad test value %q: %v", pairs[i+1], err)
+		}
+		replaced := false
+		for j := range o {
+			if o[j].key == pairs[i] {
+				o[j].val = nv
+				replaced = true
+			}
+		}
+		if !replaced {
+			o = append(o, kvp{pairs[i], nv})
+		}
+	}
+	return o
+}
+
 // With several defects the code reported depends on check order, which SPEC.md
 // does not define, and the two references disagree on (canonical.py checks the
-// ids before the name, validate.mjs the name before the ids). This pins
-// canonical.py's order, the one used here, so a change is deliberate.
+// ids before the name, validate.mjs the name before the ids). This pins every
+// adjacent pair in canonical.py's order, the one used here, so a change is
+// deliberate: in each row the earlier check must win over the later one, and the
+// two defects carry different codes so a swap is visible.
 func TestProfileEdge_RejectPrecedence(t *testing.T) {
-	bad := spanWith(t, "kind", `9`)
-	bad = append(obj{}, bad...)
-	bad = append(bad, kvp{"trace_id", "NOT-HEX"})                                      // last wins: second trace_id
-	wantReject(t, bad, `[["k",{"s":"a"}],["k",{"s":"b"}]]`, "DUPLICATE_ATTRIBUTE_KEY") // attributes first
-	wantReject(t, bad, `{}`, "KIND_OUT_OF_RANGE")                                      // then kind, before ids
+	rows := []struct {
+		name  string
+		span  obj
+		attrs string
+		want  string
+	}{
+		{"attributes before kind", spanWithMany(t, "kind", `9`), `{"k":{"i":"007"}}`, "INT_OUT_OF_RANGE"},
+		{"kind before status", spanWithMany(t, "kind", `9`, "status_code", `9`), `{}`, "KIND_OUT_OF_RANGE"},
+		{"status before trace_id", spanWithMany(t, "status_code", `9`, "trace_id", `"zz"`), `{}`, "STATUS_OUT_OF_RANGE"},
+		{"trace_id before span_id", spanWithMany(t, "trace_id", `"zz"`, "span_id", `"B7AD6B7169203331"`), `{}`, "ID_BAD_LENGTH"},
+		{"span_id before parent_span_id", spanWithMany(t, "span_id", `"zz"`, "parent_span_id", `"B7AD6B7169203331"`), `{}`, "ID_BAD_LENGTH"},
+		// The row that separates canonical.py from validate.mjs, which would
+		// report BAD_WRAPPER for the name here.
+		{"parent_span_id before name", spanWithMany(t, "parent_span_id", `"zz"`, "name", `7`), `{}`, "ID_BAD_LENGTH"},
+		{"name before start", spanWithMany(t, "name", `7`, "start_time_unix_nano", `5`), `{}`, "BAD_WRAPPER"},
+		{"start before end", spanWithMany(t, "start_time_unix_nano", `"007"`, "end_time_unix_nano", `5`), `{}`, "TIMESTAMP_NOT_DECIMAL"},
+	}
+	for _, r := range rows {
+		t.Run(r.name, func(t *testing.T) {
+			wantReject(t, r.span, r.attrs, r.want)
+		})
+	}
+}
+
+// A JSON bool is not a string timestamp. canonical.py reports it as
+// TIMESTAMP_NOT_STRING (a Python bool is an int); validate.mjs reports
+// TIMESTAMP_NOT_DECIMAL (read, not run). This follows canonical.py. A non-string
+// int attribute value is INT_OUT_OF_RANGE for the same reason, where SPEC.md
+// section 6 would read as BAD_WRAPPER.
+func TestProfileEdge_WrongTypedTimestampAndIntFollowCanonicalPy(t *testing.T) {
+	wantReject(t, spanWith(t, "start_time_unix_nano", `true`), `{}`, "TIMESTAMP_NOT_STRING")
+	wantReject(t, spanWith(t, "end_time_unix_nano", `false`), `{}`, "TIMESTAMP_NOT_STRING")
+	wantReject(t, spanWith(t, "end_time_unix_nano", `12.5`), `{}`, "TIMESTAMP_NOT_STRING")
+	wantReject(t, spanWith(t, "name", `"x"`), `{"k":{"i":5}}`, "INT_OUT_OF_RANGE")
+	wantReject(t, spanWith(t, "name", `"x"`), `{"k":{"i":true}}`, "INT_OUT_OF_RANGE")
 }
 
 // Non-zero trailing bits ("QR==" decodes to the same byte as "QQ==") are a
@@ -324,10 +383,17 @@ func TestProfileEdge_TrailingNewlineIsNotADigitOrHexCharacter(t *testing.T) {
 // is not valid Unicode arrives already replaced. SPEC.md section 2 says "as
 // given". Recorded as a limitation of this implementation, not fixed.
 func TestProfileEdge_InvalidUnicodeNameIsReplacedBeforeHashing(t *testing.T) {
+	replaced := mustHash(t, spanWith(t, "name", `"\ufffd"`), `{}`)
 	lone := mustHash(t, spanWith(t, "name", `"\ud800"`), `{}`)
-	replaced := mustHash(t, spanWith(t, "name", `"�"`), `{}`)
 	if lone.SpanSHA256 != replaced.SpanSHA256 {
 		t.Error("a lone surrogate no longer hashes as U+FFFD: the limitation is gone, update the doc")
+	}
+	// Raw invalid UTF-8 (a stray 0xff byte) is replaced too. The byte is written as
+	// an escape in this Go string so the source file itself stays valid UTF-8.
+	rawBad := mustHash(t, spanWith(t, "name", "\"a\xffb\""), `{}`)
+	wantRepl := mustHash(t, spanWith(t, "name", `"a\ufffdb"`), `{}`)
+	if rawBad.SpanSHA256 != wantRepl.SpanSHA256 {
+		t.Error("invalid UTF-8 no longer hashes as U+FFFD: the limitation is gone, update the doc")
 	}
 }
 
@@ -363,12 +429,17 @@ func TestProfileEdge_NonCanonicalBase64SpellingsDecodeAlikeButHashDifferently(t 
 func TestProfileEdge_AttributeInputIsNormalisedByJCS(t *testing.T) {
 	exp := loadExpected(t)
 
+	reversed := 0
 	for _, name := range sortedKeys(exp.Pass) {
+		attrs, err := decodeOrdered(readVector(t, "pass/"+name+".attrs.json"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(attrs.(obj)) < 2 {
+			continue // reversing zero or one attribute changes nothing
+		}
+		reversed++
 		t.Run("reversed/"+name, func(t *testing.T) {
-			attrs, err := decodeOrdered(readVector(t, "pass/"+name+".attrs.json"))
-			if err != nil {
-				t.Fatal(err)
-			}
 			span, err := decodeOrdered(readVector(t, "pass/"+name+".canonical.json"))
 			if err != nil {
 				t.Fatal(err)
@@ -386,6 +457,10 @@ func TestProfileEdge_AttributeInputIsNormalisedByJCS(t *testing.T) {
 				t.Errorf("reversed attribute order changed the hash: attrs %s span %s", got.AttrSHA256, got.SpanSHA256)
 			}
 		})
+	}
+
+	if reversed != 5 {
+		t.Fatalf("reversed %d vectors, want the 5 with two or more attributes: the vendored set changed", reversed)
 	}
 
 	// double-forms ships as 100, 0, 1e+21, 10000000000000000, 5e-7, 0.000001.

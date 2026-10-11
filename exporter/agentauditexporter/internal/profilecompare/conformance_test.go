@@ -287,6 +287,7 @@ func TestVendoredVectors_MatchProvenance(t *testing.T) {
 			return err
 		}
 		rel, _ := filepath.Rel(root, p)
+		rel = filepath.ToSlash(rel)
 		if rel == "PROVENANCE.md" {
 			return nil
 		}

@@ -1,0 +1,4 @@
+# The vendored otel-span/canonical/1 vectors are a byte-exact oracle: their sha256
+# values are pinned in PROVENANCE.md and checked by TestVendoredVectors_MatchProvenance.
+# Never let git rewrite line endings in them.
+exporter/agentauditexporter/internal/profilecompare/testdata/otel-canonical-profile/** -text

@@ -126,7 +126,8 @@ the profile accepts (below).
   timestamps are `uint64`. `TestProfileEdge_TimestampPastUint64IsAccepted`.
 - **Reject precedence and span-core duplicates are unspecified.** An input with two
   defects gets a code that depends on check order, and SPEC defines no order (the two
-  references disagree, below). SPEC rejects duplicate *attribute* keys but says
+  references disagree, below). The test pins every adjacent pair of checks in
+  `canonical.py`'s order. SPEC rejects duplicate *attribute* keys but says
   nothing of a repeated member in the span core, which a last-wins JSON loader, as
   both references use, silently accepts. No vector has two defects.
   `TestProfileEdge_RejectPrecedence`,
@@ -161,12 +162,13 @@ the profile accepts (below).
   - `"parent_span_id":null`: Python rejects it (`ID_BAD_LENGTH`); Node accepts it
     (`?? ""`).
   - A JSON `true` timestamp: Python reports `TIMESTAMP_NOT_STRING` (a bool is an
-    int); Node reports `TIMESTAMP_NOT_DECIMAL`.
+    int); Node reports `TIMESTAMP_NOT_DECIMAL`. This implementation follows Python
+    (`TestProfileEdge_WrongTypedTimestampAndIntFollowCanonicalPy`).
   - A trailing newline: Python's `$` also matches before a trailing newline, so
     `"123\n"` passes as a timestamp and 31 hex digits plus `"\n"` as an id; Node's
-    `$` does not. (I confirmed the Python behaviour with the same regex shapes in my
-    own snippet, not their code.) `TestProfileEdge_TrailingNewlineIsNotADigitOrHexCharacter`
-    pins the SPEC reading here.
+    `$` does not. (Confirmed with equivalent regexes, not by running the reference.)
+    `TestProfileEdge_TrailingNewlineIsNotADigitOrHexCharacter` pins the SPEC reading
+    here.
 
   SPEC says the two validators "must agree byte-for-byte on every vector". The
   vectors do not contradict that, and none of these inputs is a vector.
@@ -181,8 +183,10 @@ the profile accepts (below).
 - **SPEC section 6 and the reference disagree on the catch-all.** SPEC calls
   `BAD_WRAPPER` the code for a "span field structurally malformed (wrong type,
   wrong shape)", but the reference gives a wrong-typed `kind`, `status_code`, id or
-  timestamp the named code of its own rule. Read here as the reference does
-  (`TestProfileEdge_WrongTypes`).
+  timestamp the named code of its own rule, and a non-string `i` value
+  `INT_OUT_OF_RANGE`. Read here as the reference does (`TestProfileEdge_WrongTypes`,
+  `TestProfileEdge_EmptyAndShortIDs`,
+  `TestProfileEdge_WrongTypedTimestampAndIntFollowCanonicalPy`).
 
 ## Coverage the vectors lack
 
@@ -204,8 +208,9 @@ vendored vector stayed green. This repo's own tests cover them.
   `TestProfileEdge_NonHexAndOverlongIDs`.
 - **RFC 8785 normalising its input.** Every vendored attrs file is already key-sorted
   and number-canonical, so building from them cannot show the normalisation working.
-  `TestProfileEdge_AttributeInputIsNormalisedByJCS` feeds reversed key order and
-  non-canonical number spellings and requires the published hashes;
+  `TestProfileEdge_AttributeInputIsNormalisedByJCS` feeds reversed key order (for
+  the five vectors with two or more attributes) and non-canonical number
+  spellings and requires the published hashes;
   `TestProfileEdge_EquivalentDoubleSpellingsHashAlike` covers the double spellings.
 - **A malformed element inside an array wrapper,** and the missing-versus-null
   `parent_span_id` distinction.

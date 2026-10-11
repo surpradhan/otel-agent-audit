@@ -16,20 +16,35 @@ package profilecompare
 // (check order, a null parent_span_id, a boolean timestamp), see the comparison
 // doc. Choices that come from canonical.py, not SPEC.md:
 //
-//   - the order the checks run in;
+//   - the order the checks run in: attributes, kind, status_code, trace_id,
+//     span_id, parent_span_id, name, start, end (validate.mjs checks name before
+//     the ids);
 //   - kind and status_code must be integer literals in range, so a bool, a
 //     float or a string is "out of range";
+//   - a wrong-typed span field gets the named code of its own rule, and a
+//     non-string int attribute value is INT_OUT_OF_RANGE, where SPEC.md
+//     section 6 would read as the BAD_WRAPPER catch-all;
+//   - a JSON bool in a timestamp is TIMESTAMP_NOT_STRING (a bool is an int in
+//     Python); validate.mjs reports TIMESTAMP_NOT_DECIMAL;
 //   - a repeated member in the span core is last-wins;
 //   - a missing parent_span_id means no parent, an explicit null does not;
 //   - a double literal that overflows (1e999) is NONFINITE_DOUBLE;
 //   - a kvlist is accepted as an object (SPEC.md) or as a list of pairs (the
 //     reject inputs).
 //
-// Two deliberate departures from canonical.py, both toward SPEC.md or stricter:
-// base64 content is validated (including line breaks and trailing bits), and a
-// wrapper object with a repeated tag is BAD_WRAPPER where both references would
-// load it last-wins. Names are hashed after encoding/json has decoded them, so
-// invalid UTF-8 or a lone surrogate arrives as U+FFFD, not "as given".
+// Departures from canonical.py, all toward SPEC.md or stricter:
+//
+//   - base64 content is validated, including line breaks and trailing bits;
+//   - a wrapper object with a repeated tag is BAD_WRAPPER where both references
+//     would load it last-wins;
+//   - Go's $ matches only at end of text, so a trailing newline is not a digit or
+//     hex character (Python's $ also matches before it);
+//   - a double literal past 2^53 is rounded to a double, as RFC 8785 requires;
+//     canonical.py hashes the integer literal's exact digits.
+//
+// One limit of this implementation: names are hashed after encoding/json has
+// decoded them, so invalid UTF-8 or a lone surrogate arrives as U+FFFD, not "as
+// given".
 
 import (
 	"bytes"
@@ -318,7 +333,10 @@ func checkID(v any, length int, allowEmpty bool) (string, error) {
 }
 
 func checkTimestamp(v any) (string, error) {
-	if _, isNum := v.(json.Number); isNum {
+	// A JSON number is NOT_STRING, and so is a bool: canonical.py tests
+	// isinstance(v, (int, float)) and a Python bool is an int.
+	switch v.(type) {
+	case json.Number, bool:
 		return "", reject("TIMESTAMP_NOT_STRING")
 	}
 	s, ok := v.(string)
